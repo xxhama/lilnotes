@@ -23,7 +23,11 @@ pub enum PermissionStatus {
 
 pub fn mic_status() -> PermissionStatus {
     // SAFETY: AVMediaTypeAudio is a valid static; class method is thread-safe.
-    let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(AVMediaTypeAudio) };
+    let status = unsafe {
+        AVCaptureDevice::authorizationStatusForMediaType(
+            AVMediaTypeAudio.expect("AVMediaTypeAudio should always exist"),
+        )
+    };
     match status {
         AVAuthorizationStatus::Authorized => PermissionStatus::Granted,
         AVAuthorizationStatus::Denied => PermissionStatus::Denied,
@@ -41,7 +45,10 @@ pub fn request_mic_access() -> bool {
     });
     // SAFETY: valid media type + completion block.
     unsafe {
-        AVCaptureDevice::requestAccessForMediaType_completionHandler(AVMediaTypeAudio, &block);
+        AVCaptureDevice::requestAccessForMediaType_completionHandler(
+            AVMediaTypeAudio.expect("AVMediaTypeAudio should always exist"),
+            &block,
+        );
     }
     rx.recv().unwrap_or(false)
 }
