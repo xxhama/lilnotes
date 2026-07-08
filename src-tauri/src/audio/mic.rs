@@ -60,7 +60,7 @@ fn run(
         }
     };
 
-    let sample_rate = supported.sample_rate().0;
+    let sample_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.config();
@@ -79,7 +79,8 @@ fn run(
     let (chunk_tx, chunk_rx) = bounded::<Vec<f32>>(64);
     let err_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let err_flag_cb = err_flag.clone();
-    let err_fn = move |e: cpal::StreamError| {
+    // Type of `e` (cpal's stream error) is inferred from the trait bound.
+    let err_fn = move |e| {
         eprintln!("mic stream error: {e}");
         err_flag_cb.store(true, Ordering::Relaxed);
     };
@@ -88,7 +89,7 @@ fn run(
         cpal::SampleFormat::F32 => {
             let tx = chunk_tx.clone();
             device.build_input_stream(
-                &config,
+                config.clone(),
                 move |data: &[f32], _| {
                     let _ = tx.try_send(data.to_vec());
                 },
@@ -99,7 +100,7 @@ fn run(
         cpal::SampleFormat::I16 => {
             let tx = chunk_tx.clone();
             device.build_input_stream(
-                &config,
+                config.clone(),
                 move |data: &[i16], _| {
                     let v: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let _ = tx.try_send(v);
