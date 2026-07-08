@@ -32,6 +32,7 @@ objc2-core-foundation = "0.3"
 objc2-core-audio = "0.3"       # process taps, aggregate devices, HAL properties
 objc2-core-audio-types = "0.3" # AudioBufferList, ASBD, AudioTimeStamp
 objc2-av-foundation = "0.3"    # AVCaptureDevice for mic TCC status/request
+objc2-avf-audio = "0.3"        # AVAudioEngine voice-processed mic (AEC)
 
 [profile.release]
 lto = true

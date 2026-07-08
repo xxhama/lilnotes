@@ -66,6 +66,16 @@ Rust unit tests (resampler + limiter): `cd src-tauri && cargo test`.
 - *system.wav is silent:* make sure something is actually playing to the
   default output device (the tap follows the default output).
 
+**Mic echo cancellation.** The mic channel uses macOS voice processing
+(Apple's AEC + noise suppression, the FaceTime stack): speaker output and
+steady room noise are removed from `mic.wav` at the driver level, so remote
+voices shouldn't bleed into the "Me" track even without headphones. Ducking
+of other audio is disabled so the system channel keeps its level. If voice
+processing can't initialize on a device, capture automatically falls back to
+the raw mic (a console line notes the fallback). Expect the voice-processed
+mic to sound "thinner" than a raw recording — that is normal and fine for
+ASR.
+
 ## Architecture
 
 ```
