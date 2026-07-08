@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>LilNotes records your microphone during meetings so it can transcribe what you say. Audio never leaves this Mac.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>LilNotes records system audio during meetings so it can transcribe what other participants say. Audio never leaves this Mac.</string>
+</dict>
+</plist>

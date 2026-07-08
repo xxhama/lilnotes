@@ -29,7 +29,7 @@ npm run tauri build   # release .app/.dmg
 | # | Milestone | Status |
 |---|-----------|--------|
 | 1 | Scaffold: app shell, IPC round-trip | ✅ done |
-| 2 | Dual-source capture → two 16 kHz WAVs, level meters, permissions | ⬜ |
+| 2 | Dual-source capture → two 16 kHz WAVs, level meters, permissions | ✅ done |
 | 3 | Transcription (whisper-rs Metal), model download, near-live chunks | ⬜ |
 | 4 | Diarization + merged speaker-labeled transcript | ⬜ |
 | 5 | SQLite persistence, history/detail UI, speaker rename | ⬜ |
@@ -42,6 +42,29 @@ npm run tauri build   # release .app/.dmg
 `npm install && npm run tauri dev` — the window should open with the LilNotes
 sidebar; on the Meetings screen, click **Test backend connection**: it should
 show the backend version, round-trip latency, and echoed message.
+
+### Verifying milestone 2
+
+1. Go to **Record**, hit the record button. Approve the Microphone prompt,
+   then the System Audio Recording prompt (first run only).
+2. Talk, and play something (music, a video) so both meters move.
+3. Stop. The card shows the two WAV paths under
+   `~/Library/Application Support/co.elastic.lilnote/recordings/<session>/`.
+4. Inspect: `afinfo mic.wav system.wav` (both 16 kHz mono 16-bit) and play
+   them — mic.wav has only your voice, system.wav only the playback.
+
+Rust unit tests (resampler + limiter): `cd src-tauri && cargo test`.
+
+**Troubleshooting capture**
+
+- *No system-audio prompt appears / OSStatus error on start:* the
+  system-audio TCC category requires a signed binary. Dev builds are ad-hoc
+  signed, which normally works; if not, run `npm run tauri build` once and
+  launch the bundled app from `src-tauri/target/release/bundle/macos/`.
+- *Re-test the prompts:* `tccutil reset Microphone co.elastic.lilnote` and
+  `tccutil reset SystemAudioCaptureRequests co.elastic.lilnote`.
+- *system.wav is silent:* make sure something is actually playing to the
+  default output device (the tap follows the default output).
 
 ## Architecture
 
