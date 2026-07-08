@@ -16,7 +16,8 @@ model. No cloud, no telemetry, no Python at runtime.
 
 ## Development
 
-Prerequisites: Rust (stable, via rustup), Node 20+, Xcode Command Line Tools.
+Prerequisites: Rust (stable, via rustup), Node 20+, Xcode Command Line
+Tools, and CMake for the whisper.cpp build (`brew install cmake`).
 
 ```sh
 npm install
@@ -30,7 +31,7 @@ npm run tauri build   # release .app/.dmg
 |---|-----------|--------|
 | 1 | Scaffold: app shell, IPC round-trip | ✅ done |
 | 2 | Dual-source capture → two 16 kHz WAVs, level meters, permissions | ✅ done |
-| 3 | Transcription (whisper-rs Metal), model download, near-live chunks | ⬜ |
+| 3 | Transcription (whisper-rs Metal), model download, near-live chunks | ✅ done |
 | 4 | Diarization + merged speaker-labeled transcript | ⬜ |
 | 5 | SQLite persistence, history/detail UI, speaker rename | ⬜ |
 | 6 | Ollama summaries + in-app model manager (pull w/ progress) | ⬜ |
@@ -65,6 +66,19 @@ Rust unit tests (resampler + limiter): `cd src-tauri && cargo test`.
   `tccutil reset SystemAudioCaptureRequests co.elastic.lilnote`.
 - *system.wav is silent:* make sure something is actually playing to the
   default output device (the tap follows the default output).
+
+### Verifying milestone 3
+
+1. In **Settings → Transcription**, download **Large v3 Turbo** (~1.6 GB;
+   progress bar + cancel should work) and make sure it's selected. Leave
+   "Live transcription" on.
+2. Record a short session with speech on both channels (talk + play a video
+   with speech). The transcript should fill in below the meters within
+   ~5–15 s of each utterance, labeled Me / Speaker with timestamps.
+3. Stop: the last chunk flushes, and `stop_recording` returns the full
+   segment list. Timestamps should match the audio (`afplay` + spot-check).
+4. Batch mode: toggle live transcription off, record again, then click
+   **Transcribe recording** — same output, produced after the fact.
 
 **Mic echo cancellation.** The mic channel uses macOS voice processing
 (Apple's AEC + noise suppression, the FaceTime stack): speaker output and

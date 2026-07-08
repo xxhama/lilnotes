@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Mic, Square } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FileText, Loader2, Mic, Square } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import LevelMeter from "@/components/LevelMeter";
+import TranscriptPane from "@/components/TranscriptPane";
 import {
   micPermissionStatus,
+  onAsrDone,
+  onAsrSegment,
   onLevels,
   openPrivacySettings,
   recordingStatus,
   requestMicPermission,
   startRecording,
   stopRecording,
+  transcribeSession,
   type LevelsEvent,
   type PermissionStatus,
   type StoppedRecording,
+  type TranscriptSegment,
 } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import type { Route } from "@/App";
@@ -22,7 +27,7 @@ interface Props {
   onNavigate: (route: Route) => void;
 }
 
-type Phase = "idle" | "starting" | "recording" | "stopping";
+type Phase = "idle" | "starting" | "recording" | "stopping" | "transcribing";
 
 function fmtElapsed(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -35,15 +40,18 @@ function fmtElapsed(ms: number): string {
 }
 
 /**
- * Recording view: record/stop, dual level meters (mic + system), elapsed
- * timer. The live transcript pane arrives with milestone 3.
+ * Recording view: record/stop, dual level meters, elapsed timer, and the
+ * live transcript pane (segments stream in as speech is recognized).
  */
 export default function RecordingView(_props: Props) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [levels, setLevels] = useState<LevelsEvent | null>(null);
   const [micPerm, setMicPerm] = useState<PermissionStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [finished, setFinished] = useState<StoppedRecording | null>(null);
+  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
+  const [live, setLive] = useState(false);
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
 
@@ -55,23 +63,29 @@ export default function RecordingView(_props: Props) {
     micPermissionStatus().then(setMicPerm);
   }, []);
 
-  // Level meter events.
+  // Backend events.
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    const unlisteners: (() => void)[] = [];
     onLevels((e) => {
       if (phaseRef.current === "recording" || phaseRef.current === "starting") {
         setLevels(e);
       }
-    }).then((u) => (unlisten = u));
-    return () => unlisten?.();
+    }).then((u) => unlisteners.push(u));
+    onAsrSegment((e) => {
+      setSegments((prev) => [...prev, e]);
+    }).then((u) => unlisteners.push(u));
+    onAsrDone(() => {
+      // Live worker finished flushing after stop; nothing else pending.
+    }).then((u) => unlisteners.push(u));
+    return () => unlisteners.forEach((u) => u());
   }, []);
 
   const start = useCallback(async () => {
     setError(null);
+    setNotice(null);
     setFinished(null);
+    setSegments([]);
 
-    // Make sure the mic prompt happens before capture starts, so a denial is
-    // explainable rather than a silent failure.
     let perm = await micPermissionStatus();
     if (perm === "undetermined") {
       const granted = await requestMicPermission();
@@ -86,7 +100,11 @@ export default function RecordingView(_props: Props) {
 
     setPhase("starting");
     try {
-      await startRecording(); // may block on the system-audio TCC prompt
+      const started = await startRecording(); // may block on the TCC prompt
+      setLive(started.liveTranscription);
+      if (started.liveTranscriptionError) {
+        setNotice(`Recording without live transcript: ${started.liveTranscriptionError}`);
+      }
       setPhase("recording");
     } catch (e) {
       setPhase("idle");
@@ -100,6 +118,9 @@ export default function RecordingView(_props: Props) {
       const result = await stopRecording();
       setFinished(result);
       setLevels(null);
+      if (result.transcriptionError) {
+        setNotice(`Transcription problem: ${result.transcriptionError}`);
+      }
       setPhase("idle");
     } catch (e) {
       setPhase("idle");
@@ -107,105 +128,129 @@ export default function RecordingView(_props: Props) {
     }
   }, []);
 
+  const runBatchTranscription = useCallback(async () => {
+    if (!finished) return;
+    setPhase("transcribing");
+    setError(null);
+    setSegments([]);
+    try {
+      await transcribeSession(finished.sessionId, finished.micWav, finished.systemWav);
+      setPhase("idle");
+    } catch (e) {
+      setPhase("idle");
+      setError(String(e));
+    }
+  }, [finished]);
+
   const recording = phase === "recording";
+  const showTranscript = segments.length > 0 || recording || phase === "transcribing";
 
   return (
-    <div className="mx-auto flex h-full max-w-xl flex-col items-center justify-center gap-8 p-8">
-      {/* Permission banner */}
-      {(micPerm === "denied" || micPerm === "restricted") && (
-        <div className="flex w-full items-start gap-3 rounded-lg border border-destructive/30 bg-card p-4 text-sm">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
-          <div className="space-y-2">
-            <p>
-              LilNotes needs microphone access to record your side of the
-              meeting. Enable it in System Settings, then come back.
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => openPrivacySettings("microphone")}
-            >
-              Open System Settings
-            </Button>
+    <div className="flex h-full flex-col">
+      {/* Top: controls */}
+      <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-5 p-6 pb-4">
+        {(micPerm === "denied" || micPerm === "restricted") && (
+          <div className="flex w-full items-start gap-3 rounded-lg border border-destructive/30 bg-card p-4 text-sm">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+            <div className="space-y-2">
+              <p>
+                LilNotes needs microphone access to record your side of the
+                meeting.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => openPrivacySettings("microphone")}
+              >
+                Open System Settings
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <div className="flex w-full items-center justify-center gap-8">
+          <div
+            className={cn(
+              "font-mono text-4xl font-light tabular-nums tracking-tight",
+              recording ? "text-foreground" : "text-muted-foreground/50",
+            )}
+          >
+            {fmtElapsed(levels?.elapsedMs ?? 0)}
+          </div>
+
+          <button
+            onClick={recording ? stop : start}
+            disabled={phase === "starting" || phase === "stopping" || phase === "transcribing"}
+            className={cn(
+              "flex size-16 items-center justify-center rounded-full shadow-md transition-all",
+              "focus-visible:ring-4 focus-visible:ring-ring/40 focus-visible:outline-none",
+              "disabled:opacity-60",
+              recording
+                ? "bg-recording text-white hover:opacity-90"
+                : "bg-primary text-primary-foreground hover:opacity-90",
+            )}
+            aria-label={recording ? "Stop recording" : "Start recording"}
+          >
+            {recording ? (
+              <Square className="size-6 fill-current" />
+            ) : (
+              <Mic className="size-7" />
+            )}
+          </button>
+
+          <div className="w-56 space-y-2">
+            <LevelMeter label="Mic" rms={levels?.micRms ?? 0} peak={levels?.micPeak ?? 0} />
+            <LevelMeter
+              label="System"
+              rms={levels?.systemRms ?? 0}
+              peak={levels?.systemPeak ?? 0}
+            />
           </div>
         </div>
-      )}
 
-      {/* Timer */}
-      <div
-        className={cn(
-          "font-mono text-5xl font-light tabular-nums tracking-tight",
-          recording ? "text-foreground" : "text-muted-foreground/50",
-        )}
-      >
-        {fmtElapsed(levels?.elapsedMs ?? 0)}
-      </div>
+        <p className="text-xs text-muted-foreground">
+          {phase === "idle" && !finished && "Records mic and system audio as separate tracks"}
+          {phase === "starting" && "Starting capture…"}
+          {phase === "recording" &&
+            (live ? "Recording — transcript fills in below" : "Recording")}
+          {phase === "stopping" && "Finishing up… flushing the last transcript chunk"}
+          {phase === "transcribing" && "Transcribing recording…"}
+          {phase === "idle" && finished && (
+            <span className="inline-flex items-center gap-1.5">
+              <CheckCircle2 className="size-3.5 text-green-600" />
+              Saved {fmtElapsed(finished.durationMs)} of audio
+            </span>
+          )}
+        </p>
 
-      {/* Record / stop */}
-      <button
-        onClick={recording ? stop : start}
-        disabled={phase === "starting" || phase === "stopping"}
-        className={cn(
-          "flex size-20 items-center justify-center rounded-full shadow-md transition-all",
-          "focus-visible:ring-4 focus-visible:ring-ring/40 focus-visible:outline-none",
-          "disabled:opacity-60",
-          recording
-            ? "bg-recording text-white hover:opacity-90"
-            : "bg-primary text-primary-foreground hover:opacity-90",
+        {finished && segments.length === 0 && phase === "idle" && (
+          <Button size="sm" variant="outline" onClick={runBatchTranscription}>
+            <FileText /> Transcribe recording
+          </Button>
         )}
-        aria-label={recording ? "Stop recording" : "Start recording"}
-      >
-        {recording ? (
-          <Square className="size-7 fill-current" />
-        ) : (
-          <Mic className="size-8" />
-        )}
-      </button>
-      <p className="-mt-4 text-xs text-muted-foreground">
-        {phase === "idle" && "Records your mic and system audio as separate tracks"}
-        {phase === "starting" &&
-          "Starting capture… approve the system-audio prompt if one appears"}
-        {phase === "recording" && "Recording — click to stop"}
-        {phase === "stopping" && "Finishing up…"}
-      </p>
 
-      {/* Meters */}
-      <div
-        className={cn(
-          "w-full space-y-3 rounded-xl border bg-card p-5 transition-opacity",
-          recording ? "opacity-100" : "opacity-40",
-        )}
-      >
-        <LevelMeter label="Mic" rms={levels?.micRms ?? 0} peak={levels?.micPeak ?? 0} />
-        <LevelMeter
-          label="System"
-          rms={levels?.systemRms ?? 0}
-          peak={levels?.systemPeak ?? 0}
-        />
-      </div>
-
-      {/* Result / error */}
-      {finished && (
-        <div className="w-full space-y-1.5 rounded-lg border bg-card p-4 text-sm">
-          <div className="flex items-center gap-2 font-medium">
-            <CheckCircle2 className="size-4 text-green-600" />
-            Saved {fmtElapsed(finished.durationMs)} of audio
+        {notice && (
+          <div className="w-full rounded-lg border bg-card p-3 text-xs text-muted-foreground">
+            {notice}
           </div>
-          <p className="text-xs text-muted-foreground" data-selectable>
-            {finished.micWav}
-          </p>
-          <p className="text-xs text-muted-foreground" data-selectable>
-            {finished.systemWav}
-          </p>
-          <p className="pt-1 text-xs text-muted-foreground">
-            Transcription arrives in milestone 3 — for now, verify both WAVs
-            play and stay separate.
-          </p>
-        </div>
-      )}
-      {error && (
-        <div className="w-full rounded-lg border border-destructive/30 bg-card p-4 text-sm text-destructive">
-          <span data-selectable>{error}</span>
+        )}
+        {error && (
+          <div className="w-full rounded-lg border border-destructive/30 bg-card p-3 text-sm text-destructive">
+            <span data-selectable>{error}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Bottom: live transcript */}
+      {showTranscript && (
+        <div className="min-h-0 flex-1 border-t bg-card/50">
+          {phase === "transcribing" && segments.length === 0 ? (
+            <div className="flex items-center justify-center gap-2 p-6 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" /> Transcribing…
+            </div>
+          ) : (
+            <TranscriptPane segments={segments} follow={recording || phase === "transcribing"} className="h-full" />
+          )}
         </div>
       )}
     </div>
