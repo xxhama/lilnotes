@@ -129,31 +129,24 @@ fn run_voice_processed(
                     if data.is_null() {
                         return;
                     }
+                    // `floatChannelData` yields NonNull channel pointers.
                     let mono: Vec<f32> = if interleaved {
                         let stride = (buf.stride() as usize).max(1);
-                        let ptr = *data;
-                        if ptr.is_null() {
-                            return;
-                        }
+                        let ptr = (*data).as_ptr();
                         let slice = std::slice::from_raw_parts(ptr, frames * stride);
                         downmix_interleaved(slice, stride)
                     } else {
                         let chans = std::slice::from_raw_parts(data, channels);
                         let mut acc = vec![0.0f32; frames];
-                        let mut used = 0usize;
                         for &cptr in chans {
-                            if cptr.is_null() {
-                                continue;
-                            }
-                            let ch = std::slice::from_raw_parts(cptr, frames);
+                            let ch = std::slice::from_raw_parts(cptr.as_ptr(), frames);
                             for (a, &s) in acc.iter_mut().zip(ch.iter()) {
                                 *a += s;
                             }
-                            used += 1;
                         }
-                        if used > 1 {
+                        if channels > 1 {
                             for a in acc.iter_mut() {
-                                *a /= used as f32;
+                                *a /= channels as f32;
                             }
                         }
                         acc
