@@ -24,6 +24,10 @@ hound = "3.5"                 # WAV writing
 crossbeam-channel = "0.5"     # realtime-ish handoff between audio callbacks and writers
 chrono = "0.4"                # session ids / timestamps
 
+# --- transcription (M3) ---
+whisper-rs = { version = "0.16", features = ["metal"] }  # whisper.cpp, Metal backend
+reqwest = { version = "0.12", features = ["blocking"] }  # model downloads (+ Ollama in M6)
+
 # Apple framework bindings (objc2 project). Default features enable the full API.
 objc2 = "0.6"
 block2 = "0.6"

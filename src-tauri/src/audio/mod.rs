@@ -15,10 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crossbeam_channel::Sender;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use pipeline::ChannelMeters;
+use pipeline::{ChannelMeters, LiveChunk};
 
 /// Payload of the `capture:levels` event.
 #[derive(Serialize, Clone)]
@@ -79,8 +80,15 @@ impl CaptureEngine {
     }
 
     /// Start a new capture session. `dir` is the per-session directory the
-    /// WAVs are written into.
-    pub fn start(&self, app: AppHandle, dir: PathBuf) -> Result<StartedRecording, String> {
+    /// WAVs are written into. When `live_tx` is set, both pipelines feed
+    /// 16 kHz chunks into it for near-live transcription; the senders drop
+    /// when capture stops, which is the ASR worker's end-of-stream signal.
+    pub fn start(
+        &self,
+        app: AppHandle,
+        dir: PathBuf,
+        live_tx: Option<Sender<LiveChunk>>,
+    ) -> Result<StartedRecording, String> {
         let mut guard = self.active.lock().unwrap();
         if guard.is_some() {
             return Err("a recording is already in progress".into());
@@ -106,14 +114,14 @@ impl CaptureEngine {
             dir.join("mic.wav"),
             stop_flag.clone(),
             mic_meters.clone(),
-            None, // live ASR feed attaches in milestone 3
+            live_tx.clone(),
             mic_ready_tx,
         );
         let sys_thread = system_tap::spawn(
             dir.join("system.wav"),
             stop_flag.clone(),
             sys_meters.clone(),
-            None,
+            live_tx,
             sys_ready_tx,
         );
 
