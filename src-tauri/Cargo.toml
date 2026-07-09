@@ -19,8 +19,10 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# --- persistence (M5) ---
-rusqlite = { version = "0.40", features = ["bundled"] }
+# --- persistence (M5) + encryption at rest (M9) ---
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+security-framework = "3.7"   # macOS Keychain for the DB key
+rand = "0.8"                 # OsRng for key generation
 
 # --- audio capture (M2) ---
 cpal = "0.18"                 # microphone capture

@@ -51,11 +51,20 @@ pub struct MeetingDetail {
 }
 
 impl Db {
-    pub fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path, key: &[u8]) -> Result<Self, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let conn = Connection::open(path).map_err(|e| format!("cannot open database: {e}"))?;
+
+        // SQLCipher: raw 256-bit key as hex blob literal (bypasses KDF — we
+        // already hold a cryptographically random key). Must be executed as
+        // literal SQL, not a bound parameter, so SQLCipher parses x'...' as a
+        // blob literal rather than a passphrase.
+        let key_hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+            .map_err(|e| format!("invalid database key: {e}"))?;
+
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "foreign_keys", "ON")
