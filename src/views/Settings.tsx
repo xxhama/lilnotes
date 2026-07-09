@@ -25,6 +25,7 @@ import {
   type DownloadProgress,
   type PermissionStatus,
 } from "@/lib/ipc";
+import { useTauriEvent } from "@/lib/useTauriEvent";
 import { cn } from "@/lib/utils";
 
 type SysAudioState = "unknown" | "granted" | "denied";
@@ -103,13 +104,12 @@ export default function SettingsView() {
     micPermissionStatus().then(setMicPerm);
     getSettings().then(setSettings);
     refreshModels();
-    let unlisten: (() => void) | undefined;
-    onModelProgress((p) => {
-      setProgress((prev) => ({ ...prev, [p.id]: p }));
-      if (p.done) refreshModels();
-    }).then((u) => (unlisten = u));
-    return () => unlisten?.();
   }, [refreshModels]);
+
+  useTauriEvent(onModelProgress, (p) => {
+    setProgress((prev) => ({ ...prev, [p.id]: p }));
+    if (p.done) refreshModels();
+  });
 
   const saveSettings = useCallback(
     async (next: AppSettings) => {
