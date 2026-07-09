@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, Plus, X } from "lucide-react";
+import { Check, Plus, Unlink, X } from "lucide-react";
 
 import type { Persona, PersonaScore } from "@/lib/ipc";
 
@@ -10,7 +10,10 @@ interface Props {
   personas: Persona[];
   onConfirm: (personaId: number) => void;
   onCreatePersona: (name: string) => Promise<number>;
+  /** Close the popover without side effects. */
   onDismiss: () => void;
+  /** Remove the current persona link (deliberate action). */
+  onUnlink?: () => void;
 }
 
 /**
@@ -24,6 +27,7 @@ export default function SpeakerPersonaPicker({
   onConfirm,
   onCreatePersona,
   onDismiss,
+  onUnlink,
 }: Props) {
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState("");
@@ -97,6 +101,14 @@ export default function SpeakerPersonaPicker({
           >
             <Plus className="size-3.5" /> Create new persona…
           </button>
+          {current && onUnlink && (
+            <button
+              onClick={onUnlink}
+              className="mt-1 flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-destructive"
+            >
+              <Unlink className="size-3.5" /> Unlink persona
+            </button>
+          )}
         </>
       )}
 

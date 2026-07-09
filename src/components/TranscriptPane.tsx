@@ -135,7 +135,7 @@ function SpeakerChip({
         className={cn(
           "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
           chipColor(raw),
-          link && !link.confirmed && "ring-1 ring-dashed ring-amber-500/50",
+          link && !link.confirmed && "border border-dashed border-amber-500/50",
           clickable && "cursor-pointer hover:ring-1 hover:ring-ring/40",
         )}
       >
@@ -165,8 +165,9 @@ function SpeakerChip({
             setPickerOpen(false);
           }}
           onCreatePersona={onCreatePersona!}
-          onDismiss={() => {
-            if (link) onUnlinkPersona?.(raw);
+          onDismiss={() => setPickerOpen(false)}
+          onUnlink={() => {
+            onUnlinkPersona?.(raw);
             setPickerOpen(false);
           }}
         />
