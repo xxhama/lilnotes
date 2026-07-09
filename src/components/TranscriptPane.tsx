@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 
+import SpeakerPersonaPicker from "@/components/SpeakerPersonaPicker";
 import { cn } from "@/lib/utils";
-import type { TranscriptSegment } from "@/lib/ipc";
+import type { Persona, SpeakerLink, TranscriptSegment } from "@/lib/ipc";
 
 interface Props {
   segments: TranscriptSegment[];
@@ -12,6 +13,13 @@ interface Props {
   /** Called with the raw label + new name when the user renames a speaker. */
   onRenameSpeaker?: (raw: string, name: string) => void;
   className?: string;
+  /** raw label -> persona link (suggestion/confirmed) per meeting. */
+  speakerLinks?: Record<string, SpeakerLink>;
+  /** All personas for the picker's "choose different" list. */
+  personas?: Persona[];
+  onConfirmPersona?: (raw: string, personaId: number) => void;
+  onUnlinkPersona?: (raw: string) => void;
+  onCreatePersona?: (name: string) => Promise<number>;
 }
 
 function fmtTime(ms: number): string {
@@ -39,16 +47,28 @@ function SpeakerChip({
   segment,
   renames,
   onRename,
+  speakerLinks,
+  personas,
+  onConfirmPersona,
+  onUnlinkPersona,
+  onCreatePersona,
 }: {
   segment: TranscriptSegment;
   renames: Record<string, string>;
   onRename?: (raw: string, name: string) => void;
+  speakerLinks?: Record<string, SpeakerLink>;
+  personas?: Persona[];
+  onConfirmPersona?: (raw: string, personaId: number) => void;
+  onUnlinkPersona?: (raw: string) => void;
+  onCreatePersona?: (name: string) => Promise<number>;
 }) {
   const raw = segment.speaker;
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  // Legacy free-text fallback (used only when onConfirmPersona is not wired).
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-
   useEffect(() => {
     if (editing) inputRef.current?.focus();
   }, [editing]);
@@ -68,16 +88,18 @@ function SpeakerChip({
     );
   }
 
-  const display = renames[raw] ?? raw;
-  const renamable = Boolean(onRename);
+  const link = speakerLinks?.[raw];
+  const display = link?.personaName ?? renames[raw] ?? raw;
+  const personaPickerEnabled = Boolean(onConfirmPersona && onCreatePersona);
 
+  // Legacy free-text commit (fallback path only).
   const commit = () => {
     setEditing(false);
     const name = draft.trim();
     if (name && onRename) onRename(raw, name);
   };
 
-  if (editing) {
+  if (editing && !personaPickerEnabled) {
     return (
       <input
         ref={inputRef}
@@ -94,23 +116,62 @@ function SpeakerChip({
     );
   }
 
+  const clickable = personaPickerEnabled || Boolean(onRename);
+
   return (
-    <button
-      onClick={() => {
-        if (!renamable) return;
-        setDraft(renames[raw] ?? "");
-        setEditing(true);
-      }}
-      disabled={!renamable}
-      title={renamable ? `Rename ${display}` : undefined}
-      className={cn(
-        "inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
-        chipColor(raw),
-        renamable && "cursor-pointer hover:ring-1 hover:ring-ring/40",
+    <span className="relative inline-flex shrink-0">
+      <button
+        onClick={() => {
+          if (!clickable) return;
+          if (personaPickerEnabled) {
+            setPickerOpen((v) => !v);
+          } else {
+            setDraft(renames[raw] ?? "");
+            setEditing(true);
+          }
+        }}
+        disabled={!clickable}
+        title={clickable ? `Assign ${display}` : undefined}
+        className={cn(
+          "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
+          chipColor(raw),
+          link && !link.confirmed && "ring-1 ring-dashed ring-amber-500/50",
+          clickable && "cursor-pointer hover:ring-1 hover:ring-ring/40",
+        )}
+      >
+        {display}
+        {link && !link.confirmed && link.confidence != null && (
+          <sup className="ml-0.5 text-[9px] font-normal text-amber-600/80">
+            {Math.round(link.confidence * 100)}%
+          </sup>
+        )}
+      </button>
+      {pickerOpen && personaPickerEnabled && (
+        <SpeakerPersonaPicker
+          rawLabel={raw}
+          current={
+            link?.personaId != null && personas
+              ? {
+                  personaId: link.personaId,
+                  displayName: link.personaName ?? raw,
+                  score: link.confidence ?? 0,
+                  tier: link.confirmed ? "auto" : "suggest",
+                }
+              : null
+          }
+          personas={personas ?? []}
+          onConfirm={(pid) => {
+            onConfirmPersona?.(raw, pid);
+            setPickerOpen(false);
+          }}
+          onCreatePersona={onCreatePersona!}
+          onDismiss={() => {
+            if (link) onUnlinkPersona?.(raw);
+            setPickerOpen(false);
+          }}
+        />
       )}
-    >
-      {display}
-    </button>
+    </span>
   );
 }
 
@@ -120,6 +181,11 @@ export default function TranscriptPane({
   renames = {},
   onRenameSpeaker,
   className,
+  speakerLinks,
+  personas,
+  onConfirmPersona,
+  onUnlinkPersona,
+  onCreatePersona,
 }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -146,7 +212,16 @@ export default function TranscriptPane({
           <span className="w-9 shrink-0 pt-0.5 text-right font-mono text-[11px] tabular-nums text-muted-foreground/70">
             {fmtTime(s.startMs)}
           </span>
-          <SpeakerChip segment={s} renames={renames} onRename={onRenameSpeaker} />
+          <SpeakerChip
+            segment={s}
+            renames={renames}
+            onRename={onRenameSpeaker}
+            speakerLinks={speakerLinks}
+            personas={personas}
+            onConfirmPersona={onConfirmPersona}
+            onUnlinkPersona={onUnlinkPersona}
+            onCreatePersona={onCreatePersona}
+          />
           <p className="min-w-0 text-sm leading-relaxed">{s.text}</p>
         </div>
       ))}
