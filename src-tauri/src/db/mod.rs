@@ -749,14 +749,28 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
-    /// Cascade removes voiceprints; links' persona_id set to NULL by FK.
+    /// Delete a persona: cascade-removes its voiceprints and SET NULLs the
+    /// `persona_id` on `speaker_persona_links` (FK). Also clears the
+    /// per-meeting `speakers.display_name` for every label that was linked
+    /// to this persona, so the transcript falls back to the raw
+    /// `SPEAKER_xx` label instead of retaining the deleted persona's name.
     pub fn delete_persona(&self, persona_id: i64) -> Result<(), String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM personas WHERE id = ?1", params![persona_id])
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE speakers SET display_name = NULL
+             WHERE rowid IN (
+                 SELECT s.rowid FROM speakers s
+                 JOIN speaker_persona_links l
+                   ON s.meeting_id = l.meeting_id AND s.raw_label = l.raw_label
+                 WHERE l.persona_id = ?1
+             )",
+            params![persona_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM personas WHERE id = ?1", params![persona_id])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Hard-delete every voiceprint row (personas kept).
@@ -853,16 +867,57 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
-    pub fn unlink_speaker(&self, meeting_id: i64, raw_label: &str) -> Result<(), String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "DELETE FROM speaker_persona_links WHERE meeting_id = ?1 AND raw_label = ?2",
-                params![meeting_id, raw_label],
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    /// Atomically remove a persona link AND clear the per-meeting display
+    /// rename for that label (revert to the raw `SPEAKER_xx` chip). Wrapping
+    /// both in one transaction prevents a partial-failure state where the
+    /// link is gone but the persona's name persists.
+    pub fn unlink_and_clear_rename(
+        &self,
+        meeting_id: i64,
+        raw_label: &str,
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM speaker_persona_links WHERE meeting_id = ?1 AND raw_label = ?2",
+            params![meeting_id, raw_label],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO speakers(meeting_id, raw_label, display_name) VALUES(?1, ?2, NULL)
+             ON CONFLICT(meeting_id, raw_label) DO UPDATE SET display_name = NULL",
+            params![meeting_id, raw_label],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Delete `speaker_persona_links` rows for labels not in `keep`. Used by
+    /// re-identify to drop links for speakers that disappeared on a re-run
+    /// (e.g. re-diarization merged two clusters into one).
+    pub fn delete_orphaned_links(
+        &self,
+        meeting_id: i64,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let labels: Vec<String> = conn
+            .prepare("SELECT raw_label FROM speaker_persona_links WHERE meeting_id = ?1")
+            .map_err(|e| e.to_string())?
+            .query_map(params![meeting_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        for label in labels {
+            if !keep.contains(&label) {
+                conn.execute(
+                    "DELETE FROM speaker_persona_links WHERE meeting_id = ?1 AND raw_label = ?2",
+                    params![meeting_id, label],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// All links for a meeting, joined with persona display_name.
@@ -977,7 +1032,7 @@ mod tests {
         assert!(links[0].confirmed, "upsert must preserve confirmed=1");
         assert_eq!(links[0].confidence, Some(0.8), "upsert should update confidence");
 
-        db.unlink_speaker(meeting_id, "SPEAKER_00").unwrap();
+        db.unlink_and_clear_rename(meeting_id, "SPEAKER_00").unwrap();
         assert!(db.meeting_speaker_links(meeting_id).unwrap().is_empty());
 
         db.delete_persona(pid).unwrap();
@@ -996,5 +1051,76 @@ mod tests {
             1,
             "cap=1 should keep only the newest voiceprint"
         );
+    }
+
+    #[test]
+    fn delete_persona_clears_display_renames() {
+        let db = tmp_db();
+        let meeting_id = db
+            .insert_meeting("s1", "t", 0, 0, "m.wav", "s.wav")
+            .unwrap();
+        let pid = db.create_persona("Priya").unwrap();
+        // Simulate a prior confirm: link + display rename applied.
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
+            .unwrap();
+        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid).unwrap();
+        db.rename_speaker(meeting_id, "SPEAKER_00", Some("Priya")).unwrap();
+        // Sanity: the rename is present.
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert_eq!(detail.renames.get("SPEAKER_00").map(String::as_str), Some("Priya"));
+
+        db.delete_persona(pid).unwrap();
+        // After delete: link's persona_id is NULL, rename cleared.
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert!(
+            detail.renames.get("SPEAKER_00").is_none(),
+            "delete_persona should clear the display rename"
+        );
+        let link = detail.speaker_links.get("SPEAKER_00").unwrap();
+        assert!(link.persona_id.is_none(), "link persona_id should be NULL after persona delete");
+    }
+
+    #[test]
+    fn unlink_and_clear_rename_is_atomic() {
+        let db = tmp_db();
+        let meeting_id = db
+            .insert_meeting("s2", "t", 0, 0, "m.wav", "s.wav")
+            .unwrap();
+        let pid = db.create_persona("Jordan").unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.8))
+            .unwrap();
+        db.rename_speaker(meeting_id, "SPEAKER_01", Some("Jordan")).unwrap();
+
+        db.unlink_and_clear_rename(meeting_id, "SPEAKER_01").unwrap();
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert!(detail.speaker_links.get("SPEAKER_01").is_none(), "link should be gone");
+        assert!(
+            detail.renames.get("SPEAKER_01").is_none(),
+            "display rename should be cleared"
+        );
+    }
+
+    #[test]
+    fn delete_orphaned_links_keeps_current_labels() {
+        let db = tmp_db();
+        let meeting_id = db
+            .insert_meeting("s3", "t", 0, 0, "m.wav", "s.wav")
+            .unwrap();
+        let pid = db.create_persona("Priya").unwrap();
+        // Two speakers linked from a prior run.
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
+            .unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.7))
+            .unwrap();
+        assert_eq!(db.meeting_speaker_links(meeting_id).unwrap().len(), 2);
+
+        // Re-identify only finds SPEAKER_00 now; SPEAKER_01 is orphaned.
+        let keep: std::collections::HashSet<String> =
+            ["SPEAKER_00".to_string()].into_iter().collect();
+        db.delete_orphaned_links(meeting_id, &keep).unwrap();
+
+        let links = db.meeting_speaker_links(meeting_id).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].raw_label, "SPEAKER_00");
     }
 }

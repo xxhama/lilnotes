@@ -3,7 +3,7 @@
 //! orchestrate enrollment when a human confirms an identity.
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::db::Db;
 use crate::diarize::Turn;
@@ -109,6 +109,11 @@ pub fn identify_and_persist(
     let embeddings = voiceprint.embed_speakers(app, system_wav_path, turns)?;
 
     let personas = db.list_personas_with_voiceprints()?;
+    // Drop links for labels that no longer appear in the current turns
+    // (e.g. a re-diarization merged two clusters into one).
+    let current_labels: HashSet<String> =
+        turns.iter().map(|t| t.speaker.clone()).collect();
+    db.delete_orphaned_links(meeting_id, &current_labels)?;
     // Snapshot links BEFORE upserting so `already_linked` reflects prior
     // identify runs (not the row we're about to write). Also collapses the
     // per-label `meeting_speaker_links` query into one upfront call.
