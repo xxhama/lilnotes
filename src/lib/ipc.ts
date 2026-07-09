@@ -272,6 +272,7 @@ export interface MeetingDetail {
   renames: Record<string, string>;
   /** raw label -> persona link (suggestion/confirmed) per meeting. */
   speakerLinks: Record<string, SpeakerLink>;
+  speakerCount: number;
 }
 
 export function listMeetings(search?: string): Promise<MeetingSummary[]> {
