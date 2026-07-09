@@ -521,6 +521,27 @@ pub struct SummaryRow {
     pub created_at_ms: i64,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Persona {
+    pub id: i64,
+    pub display_name: String,
+    pub notes: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub voiceprint_count: i64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerLink {
+    pub raw_label: String,
+    pub persona_id: Option<i64>,
+    pub persona_name: Option<String>,
+    pub confidence: Option<f32>,
+    pub confirmed: bool,
+}
+
 impl Db {
     // -----------------------------------------------------------------------
     // Summaries (milestone 6)
@@ -560,6 +581,252 @@ impl Db {
                     model: r.get(1)?,
                     content: r.get(2)?,
                     created_at_ms: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+}
+
+impl Db {
+    // -------------------------------------------------------------------
+    // Personas + voiceprints (milestone 9)
+    // -------------------------------------------------------------------
+
+    pub fn list_personas(&self) -> Result<Vec<Persona>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.id, p.display_name, p.notes, p.created_at, p.updated_at,
+                        (SELECT COUNT(*) FROM voiceprints v WHERE v.persona_id = p.id)
+                 FROM personas p ORDER BY p.display_name COLLATE NOCASE",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Persona {
+                    id: r.get(0)?,
+                    display_name: r.get(1)?,
+                    notes: r.get(2)?,
+                    created_at_ms: r.get(3)?,
+                    updated_at_ms: r.get(4)?,
+                    voiceprint_count: r.get(5)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Used by `personas::rank_personas` — loads embeddings unpacked.
+    pub fn list_personas_with_voiceprints(
+        &self,
+    ) -> Result<Vec<crate::personas::PersonaWithEmbeddings>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, display_name FROM personas ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let personas: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(personas.len());
+        for (id, display_name) in personas {
+            let mut stmt2 = conn
+                .prepare("SELECT embedding, dim FROM voiceprints WHERE persona_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let embeddings: Vec<Vec<f32>> = stmt2
+                .query_map(params![id], |r| {
+                    let blob: Vec<u8> = r.get(0)?;
+                    let dim: i64 = r.get(1)?;
+                    Ok(crate::voiceprint::unpack_f32(&blob[..blob.len().min(dim as usize * 4)]))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            out.push(crate::personas::PersonaWithEmbeddings {
+                id,
+                display_name,
+                embeddings,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn create_persona(&self, display_name: &str) -> Result<i64, String> {
+        let name = display_name.trim();
+        if name.is_empty() {
+            return Err("persona name cannot be empty".into());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO personas(display_name, created_at, updated_at) VALUES(?1, ?2, ?2)",
+            params![name, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn rename_persona(&self, persona_id: i64, display_name: &str) -> Result<(), String> {
+        let name = display_name.trim();
+        if name.is_empty() {
+            return Err("persona name cannot be empty".into());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE personas SET display_name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![persona_id, name, now],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Cascade removes voiceprints; links' persona_id set to NULL by FK.
+    pub fn delete_persona(&self, persona_id: i64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM personas WHERE id = ?1", params![persona_id])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Hard-delete every voiceprint row (personas kept).
+    pub fn delete_all_voiceprints(&self) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM voiceprints", [])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Insert a voiceprint. If the persona now exceeds `cap`, drop the
+    /// oldest rows beyond the cap (by `created_at`, then `id`).
+    pub fn insert_voiceprint(
+        &self,
+        persona_id: i64,
+        embedding: &[f32],
+        dim: i32,
+        source_meeting_id: Option<i64>,
+        source_label: Option<&str>,
+        speech_ms: u64,
+        cap: i32,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let blob = crate::voiceprint::pack_f32(embedding);
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO voiceprints(persona_id, embedding, dim, source_meeting_id, source_label, speech_ms, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![persona_id, blob, dim, source_meeting_id, source_label, speech_ms as i64, now],
+        )
+        .map_err(|e| e.to_string())?;
+        if cap > 0 {
+            tx.execute(
+                "DELETE FROM voiceprints WHERE persona_id = ?1 AND id NOT IN (
+                    SELECT id FROM voiceprints WHERE persona_id = ?1
+                    ORDER BY created_at DESC, id DESC LIMIT ?2
+                 )",
+                params![persona_id, cap],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "UPDATE personas SET updated_at = ?2 WHERE id = ?1",
+            params![persona_id, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Upsert a `speaker_persona_links` row. Preserves an existing
+    /// `confirmed = 1` (re-running identify never un-confirms).
+    pub fn upsert_link(
+        &self,
+        meeting_id: i64,
+        raw_label: &str,
+        persona_id: Option<i64>,
+        confidence: Option<f32>,
+    ) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO speaker_persona_links(meeting_id, raw_label, persona_id, confidence, confirmed)
+                 VALUES(?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(meeting_id, raw_label) DO UPDATE SET
+                    persona_id = excluded.persona_id,
+                    confidence = excluded.confidence,
+                    confirmed = MAX(speaker_persona_links.confirmed, 0)",
+                params![meeting_id, raw_label, persona_id, confidence],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_link_confirmed(
+        &self,
+        meeting_id: i64,
+        raw_label: &str,
+        persona_id: i64,
+    ) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE speaker_persona_links
+                 SET persona_id = ?3, confirmed = 1
+                 WHERE meeting_id = ?1 AND raw_label = ?2",
+                params![meeting_id, raw_label, persona_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn unlink_speaker(&self, meeting_id: i64, raw_label: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM speaker_persona_links WHERE meeting_id = ?1 AND raw_label = ?2",
+                params![meeting_id, raw_label],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// All links for a meeting, joined with persona display_name.
+    pub fn meeting_speaker_links(&self, meeting_id: i64) -> Result<Vec<SpeakerLink>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT l.raw_label, l.persona_id, p.display_name, l.confidence, l.confirmed
+                 FROM speaker_persona_links l
+                 LEFT JOIN personas p ON p.id = l.persona_id
+                 WHERE l.meeting_id = ?1
+                 ORDER BY l.raw_label",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| {
+                Ok(SpeakerLink {
+                    raw_label: r.get(0)?,
+                    persona_id: r.get(1)?,
+                    persona_name: r.get(2)?,
+                    confidence: r.get(3)?,
+                    confirmed: r.get::<_, i64>(4)? == 1,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -612,5 +879,43 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {table}");
         }
+    }
+
+    #[test]
+    fn persona_voiceprint_link_roundtrip() {
+        let db = tmp_db();
+        let meeting_id = db
+            .insert_meeting("s1", "t", 0, 0, "m.wav", "s.wav")
+            .unwrap();
+        let pid = db.create_persona("Priya").unwrap();
+        let emb = vec![0.1, 0.2, 0.3];
+        db.insert_voiceprint(pid, &emb, 3, Some(meeting_id), Some("SPEAKER_00"), 5000, 50)
+            .unwrap();
+
+        let personas = db.list_personas().unwrap();
+        assert_eq!(personas.len(), 1);
+        assert_eq!(personas[0].display_name, "Priya");
+        assert_eq!(personas[0].voiceprint_count, 1);
+
+        let with_emb = db.list_personas_with_voiceprints().unwrap();
+        assert_eq!(with_emb[0].embeddings.len(), 1);
+        assert_eq!(with_emb[0].embeddings[0].len(), 3);
+
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
+            .unwrap();
+        let links = db.meeting_speaker_links(meeting_id).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].persona_name.as_deref(), Some("Priya"));
+        assert!(!links[0].confirmed);
+
+        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid).unwrap();
+        let links = db.meeting_speaker_links(meeting_id).unwrap();
+        assert!(links[0].confirmed);
+
+        db.unlink_speaker(meeting_id, "SPEAKER_00").unwrap();
+        assert!(db.meeting_speaker_links(meeting_id).unwrap().is_empty());
+
+        db.delete_persona(pid).unwrap();
+        assert!(db.list_personas().unwrap().is_empty());
     }
 }
