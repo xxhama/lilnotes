@@ -36,24 +36,36 @@ struct DiarizeProgress {
     total: i32,
 }
 
+/// Clustering distance threshold for auto speaker-count mode. Higher merges
+/// more aggressively (fewer speakers). 0.5 over-splits badly on real-world
+/// audio (podcasts, meeting apps with music/processing); ~0.7 is the sweet
+/// spot for CAM++ embeddings.
+const AUTO_THRESHOLD: f32 = 0.7;
+
 #[derive(Default)]
 pub struct DiarizeEngine {
-    inner: Mutex<Option<Diarize>>,
+    /// Loaded engine + the cluster count it was built with (-1 = auto).
+    inner: Mutex<Option<(i32, Diarize)>>,
 }
 
 impl DiarizeEngine {
-    /// Download models if needed and initialize sherpa-onnx (kept loaded).
-    fn ensure_loaded(&self, app: &AppHandle) -> Result<(), String> {
+    /// Download models if needed and initialize sherpa-onnx for the given
+    /// clustering mode (kept loaded; rebuilt when the mode changes).
+    fn ensure_loaded(&self, app: &AppHandle, num_clusters: i32) -> Result<(), String> {
         let mut guard = self.inner.lock().unwrap();
-        if guard.is_some() {
-            return Ok(());
+        if let Some((loaded, _)) = guard.as_ref() {
+            if *loaded == num_clusters {
+                return Ok(());
+            }
         }
+        *guard = None;
         let cancel = AtomicBool::new(false); // small models; not cancellable
         let (seg, emb) = models::ensure_diarize_models(app, &cancel)?;
         let config = DiarizeConfig {
-            // Threshold-based clustering: speaker count is unknown.
-            num_clusters: Some(-1),
-            threshold: Some(0.5),
+            // Exact k when the user declared the speaker count; otherwise
+            // threshold-based clustering.
+            num_clusters: Some(num_clusters),
+            threshold: Some(AUTO_THRESHOLD),
             // Ignore micro-blips; bridge sub-second gaps within a turn.
             min_duration_on: Some(0.3),
             min_duration_off: Some(0.5),
@@ -62,13 +74,21 @@ impl DiarizeEngine {
         };
         let diarize = Diarize::new(seg, emb, config)
             .map_err(|e| format!("failed to initialize diarization: {e}"))?;
-        *guard = Some(diarize);
+        *guard = Some((num_clusters, diarize));
         Ok(())
     }
 
     /// Diarize a 16 kHz mono WAV; emits `diarize:progress` events.
-    pub fn diarize_wav(&self, app: &AppHandle, wav_path: &str) -> Result<Vec<Turn>, String> {
-        self.ensure_loaded(app)?;
+    /// `num_speakers`: Some(k) when the user knows the speaker count
+    /// (dramatically more reliable), None for automatic.
+    pub fn diarize_wav(
+        &self,
+        app: &AppHandle,
+        wav_path: &str,
+        num_speakers: Option<i32>,
+    ) -> Result<Vec<Turn>, String> {
+        let num_clusters = num_speakers.filter(|&n| n > 0).unwrap_or(-1);
+        self.ensure_loaded(app, num_clusters)?;
 
         let mut reader = hound::WavReader::open(wav_path)
             .map_err(|e| format!("cannot open {wav_path}: {e}"))?;
@@ -93,7 +113,7 @@ impl DiarizeEngine {
         });
 
         let mut guard = self.inner.lock().unwrap();
-        let diarize = guard.as_mut().ok_or("diarization not initialized")?;
+        let (_, diarize) = guard.as_mut().ok_or("diarization not initialized")?;
         let segments = diarize
             .compute(samples, Some(callback))
             .map_err(|e| format!("diarization failed: {e}"))?;

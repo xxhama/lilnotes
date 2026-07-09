@@ -273,12 +273,15 @@ pub struct DiarizedTranscript {
 
 /// Diarize a meeting's system channel, persist the labeled segments, and
 /// (optionally, per settings) delete the audio files afterwards.
+/// `num_speakers`: exact remote-speaker count if the user declared one
+/// (much more reliable than automatic estimation).
 #[tauri::command]
 pub async fn diarize_meeting(
     app: AppHandle,
     diarizer: State<'_, Arc<DiarizeEngine>>,
     db: State<'_, Arc<Db>>,
     meeting_id: i64,
+    num_speakers: Option<i32>,
 ) -> Result<DiarizedTranscript, String> {
     let diarizer = diarizer.inner().clone();
     let db = db.inner().clone();
@@ -290,7 +293,7 @@ pub async fn diarize_meeting(
             return Err("transcribe the meeting before identifying speakers".into());
         }
 
-        let turns = diarizer.diarize_wav(&app, &system_wav)?;
+        let turns = diarizer.diarize_wav(&app, &system_wav, num_speakers)?;
         let speaker_count = transcript::assign_speakers(&mut segments, &turns);
         segments.sort_by_key(|s| s.start_ms);
 
