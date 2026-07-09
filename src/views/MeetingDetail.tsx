@@ -67,9 +67,17 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
-    onSpeakersIdentified(() => reload()).then((u) => (unlisten = u));
+    onSpeakersIdentified(() => {
+      if (!cancelled) reload();
+    })
+      .then((u) => {
+        if (cancelled) u();
+        else unlisten = u;
+      });
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, [reload]);
