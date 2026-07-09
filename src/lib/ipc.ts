@@ -40,13 +40,12 @@ export interface StartedRecording {
 }
 
 export interface StoppedRecording {
+  /** The persisted meeting created for this session. */
+  meetingId: number;
   sessionId: string;
-  micWav: string;
-  systemWav: string;
   durationMs: number;
-  startedAtMs: number;
-  /** Present when live transcription ran; null when it was off. */
-  segments: TranscriptSegment[] | null;
+  /** Segments captured live (empty when live transcription was off). */
+  segments: TranscriptSegment[];
   transcriptionError: string | null;
 }
 
@@ -136,6 +135,10 @@ export interface SegmentEvent extends TranscriptSegment {
 export interface AppSettings {
   asrModel: string;
   liveTranscription: boolean;
+  /** Where recordings are stored; null = app data dir. */
+  storageDir: string | null;
+  /** Delete WAVs once a meeting is transcribed + diarized. */
+  deleteAudioAfterTranscription: boolean;
 }
 
 export interface AsrModelInfo {
@@ -176,17 +179,9 @@ export function cancelModelDownload(id: string): Promise<boolean> {
   return invoke<boolean>("cancel_model_download", { id });
 }
 
-/** Batch-transcribe a finished session; emits asr:segment events as it runs. */
-export function transcribeSession(
-  sessionId: string,
-  micWav: string,
-  systemWav: string,
-): Promise<TranscriptSegment[]> {
-  return invoke<TranscriptSegment[]>("transcribe_session", {
-    sessionId,
-    micWav,
-    systemWav,
-  });
+/** Batch-transcribe a persisted meeting; emits asr:segment events as it runs. */
+export function transcribeMeeting(meetingId: number): Promise<TranscriptSegment[]> {
+  return invoke<TranscriptSegment[]>("transcribe_meeting", { meetingId });
 }
 
 export function onAsrSegment(cb: (e: SegmentEvent) => void): Promise<UnlistenFn> {
@@ -211,6 +206,8 @@ export interface DiarizedTranscript {
   segments: TranscriptSegment[];
   /** Number of distinct speakers found on the system channel. */
   speakerCount: number;
+  /** True if the WAVs were removed per the delete-audio setting. */
+  audioDeleted: boolean;
 }
 
 export interface DiarizeProgress {
@@ -219,14 +216,67 @@ export interface DiarizeProgress {
 }
 
 /**
- * Diarize the system channel of a finished session and label the segments.
- * First use downloads two small models (~34 MB, `model:progress` events).
+ * Diarize a meeting's system channel, persist the labeled segments, and
+ * (per settings) delete the audio afterwards. First use downloads two
+ * small models (~34 MB, `model:progress` events).
  */
-export function diarizeSession(
-  systemWav: string,
-  segments: TranscriptSegment[],
-): Promise<DiarizedTranscript> {
-  return invoke<DiarizedTranscript>("diarize_session", { systemWav, segments });
+export function diarizeMeeting(meetingId: number): Promise<DiarizedTranscript> {
+  return invoke<DiarizedTranscript>("diarize_meeting", { meetingId });
+}
+
+// ---------------------------------------------------------------------------
+// Meetings (M5)
+// ---------------------------------------------------------------------------
+
+export interface MeetingSummary {
+  id: number;
+  title: string;
+  startedAtMs: number;
+  durationMs: number | null;
+  segmentCount: number;
+  speakerCount: number;
+  preview: string | null;
+  hasAudio: boolean;
+}
+
+export interface MeetingDetail {
+  id: number;
+  sessionId: string;
+  title: string;
+  startedAtMs: number;
+  endedAtMs: number | null;
+  micWav: string | null;
+  systemWav: string | null;
+  notes: string | null;
+  segments: TranscriptSegment[];
+  /** raw label -> user-chosen display name. */
+  renames: Record<string, string>;
+}
+
+export function listMeetings(search?: string): Promise<MeetingSummary[]> {
+  return invoke<MeetingSummary[]>("list_meetings", { search: search ?? null });
+}
+
+export function getMeeting(meetingId: number): Promise<MeetingDetail> {
+  return invoke<MeetingDetail>("get_meeting", { meetingId });
+}
+
+export function updateMeetingTitle(meetingId: number, title: string): Promise<void> {
+  return invoke("update_meeting_title", { meetingId, title });
+}
+
+/** Persist a display name for a raw speaker label (null clears it). */
+export function renameSpeaker(
+  meetingId: number,
+  rawLabel: string,
+  displayName: string | null,
+): Promise<void> {
+  return invoke("rename_speaker", { meetingId, rawLabel, displayName });
+}
+
+/** Delete a meeting and its audio files. */
+export function deleteMeeting(meetingId: number): Promise<void> {
+  return invoke("delete_meeting", { meetingId });
 }
 
 export function onDiarizeProgress(

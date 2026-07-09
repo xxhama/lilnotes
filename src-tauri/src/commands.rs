@@ -10,12 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 
 use crate::asr::{chunker, AsrEngine, Segment};
-use crate::audio::{CaptureEngine, StartedRecording, StoppedRecording};
+use crate::audio::{CaptureEngine, StartedRecording};
+use crate::db::{Db, MeetingDetail, MeetingSummary};
 use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
-use crate::transcript;
 use crate::permissions::{self, PermissionStatus};
-use crate::settings::{AppSettings, SettingsStore};
+use crate::settings::AppSettings;
+use crate::transcript;
 
 /// Join handle of the live transcription worker for the active session.
 #[derive(Default)]
@@ -31,11 +32,8 @@ pub struct AsrSession(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PingResponse {
-    /// Echo of the message that was sent.
     pub echo: String,
-    /// Backend crate version.
     pub version: String,
-    /// Unix epoch milliseconds when the backend handled the call.
     pub handled_at_ms: u64,
 }
 
@@ -55,7 +53,7 @@ pub fn ping(message: String) -> PingResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Recording (milestone 2)
+// Recording (milestone 2/3/5)
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -66,37 +64,38 @@ pub struct RecordingStatus {
     pub elapsed_ms: Option<u64>,
 }
 
-/// Directory where a session's WAVs live:
-/// `<app data>/recordings/<session timestamp>/`.
-fn session_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("no app data dir: {e}"))?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    Ok(base.join("recordings").join(stamp))
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartRecordingResponse {
     #[serde(flatten)]
     pub started: StartedRecording,
-    /// Whether a live transcription worker is attached to this session.
     pub live_transcription: bool,
-    /// Set when live transcription was requested but couldn't start.
     pub live_transcription_error: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopRecordingResponse {
-    #[serde(flatten)]
-    pub stopped: StoppedRecording,
-    /// Present when live transcription ran (possibly empty for a silent
-    /// meeting); None when it was off — use `transcribe_session` then.
-    pub segments: Option<Vec<Segment>>,
+    /// The persisted meeting row created for this session.
+    pub meeting_id: i64,
+    pub session_id: String,
+    pub duration_ms: u64,
+    /// Segments captured live (empty when live transcription was off).
+    pub segments: Vec<Segment>,
     pub transcription_error: Option<String>,
+}
+
+/// Recordings go to `<storage dir>/recordings/<session timestamp>/`.
+fn session_dir(app: &AppHandle, settings: &AppSettings) -> Result<std::path::PathBuf, String> {
+    let base = match &settings.storage_dir {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("no app data dir: {e}"))?,
+    };
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    Ok(base.join("recordings").join(stamp))
 }
 
 /// Load the configured whisper model if present on disk.
@@ -121,23 +120,22 @@ pub async fn start_recording(
     engine: State<'_, CaptureEngine>,
     asr: State<'_, Arc<AsrEngine>>,
     asr_session: State<'_, AsrSession>,
-    settings: State<'_, SettingsStore>,
+    db: State<'_, Arc<Db>>,
 ) -> Result<StartRecordingResponse, String> {
-    let dir = session_dir(&app)?;
-    let cfg = settings.get();
+    let cfg = db.get_settings();
+    let dir = session_dir(&app, &cfg)?;
 
     // Prepare live transcription if enabled and the model is available.
     // Model loading takes seconds — do it off the async runtime.
     let mut live_error: Option<String> = None;
-    let live_tx = if cfg.live_transcription {
+    if cfg.live_transcription {
         let app2 = app.clone();
         let asr2 = asr.inner().clone();
         let cfg2 = cfg.clone();
-        let load: Result<(), String> = tauri::async_runtime::spawn_blocking(move || {
-            ensure_asr_model(&app2, &asr2, &cfg2)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        let load: Result<(), String> =
+            tauri::async_runtime::spawn_blocking(move || ensure_asr_model(&app2, &asr2, &cfg2))
+                .await
+                .map_err(|e| e.to_string())?;
         match load {
             Ok(()) => {
                 let (tx, rx) = crossbeam_channel::bounded(1024);
@@ -155,16 +153,11 @@ pub async fn start_recording(
                     live_transcription_error: None,
                 });
             }
-            Err(e) => {
-                live_error = Some(e);
-                None
-            }
+            Err(e) => live_error = Some(e),
         }
-    } else {
-        None
-    };
+    }
 
-    let started = engine.start(app.clone(), dir, live_tx)?;
+    let started = engine.start(app.clone(), dir, None)?;
     Ok(StartRecordingResponse {
         started,
         live_transcription: false,
@@ -176,6 +169,7 @@ pub async fn start_recording(
 pub async fn stop_recording(
     engine: State<'_, CaptureEngine>,
     asr_session: State<'_, AsrSession>,
+    db: State<'_, Arc<Db>>,
 ) -> Result<StopRecordingResponse, String> {
     // Stopping capture ends the pipelines, which drops the live senders and
     // lets the ASR worker flush its remainder and exit.
@@ -183,47 +177,40 @@ pub async fn stop_recording(
 
     let handle = asr_session.0.lock().unwrap().take();
     let (segments, transcription_error) = match handle {
-        None => (None, None),
+        None => (Vec::new(), None),
         Some(h) => {
-            // The worker may still be transcribing the tail — join off the
-            // async runtime.
             let joined = tauri::async_runtime::spawn_blocking(move || h.join())
                 .await
                 .map_err(|e| e.to_string())?;
             match joined {
-                Ok(Ok(segments)) => (Some(segments), None),
-                Ok(Err(e)) => (None, Some(e)),
-                Err(_) => (None, Some("transcription worker panicked".into())),
+                Ok(Ok(segments)) => (segments, None),
+                Ok(Err(e)) => (Vec::new(), Some(e)),
+                Err(_) => (Vec::new(), Some("transcription worker panicked".into())),
             }
         }
     };
 
+    // Persist the meeting.
+    let title = chrono::Local::now().format("Meeting — %b %-d, %Y %-I:%M %p").to_string();
+    let meeting_id = db.insert_meeting(
+        &stopped.session_id,
+        &title,
+        stopped.started_at_ms as i64,
+        (stopped.started_at_ms + stopped.duration_ms) as i64,
+        &stopped.mic_wav,
+        &stopped.system_wav,
+    )?;
+    if !segments.is_empty() {
+        db.replace_segments(meeting_id, &segments)?;
+    }
+
     Ok(StopRecordingResponse {
-        stopped,
+        meeting_id,
+        session_id: stopped.session_id,
+        duration_ms: stopped.duration_ms,
         segments,
         transcription_error,
     })
-}
-
-/// Batch transcription of a finished session's WAVs (used when live mode is
-/// off, or to re-run transcription). Emits `asr:segment` events as it goes.
-#[tauri::command]
-pub async fn transcribe_session(
-    app: AppHandle,
-    asr: State<'_, Arc<AsrEngine>>,
-    settings: State<'_, SettingsStore>,
-    session_id: String,
-    mic_wav: String,
-    system_wav: String,
-) -> Result<Vec<Segment>, String> {
-    let asr = asr.inner().clone();
-    let cfg = settings.get();
-    tauri::async_runtime::spawn_blocking(move || {
-        ensure_asr_model(&app, &asr, &cfg)?;
-        chunker::transcribe_wavs(app.clone(), &asr, session_id, &mic_wav, &system_wav)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -242,40 +229,155 @@ pub fn recording_status(engine: State<'_, CaptureEngine>) -> RecordingStatus {
     }
 }
 
+/// Batch transcription of a persisted meeting's WAVs. Emits `asr:segment`
+/// events as it goes and saves the result.
+#[tauri::command]
+pub async fn transcribe_meeting(
+    app: AppHandle,
+    asr: State<'_, Arc<AsrEngine>>,
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+) -> Result<Vec<Segment>, String> {
+    let asr = asr.inner().clone();
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = db.get_settings();
+        let (mic, system) = db.meeting_wavs(meeting_id)?;
+        let (mic, system) = match (mic, system) {
+            (Some(m), Some(s)) => (m, s),
+            _ => return Err("this meeting's audio files have been deleted".into()),
+        };
+        ensure_asr_model(&app, &asr, &cfg)?;
+        let segments =
+            chunker::transcribe_wavs(app.clone(), &asr, format!("meeting-{meeting_id}"), &mic, &system)?;
+        db.replace_segments(meeting_id, &segments)?;
+        Ok(segments)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ---------------------------------------------------------------------------
-// Diarization (milestone 4)
+// Diarization (milestone 4/5)
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiarizedTranscript {
     pub segments: Vec<Segment>,
-    /// Number of distinct speakers found on the system channel.
     pub speaker_count: usize,
+    /// True if the WAVs were removed per the delete-audio setting.
+    pub audio_deleted: bool,
 }
 
-/// Diarize a session's system channel and label the given segments.
-/// Downloads the (small) diarization models on first use, emitting the
-/// usual `model:progress` events; emits `diarize:progress` while running.
+/// Diarize a meeting's system channel, persist the labeled segments, and
+/// (optionally, per settings) delete the audio files afterwards.
 #[tauri::command]
-pub async fn diarize_session(
+pub async fn diarize_meeting(
     app: AppHandle,
     diarizer: State<'_, Arc<DiarizeEngine>>,
-    system_wav: String,
-    mut segments: Vec<Segment>,
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
 ) -> Result<DiarizedTranscript, String> {
     let diarizer = diarizer.inner().clone();
+    let db = db.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let (mic_wav, system_wav) = db.meeting_wavs(meeting_id)?;
+        let system_wav = system_wav.ok_or("this meeting's audio files have been deleted")?;
+        let mut segments = db.meeting_segments(meeting_id)?;
+        if segments.is_empty() {
+            return Err("transcribe the meeting before identifying speakers".into());
+        }
+
         let turns = diarizer.diarize_wav(&app, &system_wav)?;
         let speaker_count = transcript::assign_speakers(&mut segments, &turns);
         segments.sort_by_key(|s| s.start_ms);
+
+        db.replace_segments(meeting_id, &segments)?;
+        let mut labels: Vec<String> = segments
+            .iter()
+            .filter_map(|s| s.speaker.clone())
+            .filter(|s| s.starts_with("SPEAKER_"))
+            .collect();
+        labels.sort();
+        labels.dedup();
+        db.ensure_speakers(meeting_id, &labels)?;
+
+        // Transcript + speakers are safely stored; drop the audio if asked.
+        let mut audio_deleted = false;
+        if db.get_settings().delete_audio_after_transcription {
+            if let Some(mic) = mic_wav {
+                let _ = std::fs::remove_file(&mic);
+            }
+            let _ = std::fs::remove_file(&system_wav);
+            db.clear_audio_paths(meeting_id)?;
+            audio_deleted = true;
+        }
+
         Ok(DiarizedTranscript {
             segments,
             speaker_count,
+            audio_deleted,
         })
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// Meetings CRUD (milestone 5)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_meetings(
+    db: State<'_, Arc<Db>>,
+    search: Option<String>,
+) -> Result<Vec<MeetingSummary>, String> {
+    db.list_meetings(search.as_deref())
+}
+
+#[tauri::command]
+pub fn get_meeting(db: State<'_, Arc<Db>>, meeting_id: i64) -> Result<MeetingDetail, String> {
+    db.get_meeting(meeting_id)
+}
+
+#[tauri::command]
+pub fn update_meeting_title(
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+    title: String,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("title cannot be empty".into());
+    }
+    db.update_title(meeting_id, title)
+}
+
+#[tauri::command]
+pub fn rename_speaker(
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+    raw_label: String,
+    display_name: Option<String>,
+) -> Result<(), String> {
+    let name = display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    db.rename_speaker(meeting_id, &raw_label, name)
+}
+
+/// Delete a meeting row; also removes its WAVs from disk.
+#[tauri::command]
+pub fn delete_meeting(db: State<'_, Arc<Db>>, meeting_id: i64) -> Result<(), String> {
+    let (mic, system) = db.delete_meeting(meeting_id)?;
+    for wav in [mic, system].into_iter().flatten() {
+        let path = std::path::PathBuf::from(&wav);
+        let _ = std::fs::remove_file(&path);
+        // Remove the (now likely empty) session directory.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -312,20 +414,17 @@ pub fn open_privacy_settings(section: String) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Settings + ASR model management (milestone 3)
+// Settings + ASR model management (milestone 3/5)
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn get_settings(settings: State<'_, SettingsStore>) -> AppSettings {
-    settings.get()
+pub fn get_settings(db: State<'_, Arc<Db>>) -> AppSettings {
+    db.get_settings()
 }
 
 #[tauri::command]
-pub fn update_settings(
-    settings: State<'_, SettingsStore>,
-    new_settings: AppSettings,
-) -> Result<(), String> {
-    settings.set(new_settings)
+pub fn update_settings(db: State<'_, Arc<Db>>, new_settings: AppSettings) -> Result<(), String> {
+    db.set_settings(&new_settings)
 }
 
 #[derive(Serialize)]
@@ -342,9 +441,9 @@ pub struct AsrModelInfo {
 #[tauri::command]
 pub fn list_asr_models(
     app: AppHandle,
-    settings: State<'_, SettingsStore>,
+    db: State<'_, Arc<Db>>,
 ) -> Result<Vec<AsrModelInfo>, String> {
-    let active = settings.get().asr_model;
+    let active = db.get_settings().asr_model;
     models::WHISPER_MODELS
         .iter()
         .map(|m| {

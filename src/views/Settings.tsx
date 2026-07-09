@@ -25,6 +25,8 @@ import {
   type DownloadProgress,
   type PermissionStatus,
 } from "@/lib/ipc";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+
 import { useTauriEvent } from "@/lib/useTauriEvent";
 import { cn } from "@/lib/utils";
 
@@ -246,6 +248,66 @@ export default function SettingsView() {
               </div>
             );
           })}
+        </div>
+      </section>
+
+      {/* ------------------------------------------------------------- */}
+      {/* Storage                                                         */}
+      {/* ------------------------------------------------------------- */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">Storage</h2>
+
+        <div className="divide-y rounded-xl border bg-card">
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div className="min-w-0 space-y-0.5">
+              <div className="text-sm font-medium">Recordings location</div>
+              <p className="truncate text-xs text-muted-foreground" data-selectable>
+                {settings?.storageDir ?? "Default (app data folder)"}
+              </p>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={async () => {
+                  if (!settings) return;
+                  const dir = await openDialog({ directory: true, multiple: false });
+                  if (typeof dir === "string") {
+                    saveSettings({ ...settings, storageDir: dir });
+                  }
+                }}
+              >
+                Choose…
+              </Button>
+              {settings?.storageDir && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => saveSettings({ ...settings, storageDir: null })}
+                >
+                  Reset
+                </Button>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Delete audio after transcription</div>
+              <p className="text-xs text-muted-foreground">
+                Remove the WAV files once a meeting is transcribed and speakers
+                are identified. Saves disk space; you can't re-transcribe.
+              </p>
+            </div>
+            {settings && (
+              <Toggle
+                checked={settings.deleteAudioAfterTranscription}
+                onChange={(v) =>
+                  saveSettings({ ...settings, deleteAudioAfterTranscription: v })
+                }
+              />
+            )}
+          </div>
         </div>
       </section>
 

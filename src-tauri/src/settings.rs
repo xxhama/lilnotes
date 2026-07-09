@@ -1,10 +1,5 @@
-//! App settings, stored as JSON in the app data dir.
-//!
-//! Interim solution for M3 — migrates into the SQLite `settings` table in
-//! milestone 5. Keep the shape flat and serde-friendly.
-
-use std::path::PathBuf;
-use std::sync::Mutex;
+//! App settings shape. Stored in the SQLite `settings` table (see `db`);
+//! a pre-M5 `settings.json` is imported once at startup if present.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +10,10 @@ pub struct AppSettings {
     pub asr_model: String,
     /// Transcribe in near-live chunks during recording (vs. after stop).
     pub live_transcription: bool,
+    /// Where session recordings are stored; None = app data dir.
+    pub storage_dir: Option<String>,
+    /// Delete the WAVs once a meeting is transcribed + diarized.
+    pub delete_audio_after_transcription: bool,
 }
 
 impl Default for AppSettings {
@@ -22,39 +21,22 @@ impl Default for AppSettings {
         Self {
             asr_model: "large-v3-turbo".into(),
             live_transcription: true,
+            storage_dir: None,
+            delete_audio_after_transcription: false,
         }
     }
 }
 
-pub struct SettingsStore {
-    path: PathBuf,
-    current: Mutex<AppSettings>,
-}
-
-impl SettingsStore {
-    pub fn load(app_data_dir: PathBuf) -> Self {
-        let path = app_data_dir.join("settings.json");
-        let current = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        Self {
-            path,
-            current: Mutex::new(current),
+/// One-time import of the milestone-3 JSON settings file into SQLite.
+pub fn migrate_json_settings(app_data_dir: &std::path::Path, db: &crate::db::Db) {
+    let json_path = app_data_dir.join("settings.json");
+    if !json_path.exists() {
+        return;
+    }
+    if let Ok(text) = std::fs::read_to_string(&json_path) {
+        if let Ok(settings) = serde_json::from_str::<AppSettings>(&text) {
+            let _ = db.set_settings(&settings);
         }
     }
-
-    pub fn get(&self) -> AppSettings {
-        self.current.lock().unwrap().clone()
-    }
-
-    pub fn set(&self, settings: AppSettings) -> Result<(), String> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-        std::fs::write(&self.path, json).map_err(|e| e.to_string())?;
-        *self.current.lock().unwrap() = settings;
-        Ok(())
-    }
+    let _ = std::fs::rename(&json_path, app_data_dir.join("settings.json.bak"));
 }
