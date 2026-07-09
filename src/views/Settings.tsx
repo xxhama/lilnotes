@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   cancelModelDownload,
+  deleteAllVoiceprints,
   downloadAsrModel,
   getSettings,
   listAsrModels,
@@ -299,6 +300,108 @@ export default function SettingsView() {
             className="w-full resize-y rounded-md border bg-background p-2 font-mono text-xs leading-relaxed outline-none focus:border-ring"
             data-selectable
           />
+        </div>
+      </section>
+
+      {/* ------------------------------------------------------------- */}
+      {/* Personas & voiceprints                                          */}
+      {/* ------------------------------------------------------------- */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">
+          Personas &amp; voiceprints
+        </h2>
+
+        <div className="divide-y rounded-xl border bg-card">
+          <div className="space-y-2 p-4">
+            <div className="text-sm font-medium">Match thresholds</div>
+            <p className="text-xs text-muted-foreground">
+              Cosine similarity cutoffs for suggesting known personas on
+              diarized speakers. Higher = fewer false matches.
+            </p>
+            <label className="flex items-center justify-between gap-3 text-xs">
+              <span>Auto-suggest (pre-fill)</span>
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                max="1"
+                value={settings?.personaAutoThreshold ?? 0.65}
+                onChange={(e) =>
+                  settings &&
+                  saveSettings({
+                    ...settings,
+                    personaAutoThreshold: parseFloat(e.target.value) || 0,
+                  })
+                }
+                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+              />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-xs">
+              <span>Tentative suggestion</span>
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                max="1"
+                value={settings?.personaSuggestThreshold ?? 0.45}
+                onChange={(e) =>
+                  settings &&
+                  saveSettings({
+                    ...settings,
+                    personaSuggestThreshold: parseFloat(e.target.value) || 0,
+                  })
+                }
+                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+              />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-xs">
+              <span>Voiceprints per persona (cap)</span>
+              <input
+                type="number"
+                step="1"
+                min="0"
+                value={settings?.voiceprintGalleryCap ?? 50}
+                onChange={(e) =>
+                  settings &&
+                  saveSettings({
+                    ...settings,
+                    voiceprintGalleryCap: parseInt(e.target.value, 10) || 0,
+                  })
+                }
+                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+              />
+            </label>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Delete all voiceprints</div>
+              <p className="text-xs text-muted-foreground">
+                Clears every persona's stored voiceprints. Personas stay, but
+                recognition starts over. Manage individual personas in the
+                Personas view.
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                if (!confirm("Delete ALL stored voiceprints?")) return;
+                await deleteAllVoiceprints();
+              }}
+            >
+              Clear
+            </Button>
+          </div>
+
+          <div className="p-4 text-xs text-muted-foreground">
+            Voiceprints are biometric data stored only in the local SQLite
+            database at{" "}
+            <code className="rounded bg-secondary px-1">
+              ~/Library/Application Support/co.elastic.lilnote/lilnotes.sqlite3
+            </code>
+            . They never leave your Mac.
+          </div>
         </div>
       </section>
 
