@@ -4,7 +4,10 @@
 
 use serde::Serialize;
 
-use crate::voiceprint::cosine;
+use crate::db::Db;
+use crate::diarize::Turn;
+use crate::settings::AppSettings;
+use crate::voiceprint::{SpeakerEmbedding, VoiceprintEngine, cosine};
 
 /// Confidence tier for a persona suggestion.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +91,86 @@ pub fn rank_personas(personas: &[PersonaWithEmbeddings], query: &[f32]) -> Vec<P
         .collect();
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     scored
+}
+
+/// Run embedding + matching for a meeting's diarized speakers and persist
+/// suggestions into `speaker_persona_links` (confirmed preserved). Returns
+/// one `SpeakerMatch` per raw label that has a usable embedding.
+pub fn identify_and_persist(
+    db: &Db,
+    voiceprint: &VoiceprintEngine,
+    app: &tauri::AppHandle,
+    meeting_id: i64,
+    system_wav_path: &str,
+    turns: &[Turn],
+    settings: &AppSettings,
+) -> Result<Vec<SpeakerMatch>, String> {
+    let embeddings = voiceprint.embed_speakers(app, system_wav_path, turns)?;
+
+    let mut out = Vec::with_capacity(embeddings.len());
+    let personas = db.list_personas_with_voiceprints()?;
+    for (raw_label, emb) in &embeddings {
+        let mut scores = rank_personas(&personas, &emb.vec);
+        for s in scores.iter_mut() {
+            s.tier = classify(s.score, settings.persona_auto_threshold, settings.persona_suggest_threshold);
+        }
+        // Persist the top suggestion (if it clears `suggest`); else null link.
+        let top = scores.first();
+        let (pid, conf) = match top {
+            Some(p) if p.tier != Tier::Unknown => (Some(p.persona_id), Some(p.score)),
+            _ => (None, None),
+        };
+        db.upsert_link(meeting_id, raw_label, pid, conf)?;
+
+        let existing = db
+            .meeting_speaker_links(meeting_id)?
+            .into_iter()
+            .find(|l| l.raw_label == *raw_label);
+        out.push(SpeakerMatch {
+            raw_label: raw_label.clone(),
+            best_score: top.map(|p| p.score).unwrap_or(0.0),
+            suggestions: scores,
+            already_linked: existing.is_some(),
+            confirmed: existing.map(|l| l.confirmed).unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// Enroll a speaker's embedding into a persona's gallery (called only on
+/// human confirmation). Re-derives the embedding from `system_wav_path` for
+/// the given label's turns. If the audio is gone, returns Ok(false) so the
+/// caller can still mark the link confirmed without a voiceprint.
+pub fn enroll(
+    db: &Db,
+    voiceprint: &VoiceprintEngine,
+    app: &tauri::AppHandle,
+    persona_id: i64,
+    meeting_id: i64,
+    raw_label: &str,
+    system_wav_path: Option<&str>,
+    turns: &[Turn],
+    cap: i32,
+) -> Result<bool, String> {
+    let path = match system_wav_path {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let embeddings = voiceprint.embed_speakers(app, path, turns)?;
+    let emb: &SpeakerEmbedding = embeddings
+        .get(raw_label)
+        .ok_or_else(|| format!("no embedding for {raw_label} (need >= {} ms speech)", crate::voiceprint::MIN_SPEECH_MS))?;
+    let dim = emb.vec.len() as i32;
+    db.insert_voiceprint(
+        persona_id,
+        &emb.vec,
+        dim,
+        Some(meeting_id),
+        Some(raw_label),
+        emb.speech_ms,
+        cap,
+    )?;
+    Ok(true)
 }
 
 #[cfg(test)]
