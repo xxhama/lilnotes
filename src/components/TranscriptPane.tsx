@@ -38,8 +38,10 @@ const CHIP_COLORS = [
   "bg-lime-600/10 text-lime-700 dark:text-lime-400",
 ];
 
-function chipColor(raw: string): string {
-  const n = parseInt(raw.replace(/\D/g, ""), 10);
+function chipColor(raw: string, personaId: number | null = null): string {
+  // When a persona is linked, color by personaId so every raw label
+  // confirmed/linked to the same persona shares one color.
+  const n = personaId ?? parseInt(raw.replace(/\D/g, ""), 10);
   return CHIP_COLORS[(Number.isNaN(n) ? 0 : n) % CHIP_COLORS.length];
 }
 
@@ -134,7 +136,7 @@ function SpeakerChip({
         title={clickable ? `Assign ${display}` : undefined}
         className={cn(
           "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
-          chipColor(raw),
+          chipColor(raw, link?.personaId ?? null),
           link && !link.confirmed && "border border-dashed border-amber-500/50",
           clickable && "cursor-pointer hover:ring-1 hover:ring-ring/40",
         )}
