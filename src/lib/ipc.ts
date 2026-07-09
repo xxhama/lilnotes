@@ -143,6 +143,12 @@ export interface AppSettings {
   summaryModel: string | null;
   /** Custom summary prompt template; null = built-in default. */
   summaryTemplate: string | null;
+  /** Cosine score at/above which a persona is a strong (pre-filled) suggestion. */
+  personaAutoThreshold: number;
+  /** Cosine score at/above which a persona is a tentative suggestion. */
+  personaSuggestThreshold: number;
+  /** Max voiceprints kept per persona (oldest pruned on enroll). 0 = unlimited. */
+  voiceprintGalleryCap: number;
 }
 
 export interface AsrModelInfo {
@@ -264,6 +270,8 @@ export interface MeetingDetail {
   segments: TranscriptSegment[];
   /** raw label -> user-chosen display name. */
   renames: Record<string, string>;
+  /** raw label -> persona link (suggestion/confirmed) per meeting. */
+  speakerLinks: Record<string, SpeakerLink>;
 }
 
 export function listMeetings(search?: string): Promise<MeetingSummary[]> {
@@ -403,4 +411,88 @@ export function onDiarizeProgress(
   cb: (e: DiarizeProgress) => void,
 ): Promise<UnlistenFn> {
   return listen<DiarizeProgress>("diarize:progress", (ev) => cb(ev.payload));
+}
+
+// ---------------------------------------------------------------------------
+// Personas + voiceprints (M9)
+// ---------------------------------------------------------------------------
+
+export interface SpeakerLink {
+  rawLabel: string;
+  personaId: number | null;
+  personaName: string | null;
+  confidence: number | null;
+  confirmed: boolean;
+}
+
+export interface Persona {
+  id: number;
+  displayName: string;
+  notes: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+  voiceprintCount: number;
+}
+
+export type Tier = "auto" | "suggest" | "unknown";
+
+export interface PersonaScore {
+  personaId: number;
+  displayName: string;
+  score: number;
+  tier: Tier;
+}
+
+export interface SpeakerMatch {
+  rawLabel: string;
+  suggestions: PersonaScore[];
+  bestScore: number;
+  alreadyLinked: boolean;
+  confirmed: boolean;
+}
+
+export function listPersonas(): Promise<Persona[]> {
+  return invoke<Persona[]>("list_personas");
+}
+
+export function createPersona(displayName: string): Promise<number> {
+  return invoke<number>("create_persona", { displayName });
+}
+
+export function renamePersona(personaId: number, displayName: string): Promise<void> {
+  return invoke<void>("rename_persona", { personaId, displayName });
+}
+
+export function deletePersona(personaId: number): Promise<void> {
+  return invoke<void>("delete_persona", { personaId });
+}
+
+export function deleteAllVoiceprints(): Promise<void> {
+  return invoke<void>("delete_all_voiceprints");
+}
+
+/** Re-run embedding + matching; emits speakers:identified. */
+export function identifySpeakers(meetingId: number): Promise<SpeakerMatch[]> {
+  return invoke<SpeakerMatch[]>("identify_speakers", { meetingId });
+}
+
+export function confirmSpeakerPersona(
+  meetingId: number,
+  rawLabel: string,
+  personaId: number,
+): Promise<void> {
+  return invoke<void>("confirm_speaker_persona", { meetingId, rawLabel, personaId });
+}
+
+export function unlinkSpeakerPersona(
+  meetingId: number,
+  rawLabel: string,
+): Promise<void> {
+  return invoke<void>("unlink_speaker_persona", { meetingId, rawLabel });
+}
+
+export function onSpeakersIdentified(
+  cb: (e: SpeakerMatch[]) => void,
+): Promise<UnlistenFn> {
+  return listen<SpeakerMatch[]>("speakers:identified", (ev) => cb(ev.payload));
 }
