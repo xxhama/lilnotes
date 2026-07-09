@@ -77,7 +77,15 @@ export default function RecordingView({ onNavigate }: Props) {
     }
   });
   useTauriEvent(onAsrSegment, (e) => {
-    setSegments((prev) => [...prev, e]);
+    setSegments((prev) =>
+      // Belt-and-braces: never render the same segment twice even if an
+      // event is delivered more than once.
+      prev.some(
+        (s) => s.source === e.source && s.startMs === e.startMs && s.text === e.text,
+      )
+        ? prev
+        : [...prev, e],
+    );
   });
 
   const start = useCallback(async () => {
