@@ -210,6 +210,21 @@ impl Db {
                 s.summary_template = Some(v);
             }
         }
+        if let Some(v) = get("persona_auto_threshold") {
+            if let Ok(f) = v.parse::<f32>() {
+                s.persona_auto_threshold = f;
+            }
+        }
+        if let Some(v) = get("persona_suggest_threshold") {
+            if let Ok(f) = v.parse::<f32>() {
+                s.persona_suggest_threshold = f;
+            }
+        }
+        if let Some(v) = get("voiceprint_gallery_cap") {
+            if let Ok(n) = v.parse::<i32>() {
+                s.voiceprint_gallery_cap = n;
+            }
+        }
         s
     }
 
@@ -235,6 +250,18 @@ impl Db {
         put(
             "summary_template",
             s.summary_template.clone().unwrap_or_default(),
+        )?;
+        put(
+            "persona_auto_threshold",
+            s.persona_auto_threshold.to_string(),
+        )?;
+        put(
+            "persona_suggest_threshold",
+            s.persona_suggest_threshold.to_string(),
+        )?;
+        put(
+            "voiceprint_gallery_cap",
+            s.voiceprint_gallery_cap.to_string(),
         )?;
         Ok(())
     }
