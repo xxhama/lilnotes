@@ -1,22 +1,25 @@
 import { useState } from "react";
-import { Home, Mic, Settings as SettingsIcon } from "lucide-react";
+import { Home, Mic, Settings as SettingsIcon, Users } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import HomeView from "@/views/Home";
 import RecordingView from "@/views/Recording";
 import MeetingDetailView from "@/views/MeetingDetail";
 import SettingsView from "@/views/Settings";
+import PersonasView from "@/views/Personas";
 
 export type Route =
   | { name: "home" }
   | { name: "recording" }
   | { name: "meeting"; meetingId: string }
-  | { name: "settings" };
+  | { name: "settings" }
+  | { name: "personas" };
 
 const NAV = [
   { route: { name: "home" } as Route, label: "Meetings", icon: Home },
   { route: { name: "recording" } as Route, label: "Record", icon: Mic },
   { route: { name: "settings" } as Route, label: "Settings", icon: SettingsIcon },
+  { route: { name: "personas" } as Route, label: "Personas", icon: Users },
 ];
 
 export default function App() {
@@ -59,6 +62,7 @@ export default function App() {
           <MeetingDetailView meetingId={route.meetingId} onNavigate={setRoute} />
         )}
         {route.name === "settings" && <SettingsView />}
+        {route.name === "personas" && <PersonasView />}
       </main>
     </div>
   );
