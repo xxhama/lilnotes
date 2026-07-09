@@ -192,7 +192,7 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="space-y-2 border-b p-6 pt-12 pb-4">
+      <div className="space-y-2 border-b p-6 pt-6 pb-4">
         <button
           onClick={() => onNavigate({ name: "home" })}
           className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"

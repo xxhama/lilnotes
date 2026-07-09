@@ -27,16 +27,8 @@ export default function App() {
 
   return (
     <div className="flex h-full">
-      {/* Visible draggable title-bar strip under the (hidden) macOS title bar.
-          Keeps the traffic lights clear of content and gives the user a clear
-          area to grab when moving the window. */}
-      <div
-        data-tauri-drag-region
-        className="fixed inset-x-0 top-0 z-40 h-9 bg-card border-b"
-      />
-
       {/* Sidebar */}
-      <aside className="flex w-52 shrink-0 flex-col border-r bg-secondary/40 pt-9">
+      <aside className="flex w-52 shrink-0 flex-col border-r bg-secondary/40">
         <div className="flex h-10 items-center gap-2 px-4">
           <div className="size-5 rounded-md bg-primary" />
           <span className="text-sm font-semibold tracking-tight">LilNotes</span>

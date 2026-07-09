@@ -79,7 +79,7 @@ export default function HomeView({ onNavigate }: Props) {
   }
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 p-8 pt-12">
+    <div className="mx-auto max-w-3xl space-y-4 p-8 pt-6">
       <div className="flex items-center justify-between gap-4">
         <h1 className="text-lg font-semibold tracking-tight">Meetings</h1>
         <Button size="sm" onClick={() => onNavigate({ name: "recording" })}>
