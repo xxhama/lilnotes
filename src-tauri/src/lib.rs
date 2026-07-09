@@ -8,6 +8,7 @@
 //! - `models`      — ML model registry + downloader (M3/M4)
 //! - `settings`    — settings shape (stored in SQLite)
 //! - `diarize`     — sherpa-onnx speaker diarization (M4)
+//! - `personas`   — named identity layer + voiceprint matching (M9)
 //! - `voiceprint`  — CAM++ speaker embeddings for cross-meeting personas (M9)
 //! - `transcript`  — merge + speaker mapping (M4)
 //! - `db`          — SQLite persistence (M5)
@@ -21,6 +22,7 @@ mod keystore;
 mod db;
 mod diarize;
 mod models;
+mod personas;
 mod permissions;
 mod settings;
 mod summary;
