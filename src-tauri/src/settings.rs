@@ -14,6 +14,10 @@ pub struct AppSettings {
     pub storage_dir: Option<String>,
     /// Delete the WAVs once a meeting is transcribed + diarized.
     pub delete_audio_after_transcription: bool,
+    /// Ollama model tag for summaries; None = auto-pick from installed.
+    pub summary_model: Option<String>,
+    /// Custom summary prompt template; None = built-in default.
+    pub summary_template: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -23,6 +27,8 @@ impl Default for AppSettings {
             live_transcription: true,
             storage_dir: None,
             delete_audio_after_transcription: false,
+            summary_model: None,
+            summary_template: None,
         }
     }
 }

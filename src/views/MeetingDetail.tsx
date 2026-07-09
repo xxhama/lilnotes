@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ArrowLeft, FileText, Loader2, Users } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import SummaryPanel from "@/components/SummaryPanel";
 import TranscriptPane from "@/components/TranscriptPane";
 import {
   diarizeMeeting,
@@ -178,22 +179,27 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
 
-      {/* Transcript */}
-      <div className="min-h-0 flex-1">
-        {hasTranscript ? (
-          <TranscriptPane
-            segments={meeting.segments}
-            renames={meeting.renames}
-            onRenameSpeaker={onRename}
-            className="h-full"
-          />
-        ) : (
-          <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
-            {hasAudio
-              ? "This meeting hasn't been transcribed yet."
-              : "No transcript — the audio was deleted before transcription."}
-          </div>
-        )}
+      {/* Transcript + summary */}
+      <div className="flex min-h-0 flex-1">
+        <div className="min-w-0 flex-1">
+          {hasTranscript ? (
+            <TranscriptPane
+              segments={meeting.segments}
+              renames={meeting.renames}
+              onRenameSpeaker={onRename}
+              className="h-full"
+            />
+          ) : (
+            <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
+              {hasAudio
+                ? "This meeting hasn't been transcribed yet."
+                : "No transcript — the audio was deleted before transcription."}
+            </div>
+          )}
+        </div>
+        <aside className="w-96 shrink-0 border-l bg-card/40">
+          <SummaryPanel meetingId={id} hasTranscript={hasTranscript} />
+        </aside>
       </div>
     </div>
   );

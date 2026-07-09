@@ -34,7 +34,7 @@ npm run tauri build   # release .app/.dmg
 | 3 | Transcription (whisper-rs Metal), model download, near-live chunks | ✅ done |
 | 4 | Diarization + merged speaker-labeled transcript | ✅ done |
 | 5 | SQLite persistence, history/detail UI, speaker rename | ✅ done |
-| 6 | Ollama summaries + in-app model manager (pull w/ progress) | ⬜ |
+| 6 | Ollama summaries + in-app model manager (pull w/ progress) | ✅ done |
 | 7 | Export: Markdown, PDF, clipboard | ⬜ |
 | 8 | Signing, notarization, .dmg, first-run flow | ⬜ |
 
@@ -109,6 +109,23 @@ the speaker count is unknown. Rust tests: `cd src-tauri && cargo test`.
    there) and try "Delete audio after transcription" — after the next
    recording finishes processing, its WAVs are gone and the detail page
    shows an "audio deleted" badge.
+
+### Verifying milestone 6
+
+1. Install [Ollama](https://ollama.com/download) and launch it. (Quit it
+   first to check the setup panel: Settings → Summaries should show "Ollama
+   isn't running" with install guidance, and the rest of the app keeps
+   working.)
+2. Settings → Summaries: with Ollama running you see its version, the
+   installed-model picker, and the curated suggestions (gemma4:26b
+   recommended; gemma4:12b is the fast alternative if you want a quicker
+   first test). Pull one — the progress bar should track real percent and
+   cancel must work (a re-pull resumes where it left off).
+3. Open a transcribed meeting → the Summary panel on the right →
+   **Summarize**. Tokens should stream in live; the result is saved (check
+   it survives an app restart) with model + timestamp shown.
+4. Rename a speaker, hit **Regenerate** — action items should now use the
+   new name. Try editing the prompt template in Settings and regenerating.
 
 **Mic echo cancellation.** The mic channel uses macOS voice processing
 (Apple's AEC + noise suppression, the FaceTime stack): speaker output and

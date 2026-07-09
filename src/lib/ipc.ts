@@ -139,6 +139,10 @@ export interface AppSettings {
   storageDir: string | null;
   /** Delete WAVs once a meeting is transcribed + diarized. */
   deleteAudioAfterTranscription: boolean;
+  /** Ollama model tag for summaries; null = auto-pick from installed. */
+  summaryModel: string | null;
+  /** Custom summary prompt template; null = built-in default. */
+  summaryTemplate: string | null;
 }
 
 export interface AsrModelInfo {
@@ -277,6 +281,113 @@ export function renameSpeaker(
 /** Delete a meeting and its audio files. */
 export function deleteMeeting(meetingId: number): Promise<void> {
   return invoke("delete_meeting", { meetingId });
+}
+
+// ---------------------------------------------------------------------------
+// Ollama + summaries (M6)
+// ---------------------------------------------------------------------------
+
+export interface OllamaStatus {
+  reachable: boolean;
+  version: string | null;
+}
+
+export interface InstalledOllamaModel {
+  name: string;
+  sizeBytes: number;
+  parameterSize: string | null;
+  family: string | null;
+}
+
+export interface OllamaModels {
+  installed: InstalledOllamaModel[];
+  /** The model summaries will use (settings override or auto-pick). */
+  active: string | null;
+}
+
+export interface SuggestedModel {
+  tag: string;
+  tier: string;
+  approxDownload: string;
+  note: string;
+  installed: boolean;
+  /** True when the matching -mlx (Apple MLX runtime) variant is installed. */
+  mlxInstalled: boolean;
+}
+
+export interface PullProgress {
+  model: string;
+  status: string;
+  completed: number;
+  total: number;
+  done: boolean;
+  error: string | null;
+}
+
+export interface SummaryRow {
+  id: number;
+  model: string;
+  content: string;
+  createdAtMs: number;
+}
+
+export interface SummaryResult {
+  summaryId: number;
+  model: string;
+  content: string;
+}
+
+export interface SummaryToken {
+  meetingId: number;
+  token: string;
+}
+
+export function ollamaStatus(): Promise<OllamaStatus> {
+  return invoke<OllamaStatus>("ollama_status");
+}
+
+export function listOllamaModels(): Promise<OllamaModels> {
+  return invoke<OllamaModels>("list_ollama_models");
+}
+
+export function suggestedOllamaModels(): Promise<SuggestedModel[]> {
+  return invoke<SuggestedModel[]>("suggested_ollama_models");
+}
+
+/** Resolves when the pull completes/fails; progress via `ollama:pull`. */
+export function pullOllamaModel(model: string): Promise<void> {
+  return invoke("pull_ollama_model", { model });
+}
+
+export function cancelOllamaPull(model: string): Promise<boolean> {
+  return invoke<boolean>("cancel_ollama_pull", { model });
+}
+
+export function defaultSummaryTemplate(): Promise<string> {
+  return invoke<string>("default_summary_template");
+}
+
+/** Generate + persist a summary; tokens stream via `summary:token`. */
+export function summarizeMeeting(
+  meetingId: number,
+  model?: string,
+): Promise<SummaryResult> {
+  return invoke<SummaryResult>("summarize_meeting", {
+    meetingId,
+    model: model ?? null,
+  });
+}
+
+export function listSummaries(meetingId: number): Promise<SummaryRow[]> {
+  return invoke<SummaryRow[]>("list_summaries", { meetingId });
+}
+
+export function onSummaryToken(cb: (e: SummaryToken) => void): Promise<UnlistenFn> {
+  return listen<SummaryToken>("summary:token", (ev) => cb(ev.payload));
+}
+
+export function onOllamaPull(cb: (e: PullProgress) => void): Promise<UnlistenFn> {
+  return listen<PullProgress>("ollama:pull", (ev) => cb(ev.payload));
 }
 
 export function onDiarizeProgress(
