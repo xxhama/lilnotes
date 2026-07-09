@@ -3,6 +3,7 @@
 //! orchestrate enrollment when a human confirms an identity.
 
 use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::db::Db;
 use crate::diarize::Turn;
@@ -107,8 +108,17 @@ pub fn identify_and_persist(
 ) -> Result<Vec<SpeakerMatch>, String> {
     let embeddings = voiceprint.embed_speakers(app, system_wav_path, turns)?;
 
-    let mut out = Vec::with_capacity(embeddings.len());
     let personas = db.list_personas_with_voiceprints()?;
+    // Snapshot links BEFORE upserting so `already_linked` reflects prior
+    // identify runs (not the row we're about to write). Also collapses the
+    // per-label `meeting_speaker_links` query into one upfront call.
+    let prior_links: HashMap<String, crate::db::SpeakerLink> = db
+        .meeting_speaker_links(meeting_id)?
+        .into_iter()
+        .map(|l| (l.raw_label.clone(), l))
+        .collect();
+
+    let mut out = Vec::with_capacity(embeddings.len());
     for (raw_label, emb) in &embeddings {
         let mut scores = rank_personas(&personas, &emb.vec);
         for s in scores.iter_mut() {
@@ -120,12 +130,9 @@ pub fn identify_and_persist(
             Some(p) if p.tier != Tier::Unknown => (Some(p.persona_id), Some(p.score)),
             _ => (None, None),
         };
+        let existing = prior_links.get(raw_label);
         db.upsert_link(meeting_id, raw_label, pid, conf)?;
 
-        let existing = db
-            .meeting_speaker_links(meeting_id)?
-            .into_iter()
-            .find(|l| l.raw_label == *raw_label);
         out.push(SpeakerMatch {
             raw_label: raw_label.clone(),
             best_score: top.map(|p| p.score).unwrap_or(0.0),
