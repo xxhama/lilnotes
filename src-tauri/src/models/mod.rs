@@ -179,7 +179,7 @@ pub fn download_with_progress(
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let emit = |downloaded: u64, total: Option<u64>, done: bool, error: Option<String>| {
-        let _ = app.emit(
+        let _ = app.emit_to("main",
             "model:progress",
             DownloadProgress {
                 id: id.to_string(),

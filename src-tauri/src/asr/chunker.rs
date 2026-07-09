@@ -188,7 +188,7 @@ impl SessionChunker {
 
     fn emit(&mut self, segments: Vec<Segment>) {
         for segment in segments {
-            let _ = self.app.emit(
+            let _ = self.app.emit_to("main",
                 "asr:segment",
                 SegmentEvent {
                     session_id: self.session_id.clone(),
@@ -227,7 +227,7 @@ pub fn spawn_live_worker(
                 },
                 Err(e) => Err(e),
             };
-            let _ = app.emit("asr:done", serde_json::json!({ "sessionId": session_id }));
+            let _ = app.emit_to("main", "asr:done", serde_json::json!({ "sessionId": session_id }));
             result
         })
         .expect("failed to spawn asr worker")
@@ -266,6 +266,6 @@ pub fn transcribe_wavs(
         // feeds is fine).
     }
     let segments = chunker.finish(engine)?;
-    let _ = app.emit("asr:done", serde_json::json!({ "sessionId": session_id }));
+    let _ = app.emit_to("main", "asr:done", serde_json::json!({ "sessionId": session_id }));
     Ok(segments)
 }

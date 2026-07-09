@@ -86,7 +86,7 @@ impl DiarizeEngine {
         let callback = Box::new(move |processed: i32, total: i32| -> i32 {
             let mut last = last_emit.lock().unwrap();
             if last.elapsed() > Duration::from_millis(200) {
-                let _ = progress_app.emit("diarize:progress", DiarizeProgress { processed, total });
+                let _ = progress_app.emit_to("main", "diarize:progress", DiarizeProgress { processed, total });
                 *last = Instant::now();
             }
             0 // continue

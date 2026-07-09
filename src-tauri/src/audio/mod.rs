@@ -149,7 +149,7 @@ impl CaptureEngine {
                 while !stop.load(Ordering::Relaxed) {
                     let (mic_rms, mic_peak) = mic_meters.read_and_reset_peak();
                     let (system_rms, system_peak) = sys_meters.read_and_reset_peak();
-                    let _ = app.emit(
+                    let _ = app.emit_to("main",
                         "capture:levels",
                         LevelsEvent {
                             session_id: session.clone(),
