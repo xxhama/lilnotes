@@ -7,7 +7,7 @@
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::asr::{chunker, AsrEngine, Segment};
 use crate::audio::{CaptureEngine, StartedRecording};
