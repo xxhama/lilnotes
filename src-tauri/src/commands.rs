@@ -11,7 +11,9 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::asr::{chunker, AsrEngine, Segment};
 use crate::audio::{CaptureEngine, StartedRecording, StoppedRecording};
+use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
+use crate::transcript;
 use crate::permissions::{self, PermissionStatus};
 use crate::settings::{AppSettings, SettingsStore};
 
@@ -238,6 +240,42 @@ pub fn recording_status(engine: State<'_, CaptureEngine>) -> RecordingStatus {
             elapsed_ms: None,
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diarization (milestone 4)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiarizedTranscript {
+    pub segments: Vec<Segment>,
+    /// Number of distinct speakers found on the system channel.
+    pub speaker_count: usize,
+}
+
+/// Diarize a session's system channel and label the given segments.
+/// Downloads the (small) diarization models on first use, emitting the
+/// usual `model:progress` events; emits `diarize:progress` while running.
+#[tauri::command]
+pub async fn diarize_session(
+    app: AppHandle,
+    diarizer: State<'_, Arc<DiarizeEngine>>,
+    system_wav: String,
+    mut segments: Vec<Segment>,
+) -> Result<DiarizedTranscript, String> {
+    let diarizer = diarizer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let turns = diarizer.diarize_wav(&app, &system_wav)?;
+        let speaker_count = transcript::assign_speakers(&mut segments, &turns);
+        segments.sort_by_key(|s| s.start_ms);
+        Ok(DiarizedTranscript {
+            segments,
+            speaker_count,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------------------

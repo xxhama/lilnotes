@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import LevelMeter from "@/components/LevelMeter";
 import TranscriptPane from "@/components/TranscriptPane";
 import {
+  diarizeSession,
   micPermissionStatus,
   onAsrDone,
   onAsrSegment,
@@ -53,6 +54,8 @@ export default function RecordingView(_props: Props) {
   const [finished, setFinished] = useState<StoppedRecording | null>(null);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [live, setLive] = useState(false);
+  const [diarizing, setDiarizing] = useState(false);
+  const [renames, setRenames] = useState<Record<string, string>>({});
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
 
@@ -110,6 +113,24 @@ export default function RecordingView(_props: Props) {
     }
   }, []);
 
+  /** Diarize the system channel and swap in the labeled segments. */
+  const runDiarization = useCallback(
+    async (systemWav: string, segs: TranscriptSegment[]) => {
+      if (segs.length === 0) return;
+      setDiarizing(true);
+      try {
+        const result = await diarizeSession(systemWav, segs);
+        setSegments(result.segments);
+        setRenames({});
+      } catch (e) {
+        setNotice(`Speaker identification failed: ${e}`);
+      } finally {
+        setDiarizing(false);
+      }
+    },
+    [],
+  );
+
   const stop = useCallback(async () => {
     setPhase("stopping");
     try {
@@ -120,11 +141,17 @@ export default function RecordingView(_props: Props) {
         setNotice(`Transcription problem: ${result.transcriptionError}`);
       }
       setPhase("idle");
+      if (result.segments && result.segments.length > 0) {
+        // The joined worker result is authoritative (event stream may have
+        // started mid-view); then label speakers.
+        setSegments(result.segments);
+        await runDiarization(result.systemWav, result.segments);
+      }
     } catch (e) {
       setPhase("idle");
       setError(String(e));
     }
-  }, []);
+  }, [runDiarization]);
 
   const runBatchTranscription = useCallback(async () => {
     if (!finished) return;
@@ -132,13 +159,19 @@ export default function RecordingView(_props: Props) {
     setError(null);
     setSegments([]);
     try {
-      await transcribeSession(finished.sessionId, finished.micWav, finished.systemWav);
+      const segs = await transcribeSession(
+        finished.sessionId,
+        finished.micWav,
+        finished.systemWav,
+      );
+      setSegments(segs);
       setPhase("idle");
+      await runDiarization(finished.systemWav, segs);
     } catch (e) {
       setPhase("idle");
       setError(String(e));
     }
-  }, [finished]);
+  }, [finished, runDiarization]);
 
   const recording = phase === "recording";
   const showTranscript = segments.length > 0 || recording || phase === "transcribing";
@@ -213,10 +246,18 @@ export default function RecordingView(_props: Props) {
             (live ? "Recording — transcript fills in below" : "Recording")}
           {phase === "stopping" && "Finishing up… flushing the last transcript chunk"}
           {phase === "transcribing" && "Transcribing recording…"}
-          {phase === "idle" && finished && (
+          {phase === "idle" && diarizing && (
+            <span className="inline-flex items-center gap-1.5">
+              <Loader2 className="size-3.5 animate-spin" />
+              Identifying speakers… (first run downloads a small model)
+            </span>
+          )}
+          {phase === "idle" && !diarizing && finished && (
             <span className="inline-flex items-center gap-1.5">
               <CheckCircle2 className="size-3.5 text-green-600" />
               Saved {fmtElapsed(finished.durationMs)} of audio
+              {segments.some((s) => s.speaker?.startsWith("SPEAKER_")) &&
+                " — click a speaker chip to rename"}
             </span>
           )}
         </p>
@@ -247,7 +288,17 @@ export default function RecordingView(_props: Props) {
               <Loader2 className="size-4 animate-spin" /> Transcribing…
             </div>
           ) : (
-            <TranscriptPane segments={segments} follow={recording || phase === "transcribing"} className="h-full" />
+            <TranscriptPane
+              segments={segments}
+              follow={recording || phase === "transcribing"}
+              renames={renames}
+              onRenameSpeaker={
+                recording
+                  ? undefined
+                  : (raw, name) => setRenames((prev) => ({ ...prev, [raw]: name }))
+              }
+              className="h-full"
+            />
           )}
         </div>
       )}

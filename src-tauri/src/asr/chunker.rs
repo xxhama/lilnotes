@@ -115,6 +115,10 @@ impl ChannelBuffer {
                 start_ms: offset_ms + start,
                 end_ms: offset_ms + end,
                 text,
+                speaker: match self.source {
+                    Source::Mic => Some("Me".into()),
+                    Source::System => None, // diarization fills this in
+                },
             });
         }
         // Keep only the tail of the running prompt.

@@ -125,6 +125,8 @@ export interface TranscriptSegment {
   startMs: number;
   endMs: number;
   text: string;
+  /** "Me" for mic; "SPEAKER_xx" after diarization; null until then. */
+  speaker: string | null;
 }
 
 export interface SegmentEvent extends TranscriptSegment {
@@ -199,4 +201,36 @@ export function onModelProgress(
   cb: (e: DownloadProgress) => void,
 ): Promise<UnlistenFn> {
   return listen<DownloadProgress>("model:progress", (ev) => cb(ev.payload));
+}
+
+// ---------------------------------------------------------------------------
+// Diarization (M4)
+// ---------------------------------------------------------------------------
+
+export interface DiarizedTranscript {
+  segments: TranscriptSegment[];
+  /** Number of distinct speakers found on the system channel. */
+  speakerCount: number;
+}
+
+export interface DiarizeProgress {
+  processed: number;
+  total: number;
+}
+
+/**
+ * Diarize the system channel of a finished session and label the segments.
+ * First use downloads two small models (~34 MB, `model:progress` events).
+ */
+export function diarizeSession(
+  systemWav: string,
+  segments: TranscriptSegment[],
+): Promise<DiarizedTranscript> {
+  return invoke<DiarizedTranscript>("diarize_session", { systemWav, segments });
+}
+
+export function onDiarizeProgress(
+  cb: (e: DiarizeProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<DiarizeProgress>("diarize:progress", (ev) => cb(ev.payload));
 }

@@ -66,6 +66,48 @@ pub fn whisper_model(id: &str) -> Option<&'static WhisperModel> {
     WHISPER_MODELS.iter().find(|m| m.id == id)
 }
 
+// ---------------------------------------------------------------------------
+// Diarization models (sherpa-onnx: pyannote segmentation + CAM++ embeddings)
+// ---------------------------------------------------------------------------
+
+/// pyannote segmentation-3.0, ONNX export (~6 MB).
+pub const DIARIZE_SEGMENTATION_ID: &str = "diarize-segmentation";
+pub const DIARIZE_SEGMENTATION_URL: &str =
+    "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx";
+pub const DIARIZE_SEGMENTATION_FILE: &str = "pyannote-segmentation-3-0.onnx";
+
+/// 3D-Speaker CAM++ speaker embeddings, ONNX (~28 MB). Trained on 200k
+/// speakers; embeddings are largely language-agnostic.
+pub const DIARIZE_EMBEDDING_ID: &str = "diarize-embedding";
+pub const DIARIZE_EMBEDDING_URL: &str =
+    "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx";
+pub const DIARIZE_EMBEDDING_FILE: &str = "3dspeaker-campplus-sv-16k.onnx";
+
+/// (segmentation, embedding) model paths.
+pub fn diarize_model_paths(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
+    let dir = models_dir(app)?;
+    Ok((
+        dir.join(DIARIZE_SEGMENTATION_FILE),
+        dir.join(DIARIZE_EMBEDDING_FILE),
+    ))
+}
+
+/// Download any missing diarization model (idempotent; ~34 MB total on
+/// first run). Emits the usual `model:progress` events.
+pub fn ensure_diarize_models(
+    app: &AppHandle,
+    cancel: &AtomicBool,
+) -> Result<(PathBuf, PathBuf), String> {
+    let (seg, emb) = diarize_model_paths(app)?;
+    if !seg.exists() {
+        download_with_progress(app, DIARIZE_SEGMENTATION_ID, DIARIZE_SEGMENTATION_URL, &seg, cancel)?;
+    }
+    if !emb.exists() {
+        download_with_progress(app, DIARIZE_EMBEDDING_ID, DIARIZE_EMBEDDING_URL, &emb, cancel)?;
+    }
+    Ok((seg, emb))
+}
+
 pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()

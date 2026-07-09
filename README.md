@@ -32,7 +32,7 @@ npm run tauri build   # release .app/.dmg
 | 1 | Scaffold: app shell, IPC round-trip | ✅ done |
 | 2 | Dual-source capture → two 16 kHz WAVs, level meters, permissions | ✅ done |
 | 3 | Transcription (whisper-rs Metal), model download, near-live chunks | ✅ done |
-| 4 | Diarization + merged speaker-labeled transcript | ⬜ |
+| 4 | Diarization + merged speaker-labeled transcript | ✅ done |
 | 5 | SQLite persistence, history/detail UI, speaker rename | ⬜ |
 | 6 | Ollama summaries + in-app model manager (pull w/ progress) | ⬜ |
 | 7 | Export: Markdown, PDF, clipboard | ⬜ |
@@ -79,6 +79,22 @@ Rust unit tests (resampler + limiter): `cd src-tauri && cargo test`.
    segment list. Timestamps should match the audio (`afplay` + spot-check).
 4. Batch mode: toggle live transcription off, record again, then click
    **Transcribe recording** — same output, produced after the fact.
+
+### Verifying milestone 4
+
+1. Record a session where the system channel has **two or more distinct
+   voices** (e.g. play a podcast/interview) while you also speak.
+2. Stop. After transcription finishes, "Identifying speakers…" runs — the
+   first time it downloads two small ONNX models (~34 MB total).
+3. The generic "Speaker" chips become SPEAKER_00 / SPEAKER_01 (color-coded);
+   your speech stays "Me". Spot-check that alternating voices in the
+   recording alternate labels.
+4. Click any SPEAKER_xx chip to rename it (e.g. "Priya") — the name applies
+   across the transcript. (Renames persist per meeting from milestone 5.)
+
+Diarization models: pyannote segmentation-3.0 + 3D-Speaker CAM++
+embeddings, both ONNX via sherpa-onnx; clustering is threshold-based since
+the speaker count is unknown. Rust tests: `cd src-tauri && cargo test`.
 
 **Mic echo cancellation.** The mic channel uses macOS voice processing
 (Apple's AEC + noise suppression, the FaceTime stack): speaker output and
