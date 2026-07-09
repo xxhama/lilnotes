@@ -46,6 +46,8 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"transcribing" | "diarizing" | null>(null);
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
+  /** "auto" or a declared remote-speaker count for re-identification. */
+  const [numSpeakers, setNumSpeakers] = useState<string>("auto");
 
   const reload = useCallback(() => {
     getMeeting(id).then(setMeeting).catch((e) => setError(String(e)));
@@ -63,33 +65,38 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
     }
   }, [id, meeting, titleDraft, reload]);
 
+  const speakerCount = useCallback(
+    () => (numSpeakers === "auto" ? undefined : Number(numSpeakers)),
+    [numSpeakers],
+  );
+
   const runTranscription = useCallback(async () => {
     setBusy("transcribing");
     setError(null);
     try {
       await transcribeMeeting(id);
       setBusy("diarizing");
-      await diarizeMeeting(id);
+      await diarizeMeeting(id, speakerCount());
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
       reload();
     }
-  }, [id, reload]);
+  }, [id, reload, speakerCount]);
 
   const runDiarization = useCallback(async () => {
     setBusy("diarizing");
     setError(null);
     try {
-      await diarizeMeeting(id);
+      await diarizeMeeting(id, speakerCount());
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
       reload();
     }
-  }, [id, reload]);
+  }, [id, reload, speakerCount]);
 
   const onRename = useCallback(
     async (raw: string, name: string) => {
@@ -164,10 +171,27 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
                   : "Transcribe"}
             </Button>
           )}
-          {needsDiarization && busy === null && (
-            <Button size="sm" variant="outline" onClick={runDiarization}>
-              <Users /> Identify speakers
-            </Button>
+          {hasTranscript && hasAudio && busy === null && (
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={runDiarization}>
+                <Users /> {needsDiarization ? "Identify speakers" : "Re-identify speakers"}
+              </Button>
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                Remote speakers:
+                <select
+                  value={numSpeakers}
+                  onChange={(e) => setNumSpeakers(e.target.value)}
+                  className="h-7 rounded-md border bg-card px-1.5 text-xs outline-none focus:border-ring"
+                >
+                  <option value="auto">Auto</option>
+                  {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
           )}
           {busy === "diarizing" && hasTranscript && (
             <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">

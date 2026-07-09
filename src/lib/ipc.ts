@@ -223,9 +223,18 @@ export interface DiarizeProgress {
  * Diarize a meeting's system channel, persist the labeled segments, and
  * (per settings) delete the audio afterwards. First use downloads two
  * small models (~34 MB, `model:progress` events).
+ *
+ * `numSpeakers`: pass the exact remote-speaker count when known — much
+ * more reliable than automatic estimation.
  */
-export function diarizeMeeting(meetingId: number): Promise<DiarizedTranscript> {
-  return invoke<DiarizedTranscript>("diarize_meeting", { meetingId });
+export function diarizeMeeting(
+  meetingId: number,
+  numSpeakers?: number,
+): Promise<DiarizedTranscript> {
+  return invoke<DiarizedTranscript>("diarize_meeting", {
+    meetingId,
+    numSpeakers: numSpeakers ?? null,
+  });
 }
 
 // ---------------------------------------------------------------------------
