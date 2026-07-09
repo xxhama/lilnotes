@@ -10,11 +10,13 @@
 //! - `diarize`     — sherpa-onnx speaker diarization (M4)
 //! - `transcript`  — merge + speaker mapping (M4)
 //! - `db`          — SQLite persistence (M5)
+//! - `keystore`    — macOS Keychain key for SQLCipher (M9)
 //! - `summary`     — Ollama client (M6)
 
 mod asr;
 mod audio;
 mod commands;
+mod keystore;
 mod db;
 mod diarize;
 mod models;
@@ -46,7 +48,12 @@ pub fn run() {
         .manage(DownloadManager::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            let db = Arc::new(Db::open(&db::db_path(&data_dir)).map_err(std::io::Error::other)?);
+            let key = keystore::db_key()
+                .map_err(|e| std::io::Error::other(format!("cannot unlock database: {e}")))?;
+            let db = Arc::new(
+                Db::open(&db::db_path(&data_dir), &key)
+                    .map_err(std::io::Error::other)?,
+            );
             settings::migrate_json_settings(&data_dir, &db);
             app.manage(db);
             Ok(())
