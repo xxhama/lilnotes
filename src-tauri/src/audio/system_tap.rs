@@ -350,10 +350,22 @@ unsafe extern "C-unwind" fn io_proc(
     } else {
         all_buffers
     };
-    let n_buffers = buffers.len();
 
-    let mono: Vec<f32> = if n_buffers > 1 {
-        // Non-interleaved: one buffer per channel; average frame-wise.
+    // Each ABL buffer is an INTERLEAVED stream carrying mNumberChannels
+    // channels (frames = bytes / 4 / channels) — a buffer is NOT one mono
+    // channel. Sub-devices can contribute extra streams here (e.g. the
+    // MacBook speaker array shows up as a 6-channel stream) that are not
+    // system audio, so:
+    // - several buffers that are all true mono planes of equal length =
+    //   one non-interleaved stream; average them frame-wise;
+    // - otherwise the tap's stereo mixdown is the LAST buffer (taps are
+    //   appended after sub-device streams); downmix just that one.
+    let all_mono_planes = buffers.len() > 1
+        && buffers
+            .iter()
+            .all(|b| b.mNumberChannels <= 1 && b.mDataByteSize == buffers[0].mDataByteSize);
+
+    let mono: Vec<f32> = if all_mono_planes {
         let frames = (buffers[0].mDataByteSize as usize) / 4;
         let mut acc = vec![0.0f32; frames];
         let mut used = 0usize;
@@ -361,7 +373,7 @@ unsafe extern "C-unwind" fn io_proc(
             if b.mData.is_null() {
                 continue;
             }
-            let ch = std::slice::from_raw_parts(b.mData as *const f32, (b.mDataByteSize as usize) / 4);
+            let ch = std::slice::from_raw_parts(b.mData as *const f32, frames.min((b.mDataByteSize as usize) / 4));
             for (a, &s) in acc.iter_mut().zip(ch.iter()) {
                 *a += s;
             }
@@ -374,11 +386,12 @@ unsafe extern "C-unwind" fn io_proc(
         }
         acc
     } else {
-        let b = &buffers[0];
+        let b = &buffers[buffers.len() - 1];
         if b.mData.is_null() {
             return 0;
         }
-        let data = std::slice::from_raw_parts(b.mData as *const f32, (b.mDataByteSize as usize) / 4);
+        let samples = (b.mDataByteSize as usize) / 4;
+        let data = std::slice::from_raw_parts(b.mData as *const f32, samples);
         let ch = (b.mNumberChannels as usize).max(1);
         super::pipeline::downmix_interleaved(data, ch)
     };
