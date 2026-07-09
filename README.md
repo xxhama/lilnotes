@@ -37,6 +37,7 @@ npm run tauri build   # release .app/.dmg
 | 6 | Ollama summaries + in-app model manager (pull w/ progress) | ✅ done |
 | 7 | Export: Markdown, PDF, clipboard | ⬜ |
 | 8 | Signing, notarization, .dmg, first-run flow | ⬜ |
+| 9 | Cross-meeting voiceprints & named personas | ✅ done |
 
 ### Verifying milestone 1
 
@@ -137,6 +138,34 @@ the raw mic (a console line notes the fallback). Expect the voice-processed
 mic to sound "thinner" than a raw recording — that is normal and fine for
 ASR.
 
+### Verifying milestone 9
+
+1. Record/transcribe/diarize a meeting with a distinct remote speaker; click
+   that speaker's chip → **Create new persona** "Priya" → confirm. Verify via
+   the Personas view (shows "Priya — 1 voiceprint"). The DB is now encrypted
+   with SQLCipher, so plain `sqlite3` reports "file is not a database" — that
+   itself confirms encryption is active. To inspect rows, install
+   `sqlcipher` (`brew install sqlcipher`), fetch the key from the Keychain
+   (`security find-generic-password -s co.elastic.lilnote -a db-key -w`),
+   hex-encode it, and open with `PRAGMA key = "x'<64 hex chars>'"`.
+2. Record a **second** meeting with the same person. After diarization the
+   chip should pre-fill "Priya" with a confidence % (dashed ring = suggested).
+   Confirm it → `SELECT COUNT(*) FROM voiceprints;` increments (gallery grew).
+3. Negative: a brand-new voice stays `SPEAKER_xx` (no false auto-match).
+4. Adaptive case: in a meeting where Priya is *not* auto-matched (below
+   threshold), manually assign her via the picker; confirm a new voiceprint
+   row is enrolled, then re-run a similar later recording and check the
+   confidence is higher / now clears the threshold.
+5. `delete_persona("Priya")` (Personas view) removes her voiceprints and
+   nulls links; the transcript falls back to the raw `SPEAKER_xx` label.
+6. Encryption: on first launch a Keychain entry is created (service
+   `co.elastic.lilnote`, account `db-key` — verify with `security find-generic-password -s co.elastic.lilnote -a db-key`). Quit, relaunch — the DB
+   unlocks and all data reloads. `sqlite3` on the DB file reports "file is
+   not a database" (encrypted). Deleting the Keychain item and relaunching
+   makes the DB unreadable (intended factory-reset behavior). `cd src-tauri
+   && cargo test` passes (pack/unpack round-trip, cosine, threshold
+   classification, CRUD — all with the fixed test key, no Keychain access).
+
 ## Architecture
 
 ```
@@ -149,6 +178,22 @@ System audio ► (process tap, separate)  ── system.wav ► whisper-rs ─�
 
 Mic segments are labeled **Me**; system-channel segments get diarized speaker
 labels (renamable per meeting). Channels are never mixed before ASR.
+
+**Voiceprints & personas.** CAM++ speaker embeddings computed during
+diarization are persisted (L2-normalized f32 vectors) as per-persona
+"voiceprint galleries" in the same SQLite database. Matching is brute-force
+cosine similarity on-device; a persona's gallery grows only when you confirm
+an identity, so unconfirmed suggestions never corrupt it. Voiceprints are
+biometric data at rest and never leave your Mac. Manage or delete them in
+**Personas** (sidebar) or **Settings → Personas & voiceprints**.
+
+**Encryption at rest.** The entire SQLite database (meetings, transcripts,
+summaries, personas, and voiceprints) is encrypted with SQLCipher. The
+256-bit key is generated on first run and stored in the macOS Keychain
+(service `co.elastic.lilnote`); it is protected by your login keychain
+(FileVault + user password). If the key is deleted, the database becomes
+unreadable — effectively a factory reset. Nothing in the database or the
+key ever leaves your Mac.
 
 ## Signing & notarization (milestone 8)
 
