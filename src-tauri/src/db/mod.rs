@@ -130,6 +130,42 @@ impl Db {
             )
             .map_err(|e| format!("migration failed: {e}"))?;
         }
+        if version < 2 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE personas(
+                    id           INTEGER PRIMARY KEY,
+                    display_name TEXT NOT NULL UNIQUE,
+                    notes        TEXT,
+                    created_at   INTEGER NOT NULL,
+                    updated_at   INTEGER NOT NULL
+                );
+                CREATE TABLE voiceprints(
+                    id                INTEGER PRIMARY KEY,
+                    persona_id        INTEGER NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+                    embedding         BLOB NOT NULL,
+                    dim               INTEGER NOT NULL,
+                    source_meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
+                    source_label      TEXT,
+                    speech_ms         INTEGER NOT NULL,
+                    created_at        INTEGER NOT NULL
+                );
+                CREATE INDEX idx_voiceprints_persona ON voiceprints(persona_id);
+                CREATE TABLE speaker_persona_links(
+                    meeting_id  INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    raw_label   TEXT NOT NULL,
+                    persona_id  INTEGER REFERENCES personas(id) ON DELETE SET NULL,
+                    confidence  REAL,
+                    confirmed   INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(meeting_id, raw_label)
+                );
+                PRAGMA user_version = 2;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v2 failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -536,4 +572,45 @@ impl Db {
 /// Default database location: `<app data>/lilnotes.sqlite3`.
 pub fn db_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("lilnotes.sqlite3")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn tmp_db() -> Arc<Db> {
+        let dir = std::env::temp_dir().join(format!(
+            "lilnotes-m9-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite3");
+        // Fixed test key — bypasses the Keychain so tests stay hermetic.
+        Arc::new(Db::open(&path, &[0x42u8; 32]).unwrap())
+    }
+
+    #[test]
+    fn migrates_to_v2_with_tables() {
+        let db = tmp_db();
+        let conn = db.conn.lock().unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+        for table in ["personas", "voiceprints", "speaker_persona_links"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "missing table {table}");
+        }
+    }
 }
