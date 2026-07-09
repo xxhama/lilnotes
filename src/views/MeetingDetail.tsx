@@ -11,6 +11,7 @@ import {
   getMeeting,
   listPersonas,
   onSpeakersIdentified,
+  onVoiceprintsEnrolled,
   renameSpeaker,
   transcribeMeeting,
   unlinkSpeakerPersona,
@@ -81,6 +82,23 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
       unlisten?.();
     };
   }, [reload]);
+
+  // Refresh persona voiceprint counts when a background enrollment finishes.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    onVoiceprintsEnrolled(() => {
+      if (!cancelled) listPersonas().then(setPersonas).catch(() => {});
+    })
+      .then((u) => {
+        if (cancelled) u();
+        else unlisten = u;
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const commitTitle = useCallback(async () => {
     if (!meeting || titleDraft === null) return;

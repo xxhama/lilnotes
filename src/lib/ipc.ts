@@ -496,3 +496,8 @@ export function onSpeakersIdentified(
 ): Promise<UnlistenFn> {
   return listen<SpeakerMatch[]>("speakers:identified", (ev) => cb(ev.payload));
 }
+
+/** Fires when a background voiceprint enrollment finishes (refresh counts). */
+export function onVoiceprintsEnrolled(cb: () => void): Promise<UnlistenFn> {
+  return listen("voiceprints:enrolled", () => cb());
+}

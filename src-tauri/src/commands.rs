@@ -464,10 +464,11 @@ pub async fn identify_speakers(
 }
 
 /// Confirm that `raw_label` in a meeting is `persona_id`. Marks the link
-/// confirmed AND enrolls that speaker's embedding (if audio is available).
-/// Also applies the persona name via the per-meeting display mapping so the
-/// transcript shows the name. Turns are rebuilt from persisted segments so
-/// the enrolled voiceprint matches the labels shown in the transcript.
+/// confirmed and applies the persona name via the per-meeting display
+/// mapping (so the chip updates immediately), then enrolls the speaker's
+/// embedding in the background (best-effort, slow — CAM++ extraction over
+/// the full system WAV). A `voiceprints:enrolled` event fires when the
+/// enrollment attempt finishes so persona counts can refresh.
 #[tauri::command]
 pub async fn confirm_speaker_persona(
     app: AppHandle,
@@ -478,8 +479,9 @@ pub async fn confirm_speaker_persona(
     persona_id: i64,
 ) -> Result<(), String> {
     let db2 = db.inner().clone();
-    let voiceprint = voiceprint.inner().clone();
     let raw = raw_label.clone();
+    // Steps 1-2 (what the chip reflects) run synchronously so the UI
+    // updates as soon as the command resolves.
     tauri::async_runtime::spawn_blocking(move || {
         // 1. Mark the link confirmed.
         db2.set_link_confirmed(meeting_id, &raw, persona_id)?;
@@ -491,20 +493,32 @@ pub async fn confirm_speaker_persona(
             .map(|p| p.display_name)
             .ok_or("persona not found")?;
         db2.rename_speaker(meeting_id, &raw, Some(&name))?;
-        // 3. Enroll the embedding (best-effort if audio still present).
-        let (_, system) = db2.meeting_wavs(meeting_id)?;
-        if let Some(system_wav) = system {
-            let turns = turns_from_segments(&db2.meeting_segments(meeting_id)?);
-            let cap = db2.get_settings().voiceprint_gallery_cap;
-            let _ = personas::enroll(
-                &db2, &voiceprint, &app, persona_id, meeting_id, &raw,
-                Some(&system_wav), &turns, cap,
-            );
-        }
-        Ok(())
+        Ok::<(), String>(())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    // Step 3: enroll the voiceprint detached — embedding extraction takes a
+    // few seconds and must not block the chip update. Emit when done so the
+    // frontend can refresh persona voiceprint counts.
+    let db3 = db.inner().clone();
+    let voiceprint2 = voiceprint.inner().clone();
+    let raw2 = raw_label.clone();
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Ok((_, Some(system_wav))) = db3.meeting_wavs(meeting_id) {
+            if let Ok(segments) = db3.meeting_segments(meeting_id) {
+                let turns = turns_from_segments(&segments);
+                let cap = db3.get_settings().voiceprint_gallery_cap;
+                let _ = personas::enroll(
+                    &db3, &voiceprint2, &app2, persona_id, meeting_id, &raw2,
+                    Some(&system_wav), &turns, cap,
+                );
+            }
+        }
+        let _ = app2.emit_to("main", "voiceprints:enrolled", ());
+    });
+    Ok(())
 }
 
 /// Remove the persona link for a raw label and clear any display rename
