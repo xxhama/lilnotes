@@ -33,7 +33,8 @@ sherpa-rs = "0.6"  # sherpa-onnx: pyannote segmentation + CAM++ embeddings
 
 # --- transcription (M3) ---
 whisper-rs = { version = "0.16", features = ["metal"] }  # whisper.cpp, Metal backend
-reqwest = { version = "0.12", features = ["blocking"] }  # model downloads (+ Ollama in M6)
+reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }  # model downloads + Ollama
+futures-util = "0.3"  # stream combinators for Ollama NDJSON streaming
 
 # Apple framework bindings (objc2 project). Default features enable the full API.
 objc2 = "0.6"

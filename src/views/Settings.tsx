@@ -27,6 +27,8 @@ import {
 } from "@/lib/ipc";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
+import OllamaManager from "@/components/OllamaManager";
+import { defaultSummaryTemplate } from "@/lib/ipc";
 import { useTauriEvent } from "@/lib/useTauriEvent";
 import { cn } from "@/lib/utils";
 
@@ -97,6 +99,7 @@ export default function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [asrModels, setAsrModels] = useState<AsrModelInfo[]>([]);
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
+  const [templatePlaceholder, setTemplatePlaceholder] = useState("");
 
   const refreshModels = useCallback(() => {
     listAsrModels().then(setAsrModels).catch(() => {});
@@ -105,6 +108,7 @@ export default function SettingsView() {
   useEffect(() => {
     micPermissionStatus().then(setMicPerm);
     getSettings().then(setSettings);
+    defaultSummaryTemplate().then(setTemplatePlaceholder);
     refreshModels();
   }, [refreshModels]);
 
@@ -248,6 +252,53 @@ export default function SettingsView() {
               </div>
             );
           })}
+        </div>
+      </section>
+
+      {/* ------------------------------------------------------------- */}
+      {/* Summaries (Ollama)                                              */}
+      {/* ------------------------------------------------------------- */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">Summaries</h2>
+        {settings && <OllamaManager settings={settings} onSave={saveSettings} />}
+
+        {/* Template editor */}
+        <div className="space-y-2 rounded-xl border bg-card p-4">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Prompt template</div>
+              <p className="text-xs text-muted-foreground">
+                {"{title}"} and {"{transcript}"} are filled in automatically.
+              </p>
+            </div>
+            {settings?.summaryTemplate && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => settings && saveSettings({ ...settings, summaryTemplate: null })}
+              >
+                Reset to default
+              </Button>
+            )}
+          </div>
+          <textarea
+            value={settings?.summaryTemplate ?? templatePlaceholder}
+            onChange={(e) =>
+              settings && setSettings({ ...settings, summaryTemplate: e.target.value })
+            }
+            onBlur={() => {
+              if (!settings) return;
+              const v = settings.summaryTemplate?.trim();
+              saveSettings({
+                ...settings,
+                summaryTemplate: !v || v === templatePlaceholder.trim() ? null : v,
+              });
+            }}
+            rows={8}
+            spellCheck={false}
+            className="w-full resize-y rounded-md border bg-background p-2 font-mono text-xs leading-relaxed outline-none focus:border-ring"
+            data-selectable
+          />
         </div>
       </section>
 

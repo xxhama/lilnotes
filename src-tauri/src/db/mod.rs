@@ -155,6 +155,16 @@ impl Db {
         if let Some(v) = get("delete_audio_after_transcription") {
             s.delete_audio_after_transcription = v == "true";
         }
+        if let Some(v) = get("summary_model") {
+            if !v.is_empty() {
+                s.summary_model = Some(v);
+            }
+        }
+        if let Some(v) = get("summary_template") {
+            if !v.is_empty() {
+                s.summary_template = Some(v);
+            }
+        }
         s
     }
 
@@ -175,6 +185,11 @@ impl Db {
         put(
             "delete_audio_after_transcription",
             s.delete_audio_after_transcription.to_string(),
+        )?;
+        put("summary_model", s.summary_model.clone().unwrap_or_default())?;
+        put(
+            "summary_template",
+            s.summary_template.clone().unwrap_or_default(),
         )?;
         Ok(())
     }
@@ -443,6 +458,63 @@ impl Db {
                     start_ms: r.get::<_, i64>(2)? as u64,
                     end_ms: r.get::<_, i64>(3)? as u64,
                     text: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryRow {
+    pub id: i64,
+    pub model: String,
+    pub content: String,
+    pub created_at_ms: i64,
+}
+
+impl Db {
+    // -----------------------------------------------------------------------
+    // Summaries (milestone 6)
+    // -----------------------------------------------------------------------
+
+    pub fn insert_summary(
+        &self,
+        meeting_id: i64,
+        model: &str,
+        template: &str,
+        content: &str,
+    ) -> Result<i64, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO summaries(meeting_id, model, template, content, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![meeting_id, model, template, content, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Summaries for a meeting, newest first.
+    pub fn list_summaries(&self, meeting_id: i64) -> Result<Vec<SummaryRow>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, model, content, created_at FROM summaries
+                 WHERE meeting_id = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| {
+                Ok(SummaryRow {
+                    id: r.get(0)?,
+                    model: r.get(1)?,
+                    content: r.get(2)?,
+                    created_at_ms: r.get(3)?,
                 })
             })
             .map_err(|e| e.to_string())?

@@ -20,6 +20,7 @@ mod diarize;
 mod models;
 mod permissions;
 mod settings;
+mod summary;
 mod transcript;
 
 use std::sync::Arc;
@@ -71,6 +72,14 @@ pub fn run() {
             commands::list_asr_models,
             commands::download_asr_model,
             commands::cancel_model_download,
+            commands::ollama_status,
+            commands::list_ollama_models,
+            commands::suggested_ollama_models,
+            commands::pull_ollama_model,
+            commands::cancel_ollama_pull,
+            commands::default_summary_template,
+            commands::summarize_meeting,
+            commands::list_summaries,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

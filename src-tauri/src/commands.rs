@@ -16,6 +16,7 @@ use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
 use crate::permissions::{self, PermissionStatus};
 use crate::settings::AppSettings;
+use crate::summary::{self, ollama};
 use crate::transcript;
 
 /// Join handle of the live transcription worker for the active session.
@@ -488,4 +489,165 @@ pub async fn download_asr_model(
 #[tauri::command]
 pub fn cancel_model_download(downloads: State<'_, DownloadManager>, id: String) -> bool {
     downloads.cancel(&id)
+}
+
+// ---------------------------------------------------------------------------
+// Ollama: status, models, pull (milestone 6)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn ollama_status() -> Result<ollama::OllamaStatus, String> {
+    Ok(ollama::status().await)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaModels {
+    pub installed: Vec<ollama::InstalledModel>,
+    /// The model summaries will use (settings override or curated auto-pick).
+    pub active: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_ollama_models(db: State<'_, Arc<Db>>) -> Result<OllamaModels, String> {
+    let installed = ollama::installed_models().await?;
+    let names: Vec<String> = installed.iter().map(|m| m.name.clone()).collect();
+    let settings_model = db.get_settings().summary_model;
+    let active = settings_model
+        .filter(|m| names.iter().any(|n| n == m))
+        .or_else(|| summary::pick_default_model(&names));
+    Ok(OllamaModels { installed, active })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestedModel {
+    pub tag: String,
+    pub tier: String,
+    pub approx_download: String,
+    pub note: String,
+    pub installed: bool,
+    /// Set when the matching `-mlx` (Apple MLX runtime) variant is installed.
+    pub mlx_installed: bool,
+}
+
+#[tauri::command]
+pub async fn suggested_ollama_models() -> Result<Vec<SuggestedModel>, String> {
+    let installed: Vec<String> = ollama::installed_models()
+        .await
+        .map(|ms| ms.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
+    Ok(summary::CURATED_MODELS
+        .iter()
+        .map(|c| SuggestedModel {
+            tag: c.tag.into(),
+            tier: c.tier.into(),
+            approx_download: c.approx_download.into(),
+            note: c.note.into(),
+            installed: installed.iter().any(|m| m == c.tag),
+            mlx_installed: installed.iter().any(|m| m == &format!("{}-mlx", c.tag)),
+        })
+        .collect())
+}
+
+/// Pull a model with live `ollama:pull` progress events. Cancellable;
+/// Ollama resumes cancelled pulls on the next attempt.
+#[tauri::command]
+pub async fn pull_ollama_model(
+    app: AppHandle,
+    downloads: State<'_, DownloadManager>,
+    model: String,
+) -> Result<(), String> {
+    let key = format!("ollama:{model}");
+    let cancel = downloads.begin(&key)?;
+    let result = ollama::pull(&app, &model, &cancel).await;
+    downloads.finish(&key);
+    result
+}
+
+#[tauri::command]
+pub fn cancel_ollama_pull(downloads: State<'_, DownloadManager>, model: String) -> bool {
+    downloads.cancel(&format!("ollama:{model}"))
+}
+
+// ---------------------------------------------------------------------------
+// Summaries (milestone 6)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn default_summary_template() -> String {
+    summary::DEFAULT_TEMPLATE.to_string()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryResult {
+    pub summary_id: i64,
+    pub model: String,
+    pub content: String,
+}
+
+/// Generate a summary for a meeting, streaming tokens via `summary:token`
+/// events, and persist it. `model` overrides the configured/auto-picked one.
+#[tauri::command]
+pub async fn summarize_meeting(
+    app: AppHandle,
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+    model: Option<String>,
+) -> Result<SummaryResult, String> {
+    let meeting = db.get_meeting(meeting_id)?;
+    if meeting.segments.is_empty() {
+        return Err("transcribe the meeting before summarizing".into());
+    }
+
+    // Resolve model: explicit > settings > curated auto-pick.
+    let settings = db.get_settings();
+    let model = match model.or(settings.summary_model) {
+        Some(m) => m,
+        None => {
+            let installed: Vec<String> = ollama::installed_models()
+                .await?
+                .into_iter()
+                .map(|m| m.name)
+                .collect();
+            summary::pick_default_model(&installed).ok_or(
+                "no Ollama model installed — pull one in Settings → Summaries",
+            )?
+        }
+    };
+
+    let template = settings
+        .summary_template
+        .unwrap_or_else(|| summary::DEFAULT_TEMPLATE.to_string());
+    let transcript = summary::transcript_text(&meeting.segments, &meeting.renames);
+    let prompt = summary::build_prompt(&template, &meeting.title, &transcript);
+
+    let app2 = app.clone();
+    let content = ollama::chat_stream(&model, &prompt, |token| {
+        let _ = app2.emit_to(
+            "main",
+            "summary:token",
+            summary::SummaryToken {
+                meeting_id,
+                token: token.to_string(),
+            },
+        );
+    })
+    .await?;
+
+    let summary_id = db.insert_summary(meeting_id, &model, &template, &content)?;
+    Ok(SummaryResult {
+        summary_id,
+        model,
+        content,
+    })
+}
+
+#[tauri::command]
+pub fn list_summaries(
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+) -> Result<Vec<crate::db::SummaryRow>, String> {
+    db.list_summaries(meeting_id)
 }
