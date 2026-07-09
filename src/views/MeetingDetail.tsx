@@ -225,6 +225,12 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span>{fmtDate(meeting.startedAtMs)}</span>
           <span>{fmtDuration(meeting.startedAtMs, meeting.endedAtMs)}</span>
+          {meeting.speakerCount > 0 && (
+            <span className="inline-flex items-center gap-1">
+              <Users className="size-3" />
+              {meeting.speakerCount}
+            </span>
+          )}
           {!hasAudio && <span className="rounded-full bg-secondary px-2 py-0.5">audio deleted</span>}
         </div>
 

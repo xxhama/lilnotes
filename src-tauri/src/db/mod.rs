@@ -50,6 +50,7 @@ pub struct MeetingDetail {
     pub renames: std::collections::HashMap<String, String>,
     /// raw_label -> persona link (suggestion/confirmed) per meeting.
     pub speaker_links: std::collections::HashMap<String, crate::db::SpeakerLink>,
+    pub speaker_count: i64,
 }
 
 impl Db {
@@ -299,8 +300,21 @@ impl Db {
         let sql = r#"
             SELECT m.id, m.title, m.started_at, m.ended_at, m.mic_wav,
                    (SELECT COUNT(*) FROM segments s WHERE s.meeting_id = m.id),
-                   (SELECT COUNT(DISTINCT s.speaker) FROM segments s
-                     WHERE s.meeting_id = m.id AND s.speaker IS NOT NULL),
+                   (SELECT COUNT(DISTINCT
+                       CASE
+                         WHEN s.speaker = 'Me' THEN 'me'
+                         ELSE COALESCE(
+                           (SELECT 'p:' || l.persona_id
+                            FROM speaker_persona_links l
+                            WHERE l.meeting_id = m.id
+                              AND l.raw_label = s.speaker
+                              AND l.persona_id IS NOT NULL
+                              AND l.confirmed = 1
+                            LIMIT 1),
+                           s.speaker)
+                       END)
+                    FROM segments s
+                    WHERE s.meeting_id = m.id AND s.speaker IS NOT NULL),
                    (SELECT s.text FROM segments s WHERE s.meeting_id = m.id
                      ORDER BY s.start_ms LIMIT 1)
             FROM meetings m
@@ -354,67 +368,78 @@ impl Db {
             )
             .map_err(|e| format!("meeting {id} not found: {e}"))?;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT source, speaker, start_ms, end_ms, text FROM segments
-                 WHERE meeting_id = ?1 ORDER BY start_ms",
-            )
-            .map_err(|e| e.to_string())?;
-        let segments = stmt
-            .query_map(params![id], |r| {
-                Ok(Segment {
-                    source: r.get(0)?,
-                    speaker: r.get(1)?,
-                    start_ms: r.get::<_, i64>(2)? as u64,
-                    end_ms: r.get::<_, i64>(3)? as u64,
-                    text: r.get(4)?,
+        let segments: Vec<Segment> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source, speaker, start_ms, end_ms, text FROM segments
+                     WHERE meeting_id = ?1 ORDER BY start_ms",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![id], |r| {
+                    Ok(Segment {
+                        source: r.get(0)?,
+                        speaker: r.get(1)?,
+                        start_ms: r.get::<_, i64>(2)? as u64,
+                        end_ms: r.get::<_, i64>(3)? as u64,
+                        text: r.get(4)?,
+                    })
                 })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT raw_label, display_name FROM speakers
-                 WHERE meeting_id = ?1 AND display_name IS NOT NULL",
-            )
-            .map_err(|e| e.to_string())?;
-        let renames = stmt
-            .query_map(params![id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<std::collections::HashMap<_, _>, _>>()
-            .map_err(|e| e.to_string())?;
+        let renames: std::collections::HashMap<String, String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT raw_label, display_name FROM speakers
+                     WHERE meeting_id = ?1 AND display_name IS NOT NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<std::collections::HashMap<_, _>, _>>()
+                .map_err(|e| e.to_string())?
+        };
 
         // Inlined links query (NOT self.meeting_speaker_links — that would
         // re-lock self.conn and deadlock under std::sync::Mutex).
-        let mut link_stmt = conn
-            .prepare(
-                "SELECT l.raw_label, l.persona_id, p.display_name, l.confidence, l.confirmed
-                 FROM speaker_persona_links l
-                 LEFT JOIN personas p ON p.id = l.persona_id
-                 WHERE l.meeting_id = ?1
-                 ORDER BY l.raw_label",
-            )
-            .map_err(|e| e.to_string())?;
-        let speaker_links = link_stmt
-            .query_map(params![id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    SpeakerLink {
-                        raw_label: r.get(0)?,
-                        persona_id: r.get(1)?,
-                        persona_name: r.get(2)?,
-                        confidence: r.get(3)?,
-                        confirmed: r.get::<_, i64>(4)? == 1,
-                    },
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<std::collections::HashMap<_, _>, _>>()
-            .map_err(|e| e.to_string())?;
+        let speaker_links: std::collections::HashMap<String, SpeakerLink> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT l.raw_label, l.persona_id, p.display_name, l.confidence, l.confirmed
+                     FROM speaker_persona_links l
+                     LEFT JOIN personas p ON p.id = l.persona_id
+                     WHERE l.meeting_id = ?1
+                     ORDER BY l.raw_label",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        SpeakerLink {
+                            raw_label: r.get(0)?,
+                            persona_id: r.get(1)?,
+                            persona_name: r.get(2)?,
+                            confidence: r.get(3)?,
+                            confirmed: r.get::<_, i64>(4)? == 1,
+                        },
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<std::collections::HashMap<_, _>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+
+        // Drop the lock before calling count_speaker_identities to avoid deadlock.
+        drop(conn);
+
+        let speaker_count = self.count_speaker_identities(id)?;
 
         Ok(MeetingDetail {
             id,
@@ -428,7 +453,43 @@ impl Db {
             segments,
             renames,
             speaker_links,
+            speaker_count,
         })
+    }
+
+    /// Count distinct speaker identities for a meeting.
+    ///
+    /// Rules:
+    /// - "Me" always counts as exactly one identity.
+    /// - Raw labels linked to the same confirmed persona collapse to one identity.
+    /// - Unlinked or merely-suggested raw labels each count separately.
+    /// - NULL speakers are ignored.
+    pub fn count_speaker_identities(&self, meeting_id: i64) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                r#"
+                SELECT COUNT(DISTINCT
+                    CASE
+                      WHEN s.speaker = 'Me' THEN 'me'
+                      ELSE COALESCE(
+                        (SELECT 'p:' || l.persona_id
+                         FROM speaker_persona_links l
+                         WHERE l.meeting_id = s.meeting_id
+                           AND l.raw_label = s.speaker
+                           AND l.persona_id IS NOT NULL
+                           AND l.confirmed = 1
+                         LIMIT 1),
+                        s.speaker)
+                    END)
+                FROM segments s
+                WHERE s.meeting_id = ?1 AND s.speaker IS NOT NULL
+                "#,
+                params![meeting_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(count)
     }
 
     pub fn update_title(&self, id: i64, title: &str) -> Result<(), String> {
@@ -958,15 +1019,19 @@ pub fn db_path(app_data_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     fn tmp_db() -> Arc<Db> {
         let dir = std::env::temp_dir().join(format!(
-            "lilnotes-m9-test-{}-{}",
+            "lilnotes-m9-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEST_ID.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.sqlite3");
@@ -1122,5 +1187,148 @@ mod tests {
         let links = db.meeting_speaker_links(meeting_id).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].raw_label, "SPEAKER_00");
+    }
+
+    #[test]
+    fn speaker_identity_count_collapses_confirmed_personas() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting("s4", "t", 0, 0, "m.wav", "s.wav").unwrap();
+
+        // 3 remote raw labels + local user = 4 identities.
+        db.replace_segments(
+            meeting_id,
+            &[
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "hello".into(),
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    text: "a".into(),
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_01".into()),
+                    start_ms: 2000,
+                    end_ms: 3000,
+                    text: "b".into(),
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_02".into()),
+                    start_ms: 3000,
+                    end_ms: 4000,
+                    text: "c".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 4);
+        let summary = db.list_meetings(None).unwrap().pop().unwrap();
+        assert_eq!(summary.speaker_count, 4);
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert_eq!(detail.speaker_count, 4);
+
+        // Confirm two remote labels are the same persona -> count drops to 3.
+        let pid = db.create_persona("Priya").unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9)).unwrap();
+        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid).unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.85)).unwrap();
+        db.set_link_confirmed(meeting_id, "SPEAKER_01", pid).unwrap();
+
+        assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 3);
+        assert_eq!(db.list_meetings(None).unwrap()[0].speaker_count, 3);
+        assert_eq!(db.get_meeting(meeting_id).unwrap().speaker_count, 3);
+
+        // Unlink one -> count returns to 4.
+        db.unlink_and_clear_rename(meeting_id, "SPEAKER_01").unwrap();
+        assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 4);
+        assert_eq!(db.list_meetings(None).unwrap()[0].speaker_count, 4);
+    }
+
+    #[test]
+    fn speaker_identity_count_ignores_unconfirmed_suggestions() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting("s5", "t", 0, 0, "m.wav", "s.wav").unwrap();
+
+        db.replace_segments(
+            meeting_id,
+            &[
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "a".into(),
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_01".into()),
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    text: "b".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        // Suggestion (confirmed = 0) should NOT merge the two labels.
+        let pid = db.create_persona("Priya").unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9)).unwrap();
+
+        assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 2);
+    }
+
+    #[test]
+    fn speaker_identity_count_edge_cases() {
+        let db = tmp_db();
+        let empty_id = db.insert_meeting("empty", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        assert_eq!(db.count_speaker_identities(empty_id).unwrap(), 0);
+
+        let me_id = db.insert_meeting("me", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        db.replace_segments(
+            me_id,
+            &[
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "hello".into(),
+                },
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    text: "world".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.count_speaker_identities(me_id).unwrap(), 1);
+
+        let null_id = db.insert_meeting("null", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        db.replace_segments(
+            null_id,
+            &[
+                Segment {
+                    source: "system".into(),
+                    speaker: None,
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "no speaker".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.count_speaker_identities(null_id).unwrap(), 0);
     }
 }
