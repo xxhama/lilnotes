@@ -18,6 +18,12 @@ pub struct AppSettings {
     pub summary_model: Option<String>,
     /// Custom summary prompt template; None = built-in default.
     pub summary_template: Option<String>,
+    /// Cosine score at/above which a persona is a strong (pre-filled) suggestion.
+    pub persona_auto_threshold: f32,
+    /// Cosine score at/above which a persona is a tentative suggestion.
+    pub persona_suggest_threshold: f32,
+    /// Max voiceprints kept per persona (oldest pruned on enroll). 0 = unlimited.
+    pub voiceprint_gallery_cap: i32,
 }
 
 impl Default for AppSettings {
@@ -29,6 +35,9 @@ impl Default for AppSettings {
             delete_audio_after_transcription: false,
             summary_model: None,
             summary_template: None,
+            persona_auto_threshold: 0.65,
+            persona_suggest_threshold: 0.45,
+            voiceprint_gallery_cap: 50,
         }
     }
 }
