@@ -5,12 +5,18 @@ import { Button } from "@/components/ui/button";
 import SummaryPanel from "@/components/SummaryPanel";
 import TranscriptPane from "@/components/TranscriptPane";
 import {
+  confirmSpeakerPersona,
+  createPersona,
   diarizeMeeting,
   getMeeting,
+  listPersonas,
+  onSpeakersIdentified,
   renameSpeaker,
   transcribeMeeting,
+  unlinkSpeakerPersona,
   updateMeetingTitle,
   type MeetingDetail as Meeting,
+  type Persona,
 } from "@/lib/ipc";
 import type { Route } from "@/App";
 
@@ -48,12 +54,25 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
   /** "auto" or a declared remote-speaker count for re-identification. */
   const [numSpeakers, setNumSpeakers] = useState<string>("auto");
+  const [personas, setPersonas] = useState<Persona[]>([]);
 
   const reload = useCallback(() => {
     getMeeting(id).then(setMeeting).catch((e) => setError(String(e)));
   }, [id]);
 
   useEffect(reload, [reload]);
+
+  useEffect(() => {
+    listPersonas().then(setPersonas).catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onSpeakersIdentified(() => reload()).then((u) => (unlisten = u));
+    return () => {
+      unlisten?.();
+    };
+  }, [reload]);
 
   const commitTitle = useCallback(async () => {
     if (!meeting || titleDraft === null) return;
@@ -105,6 +124,29 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
     },
     [id, reload],
   );
+
+  const onConfirmPersona = useCallback(
+    async (raw: string, personaId: number) => {
+      await confirmSpeakerPersona(id, raw, personaId);
+      reload();
+      setPersonas(await listPersonas());
+    },
+    [id, reload],
+  );
+
+  const onUnlinkPersona = useCallback(
+    async (raw: string) => {
+      await unlinkSpeakerPersona(id, raw);
+      reload();
+    },
+    [id, reload],
+  );
+
+  const onCreatePersona = useCallback(async (name: string): Promise<number> => {
+    const pid = await createPersona(name);
+    setPersonas(await listPersonas());
+    return pid;
+  }, []);
 
   if (!meeting) {
     return (
@@ -211,6 +253,11 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
               segments={meeting.segments}
               renames={meeting.renames}
               onRenameSpeaker={onRename}
+              speakerLinks={meeting.speakerLinks}
+              personas={personas}
+              onConfirmPersona={onConfirmPersona}
+              onUnlinkPersona={onUnlinkPersona}
+              onCreatePersona={onCreatePersona}
               className="h-full"
             />
           ) : (
