@@ -15,9 +15,11 @@ use crate::db::{Db, MeetingDetail, MeetingSummary};
 use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
 use crate::permissions::{self, PermissionStatus};
+use crate::personas;
 use crate::settings::AppSettings;
 use crate::summary::{self, ollama};
 use crate::transcript;
+use crate::voiceprint::VoiceprintEngine;
 
 /// Join handle of the live transcription worker for the active session.
 #[derive(Default)]
@@ -279,11 +281,13 @@ pub struct DiarizedTranscript {
 pub async fn diarize_meeting(
     app: AppHandle,
     diarizer: State<'_, Arc<DiarizeEngine>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
     db: State<'_, Arc<Db>>,
     meeting_id: i64,
     num_speakers: Option<i32>,
 ) -> Result<DiarizedTranscript, String> {
     let diarizer = diarizer.inner().clone();
+    let voiceprint = voiceprint.inner().clone();
     let db = db.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (mic_wav, system_wav) = db.meeting_wavs(meeting_id)?;
@@ -306,6 +310,21 @@ pub async fn diarize_meeting(
         labels.sort();
         labels.dedup();
         db.ensure_speakers(meeting_id, &labels)?;
+
+        // Milestone 9: identity layer (additive). Runs after speakers are
+        // persisted; never blocks the diarize result on failure.
+        let settings = db.get_settings();
+        if let Err(e) = {
+            let matches = personas::identify_and_persist(
+                &db, &voiceprint, &app, meeting_id, &system_wav, &turns, &settings,
+            );
+            match matches {
+                Ok(m) => { let _ = app.emit_to("main", "speakers:identified", m); Ok(()) }
+                Err(e) => Err(e),
+            }
+        } {
+            eprintln!("identify_speakers failed (non-fatal): {e}");
+        }
 
         // Transcript + speakers are safely stored; drop the audio if asked.
         let mut audio_deleted = false;
@@ -367,6 +386,146 @@ pub fn rename_speaker(
 ) -> Result<(), String> {
     let name = display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
     db.rename_speaker(meeting_id, &raw_label, name)
+}
+
+// ---------------------------------------------------------------------------
+// Personas + voiceprints (milestone 9)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonaInfo {
+    pub id: i64,
+    pub display_name: String,
+    pub notes: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub voiceprint_count: i64,
+}
+
+#[tauri::command]
+pub fn list_personas(db: State<'_, Arc<Db>>) -> Result<Vec<PersonaInfo>, String> {
+    db.list_personas()
+        .map(|v| v.into_iter().map(|p| PersonaInfo {
+            id: p.id,
+            display_name: p.display_name,
+            notes: p.notes,
+            created_at_ms: p.created_at_ms,
+            updated_at_ms: p.updated_at_ms,
+            voiceprint_count: p.voiceprint_count,
+        }).collect())
+}
+
+#[tauri::command]
+pub fn create_persona(db: State<'_, Arc<Db>>, display_name: String) -> Result<i64, String> {
+    db.create_persona(&display_name)
+}
+
+#[tauri::command]
+pub fn rename_persona(
+    db: State<'_, Arc<Db>>,
+    persona_id: i64,
+    display_name: String,
+) -> Result<(), String> {
+    db.rename_persona(persona_id, &display_name)
+}
+
+#[tauri::command]
+pub fn delete_persona(db: State<'_, Arc<Db>>, persona_id: i64) -> Result<(), String> {
+    db.delete_persona(persona_id)
+}
+
+#[tauri::command]
+pub fn delete_all_voiceprints(db: State<'_, Arc<Db>>) -> Result<(), String> {
+    db.delete_all_voiceprints()
+}
+
+/// Re-run embedding + matching for a meeting's diarized speakers; persists
+/// suggestions (confirmed preserved). Useful to re-match after the gallery
+/// grew. Fails gracefully if the audio has been deleted.
+#[tauri::command]
+pub async fn identify_speakers(
+    app: AppHandle,
+    db: State<'_, Arc<Db>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
+    diarizer: State<'_, Arc<DiarizeEngine>>,
+    meeting_id: i64,
+) -> Result<Vec<personas::SpeakerMatch>, String> {
+    let db = db.inner().clone();
+    let voiceprint = voiceprint.inner().clone();
+    let diarizer = diarizer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, system_wav) = db.meeting_wavs(meeting_id)?;
+        let system_wav = system_wav.ok_or("this meeting's audio files have been deleted")?;
+        let turns = diarizer.diarize_wav(&app, &system_wav, None)?;
+        let settings = db.get_settings();
+        let matches = personas::identify_and_persist(
+            &db, &voiceprint, &app, meeting_id, &system_wav, &turns, &settings,
+        )?;
+        let _ = app.emit_to("main", "speakers:identified", matches.clone());
+        Ok(matches)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Confirm that `raw_label` in a meeting is `persona_id`. Marks the link
+/// confirmed AND enrolls that speaker's embedding (if audio is available).
+/// Also applies the persona name via the per-meeting display mapping so the
+/// transcript shows the name.
+#[tauri::command]
+pub async fn confirm_speaker_persona(
+    app: AppHandle,
+    db: State<'_, Arc<Db>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
+    diarizer: State<'_, Arc<DiarizeEngine>>,
+    meeting_id: i64,
+    raw_label: String,
+    persona_id: i64,
+) -> Result<(), String> {
+    let db2 = db.inner().clone();
+    let voiceprint = voiceprint.inner().clone();
+    let diarizer = diarizer.inner().clone();
+    let raw = raw_label.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // 1. Mark the link confirmed.
+        db2.set_link_confirmed(meeting_id, &raw, persona_id)?;
+        // 2. Apply the persona name to the per-meeting display mapping.
+        let name = db2
+            .list_personas()?
+            .into_iter()
+            .find(|p| p.id == persona_id)
+            .map(|p| p.display_name)
+            .ok_or("persona not found")?;
+        db2.rename_speaker(meeting_id, &raw, Some(&name))?;
+        // 3. Enroll the embedding (best-effort if audio still present).
+        let (mic, system) = db2.meeting_wavs(meeting_id)?;
+        if let Some(system_wav) = system {
+            let turns = diarizer.diarize_wav(&app, &system_wav, None)?;
+            let cap = db2.get_settings().voiceprint_gallery_cap;
+            let _ = personas::enroll(
+                &db2, &voiceprint, &app, persona_id, meeting_id, &raw,
+                Some(&system_wav), &turns, cap,
+            );
+        }
+        let _ = mic; // mic unused for enrollment
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Remove the persona link for a raw label and clear any display rename
+/// applied by a prior confirm (revert to the raw `SPEAKER_xx` label).
+#[tauri::command]
+pub async fn unlink_speaker_persona(
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+    raw_label: String,
+) -> Result<(), String> {
+    db.unlink_speaker(meeting_id, &raw_label)?;
+    db.rename_speaker(meeting_id, &raw_label, None)?;
+    Ok(())
 }
 
 /// Delete a meeting row; also removes its WAVs from disk.

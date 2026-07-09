@@ -48,6 +48,8 @@ pub struct MeetingDetail {
     pub segments: Vec<Segment>,
     /// raw_label -> display_name (only rows the user renamed).
     pub renames: std::collections::HashMap<String, String>,
+    /// raw_label -> persona link (suggestion/confirmed) per meeting.
+    pub speaker_links: std::collections::HashMap<String, crate::db::SpeakerLink>,
 }
 
 impl Db {
@@ -386,6 +388,34 @@ impl Db {
             .collect::<Result<std::collections::HashMap<_, _>, _>>()
             .map_err(|e| e.to_string())?;
 
+        // Inlined links query (NOT self.meeting_speaker_links — that would
+        // re-lock self.conn and deadlock under std::sync::Mutex).
+        let mut link_stmt = conn
+            .prepare(
+                "SELECT l.raw_label, l.persona_id, p.display_name, l.confidence, l.confirmed
+                 FROM speaker_persona_links l
+                 LEFT JOIN personas p ON p.id = l.persona_id
+                 WHERE l.meeting_id = ?1
+                 ORDER BY l.raw_label",
+            )
+            .map_err(|e| e.to_string())?;
+        let speaker_links = link_stmt
+            .query_map(params![id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    SpeakerLink {
+                        raw_label: r.get(0)?,
+                        persona_id: r.get(1)?,
+                        persona_name: r.get(2)?,
+                        confidence: r.get(3)?,
+                        confirmed: r.get::<_, i64>(4)? == 1,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())?;
+
         Ok(MeetingDetail {
             id,
             session_id,
@@ -397,6 +427,7 @@ impl Db {
             notes,
             segments,
             renames,
+            speaker_links,
         })
     }
 
