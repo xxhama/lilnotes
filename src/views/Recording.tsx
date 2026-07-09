@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, FileText, Loader2, Mic, Square } from "lucide-react";
+import { AlertTriangle, FileText, Loader2, Mic, Square } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import LevelMeter from "@/components/LevelMeter";
 import TranscriptPane from "@/components/TranscriptPane";
 import {
-  diarizeSession,
+  diarizeMeeting,
   micPermissionStatus,
-  onAsrDone,
   onAsrSegment,
   onLevels,
   openPrivacySettings,
@@ -15,7 +14,7 @@ import {
   requestMicPermission,
   startRecording,
   stopRecording,
-  transcribeSession,
+  transcribeMeeting,
   type LevelsEvent,
   type PermissionStatus,
   type StoppedRecording,
@@ -29,7 +28,13 @@ interface Props {
   onNavigate: (route: Route) => void;
 }
 
-type Phase = "idle" | "starting" | "recording" | "stopping" | "transcribing";
+type Phase =
+  | "idle"
+  | "starting"
+  | "recording"
+  | "stopping"
+  | "transcribing"
+  | "diarizing";
 
 function fmtElapsed(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -42,10 +47,11 @@ function fmtElapsed(ms: number): string {
 }
 
 /**
- * Recording view: record/stop, dual level meters, elapsed timer, and the
- * live transcript pane (segments stream in as speech is recognized).
+ * Recording view: record/stop, dual level meters, elapsed timer, live
+ * transcript. When a recording finishes (and is transcribed + diarized),
+ * navigation moves to the persisted meeting's detail view.
  */
-export default function RecordingView(_props: Props) {
+export default function RecordingView({ onNavigate }: Props) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [levels, setLevels] = useState<LevelsEvent | null>(null);
   const [micPerm, setMicPerm] = useState<PermissionStatus | null>(null);
@@ -54,8 +60,6 @@ export default function RecordingView(_props: Props) {
   const [finished, setFinished] = useState<StoppedRecording | null>(null);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [live, setLive] = useState(false);
-  const [diarizing, setDiarizing] = useState(false);
-  const [renames, setRenames] = useState<Record<string, string>>({});
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
 
@@ -67,8 +71,6 @@ export default function RecordingView(_props: Props) {
     micPermissionStatus().then(setMicPerm);
   }, []);
 
-  // Backend events (useTauriEvent survives StrictMode double-mounting
-  // without leaking duplicate listeners).
   useTauriEvent(onLevels, (e) => {
     if (phaseRef.current === "recording" || phaseRef.current === "starting") {
       setLevels(e);
@@ -76,9 +78,6 @@ export default function RecordingView(_props: Props) {
   });
   useTauriEvent(onAsrSegment, (e) => {
     setSegments((prev) => [...prev, e]);
-  });
-  useTauriEvent(onAsrDone, () => {
-    // Live worker finished flushing after stop; nothing else pending.
   });
 
   const start = useCallback(async () => {
@@ -113,24 +112,6 @@ export default function RecordingView(_props: Props) {
     }
   }, []);
 
-  /** Diarize the system channel and swap in the labeled segments. */
-  const runDiarization = useCallback(
-    async (systemWav: string, segs: TranscriptSegment[]) => {
-      if (segs.length === 0) return;
-      setDiarizing(true);
-      try {
-        const result = await diarizeSession(systemWav, segs);
-        setSegments(result.segments);
-        setRenames({});
-      } catch (e) {
-        setNotice(`Speaker identification failed: ${e}`);
-      } finally {
-        setDiarizing(false);
-      }
-    },
-    [],
-  );
-
   const stop = useCallback(async () => {
     setPhase("stopping");
     try {
@@ -140,18 +121,23 @@ export default function RecordingView(_props: Props) {
       if (result.transcriptionError) {
         setNotice(`Transcription problem: ${result.transcriptionError}`);
       }
-      setPhase("idle");
-      if (result.segments && result.segments.length > 0) {
-        // The joined worker result is authoritative (event stream may have
-        // started mid-view); then label speakers.
+      if (result.segments.length > 0) {
         setSegments(result.segments);
-        await runDiarization(result.systemWav, result.segments);
+        setPhase("diarizing");
+        try {
+          await diarizeMeeting(result.meetingId);
+        } catch (e) {
+          setNotice(`Speaker identification failed: ${e}`);
+        }
+        onNavigate({ name: "meeting", meetingId: String(result.meetingId) });
+      } else {
+        setPhase("idle");
       }
     } catch (e) {
       setPhase("idle");
       setError(String(e));
     }
-  }, [runDiarization]);
+  }, [onNavigate]);
 
   const runBatchTranscription = useCallback(async () => {
     if (!finished) return;
@@ -159,22 +145,23 @@ export default function RecordingView(_props: Props) {
     setError(null);
     setSegments([]);
     try {
-      const segs = await transcribeSession(
-        finished.sessionId,
-        finished.micWav,
-        finished.systemWav,
-      );
-      setSegments(segs);
-      setPhase("idle");
-      await runDiarization(finished.systemWav, segs);
+      await transcribeMeeting(finished.meetingId);
+      setPhase("diarizing");
+      try {
+        await diarizeMeeting(finished.meetingId);
+      } catch (e) {
+        setNotice(`Speaker identification failed: ${e}`);
+      }
+      onNavigate({ name: "meeting", meetingId: String(finished.meetingId) });
     } catch (e) {
       setPhase("idle");
       setError(String(e));
     }
-  }, [finished, runDiarization]);
+  }, [finished, onNavigate]);
 
   const recording = phase === "recording";
-  const showTranscript = segments.length > 0 || recording || phase === "transcribing";
+  const showTranscript =
+    segments.length > 0 || recording || phase === "transcribing" || phase === "diarizing";
 
   return (
     <div className="flex h-full flex-col">
@@ -184,10 +171,7 @@ export default function RecordingView(_props: Props) {
           <div className="flex w-full items-start gap-3 rounded-lg border border-destructive/30 bg-card p-4 text-sm">
             <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
             <div className="space-y-2">
-              <p>
-                LilNotes needs microphone access to record your side of the
-                meeting.
-              </p>
+              <p>LilNotes needs microphone access to record your side of the meeting.</p>
               <Button
                 variant="outline"
                 size="sm"
@@ -211,7 +195,7 @@ export default function RecordingView(_props: Props) {
 
           <button
             onClick={recording ? stop : start}
-            disabled={phase === "starting" || phase === "stopping" || phase === "transcribing"}
+            disabled={!["idle", "recording"].includes(phase)}
             className={cn(
               "flex size-16 items-center justify-center rounded-full shadow-md transition-all",
               "focus-visible:ring-4 focus-visible:ring-ring/40 focus-visible:outline-none",
@@ -246,26 +230,32 @@ export default function RecordingView(_props: Props) {
             (live ? "Recording — transcript fills in below" : "Recording")}
           {phase === "stopping" && "Finishing up… flushing the last transcript chunk"}
           {phase === "transcribing" && "Transcribing recording…"}
-          {phase === "idle" && diarizing && (
+          {phase === "diarizing" && (
             <span className="inline-flex items-center gap-1.5">
               <Loader2 className="size-3.5 animate-spin" />
               Identifying speakers… (first run downloads a small model)
             </span>
           )}
-          {phase === "idle" && !diarizing && finished && (
-            <span className="inline-flex items-center gap-1.5">
-              <CheckCircle2 className="size-3.5 text-green-600" />
-              Saved {fmtElapsed(finished.durationMs)} of audio
-              {segments.some((s) => s.speaker?.startsWith("SPEAKER_")) &&
-                " — click a speaker chip to rename"}
-            </span>
-          )}
+          {phase === "idle" && finished && `Saved ${fmtElapsed(finished.durationMs)} of audio`}
         </p>
 
-        {finished && segments.length === 0 && phase === "idle" && (
-          <Button size="sm" variant="outline" onClick={runBatchTranscription}>
-            <FileText /> Transcribe recording
-          </Button>
+        {finished && phase === "idle" && (
+          <div className="flex gap-2">
+            {finished.segments.length === 0 && (
+              <Button size="sm" onClick={runBatchTranscription}>
+                <FileText /> Transcribe recording
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                onNavigate({ name: "meeting", meetingId: String(finished.meetingId) })
+              }
+            >
+              View meeting
+            </Button>
+          </div>
         )}
 
         {notice && (
@@ -283,20 +273,15 @@ export default function RecordingView(_props: Props) {
       {/* Bottom: live transcript */}
       {showTranscript && (
         <div className="min-h-0 flex-1 border-t bg-card/50">
-          {phase === "transcribing" && segments.length === 0 ? (
+          {(phase === "transcribing" || phase === "diarizing") && segments.length === 0 ? (
             <div className="flex items-center justify-center gap-2 p-6 text-sm text-muted-foreground">
-              <Loader2 className="size-4 animate-spin" /> Transcribing…
+              <Loader2 className="size-4 animate-spin" />
+              {phase === "transcribing" ? "Transcribing…" : "Identifying speakers…"}
             </div>
           ) : (
             <TranscriptPane
               segments={segments}
               follow={recording || phase === "transcribing"}
-              renames={renames}
-              onRenameSpeaker={
-                recording
-                  ? undefined
-                  : (raw, name) => setRenames((prev) => ({ ...prev, [raw]: name }))
-              }
               className="h-full"
             />
           )}

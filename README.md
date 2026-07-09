@@ -33,7 +33,7 @@ npm run tauri build   # release .app/.dmg
 | 2 | Dual-source capture → two 16 kHz WAVs, level meters, permissions | ✅ done |
 | 3 | Transcription (whisper-rs Metal), model download, near-live chunks | ✅ done |
 | 4 | Diarization + merged speaker-labeled transcript | ✅ done |
-| 5 | SQLite persistence, history/detail UI, speaker rename | ⬜ |
+| 5 | SQLite persistence, history/detail UI, speaker rename | ✅ done |
 | 6 | Ollama summaries + in-app model manager (pull w/ progress) | ⬜ |
 | 7 | Export: Markdown, PDF, clipboard | ⬜ |
 | 8 | Signing, notarization, .dmg, first-run flow | ⬜ |
@@ -95,6 +95,20 @@ Rust unit tests (resampler + limiter): `cd src-tauri && cargo test`.
 Diarization models: pyannote segmentation-3.0 + 3D-Speaker CAM++
 embeddings, both ONNX via sherpa-onnx; clustering is threshold-based since
 the speaker count is unknown. Rust tests: `cd src-tauri && cargo test`.
+
+### Verifying milestone 5
+
+1. Record a short meeting; after speakers are identified you land on the
+   meeting's detail page automatically.
+2. Rename a speaker and the meeting title, quit the app fully, relaunch —
+   everything (transcript, labels, names, title) reloads from SQLite
+   (`<app data>/lilnotes.sqlite3`).
+3. Meetings shows the history; search matches titles *and* transcript text;
+   hovering a row reveals delete.
+4. Settings → Storage: change the recordings folder (new sessions land
+   there) and try "Delete audio after transcription" — after the next
+   recording finishes processing, its WAVs are gone and the detail page
+   shows an "audio deleted" badge.
 
 **Mic echo cancellation.** The mic channel uses macOS voice processing
 (Apple's AEC + noise suppression, the FaceTime stack): speaker output and
