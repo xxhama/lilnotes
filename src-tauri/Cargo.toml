@@ -22,6 +22,7 @@ serde_json = "1"
 # --- persistence (M5) + encryption at rest (M9) ---
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
 security-framework = "3.7"   # macOS Keychain for the DB key
+security-framework-sys = "2.17"  # errSecItemNotFound constant for Keychain error matching
 rand = "0.8"                 # OsRng for key generation
 
 # --- audio capture (M2) ---
