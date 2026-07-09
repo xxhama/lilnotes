@@ -170,7 +170,7 @@ impl Db {
 
     pub fn set_settings(&self, s: &AppSettings) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        let mut put = |key: &str, value: String| -> Result<(), String> {
+        let put = |key: &str, value: String| -> Result<(), String> {
             conn.execute(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
