@@ -8,6 +8,7 @@
 //! - `models`      — ML model registry + downloader (M3/M4)
 //! - `settings`    — settings shape (stored in SQLite)
 //! - `diarize`     — sherpa-onnx speaker diarization (M4)
+//! - `voiceprint`  — CAM++ speaker embeddings for cross-meeting personas (M9)
 //! - `transcript`  — merge + speaker mapping (M4)
 //! - `db`          — SQLite persistence (M5)
 //! - `keystore`    — macOS Keychain key for SQLCipher (M9)
@@ -24,6 +25,7 @@ mod permissions;
 mod settings;
 mod summary;
 mod transcript;
+mod voiceprint;
 
 use std::sync::Arc;
 
@@ -35,6 +37,7 @@ use commands::AsrSession;
 use db::Db;
 use diarize::DiarizeEngine;
 use models::DownloadManager;
+use voiceprint::VoiceprintEngine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -44,6 +47,7 @@ pub fn run() {
         .manage(CaptureEngine::default())
         .manage(Arc::new(AsrEngine::default()))
         .manage(Arc::new(DiarizeEngine::default()))
+        .manage(Arc::new(VoiceprintEngine::default()))
         .manage(AsrSession::default())
         .manage(DownloadManager::default())
         .setup(|app| {
