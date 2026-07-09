@@ -912,10 +912,31 @@ mod tests {
         let links = db.meeting_speaker_links(meeting_id).unwrap();
         assert!(links[0].confirmed);
 
+        // Re-running upsert after confirm must NOT clear confirmed.
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.8))
+            .unwrap();
+        let links = db.meeting_speaker_links(meeting_id).unwrap();
+        assert!(links[0].confirmed, "upsert must preserve confirmed=1");
+        assert_eq!(links[0].confidence, Some(0.8), "upsert should update confidence");
+
         db.unlink_speaker(meeting_id, "SPEAKER_00").unwrap();
         assert!(db.meeting_speaker_links(meeting_id).unwrap().is_empty());
 
         db.delete_persona(pid).unwrap();
         assert!(db.list_personas().unwrap().is_empty());
+
+        // Gallery cap pruning: with cap=1, a second insert drops the oldest.
+        let pid2 = db.create_persona("CapTest").unwrap();
+        db.insert_voiceprint(pid2, &[0.1, 0.2, 0.3], 3, None, None, 1000, 1)
+            .unwrap();
+        db.insert_voiceprint(pid2, &[0.4, 0.5, 0.6], 3, None, None, 2000, 1)
+            .unwrap();
+        let with_emb = db.list_personas_with_voiceprints().unwrap();
+        let cap_persona = with_emb.iter().find(|p| p.id == pid2).unwrap();
+        assert_eq!(
+            cap_persona.embeddings.len(),
+            1,
+            "cap=1 should keep only the newest voiceprint"
+        );
     }
 }
