@@ -497,7 +497,7 @@ fn run(
     live_tx: Option<Sender<LiveChunk>>,
     ready_tx: Sender<Result<(), String>>,
 ) -> Result<PathBuf, String> {
-    let setup = (|| -> Result<(TapHandle, AggregateHandle, u32), String> {
+    let setup = (|| -> Result<(TapHandle, AggregateHandle, u32, usize), String> {
         let tap = TapHandle::create()?;
         let (out_device, out_uid) = default_output_device()?;
         // The output device's own input streams (if any — AirPods mic, USB
