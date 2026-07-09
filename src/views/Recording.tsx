@@ -20,6 +20,7 @@ import {
   type StoppedRecording,
   type TranscriptSegment,
 } from "@/lib/ipc";
+import { useTauriEvent } from "@/lib/useTauriEvent";
 import { cn } from "@/lib/utils";
 import type { Route } from "@/App";
 
@@ -63,22 +64,19 @@ export default function RecordingView(_props: Props) {
     micPermissionStatus().then(setMicPerm);
   }, []);
 
-  // Backend events.
-  useEffect(() => {
-    const unlisteners: (() => void)[] = [];
-    onLevels((e) => {
-      if (phaseRef.current === "recording" || phaseRef.current === "starting") {
-        setLevels(e);
-      }
-    }).then((u) => unlisteners.push(u));
-    onAsrSegment((e) => {
-      setSegments((prev) => [...prev, e]);
-    }).then((u) => unlisteners.push(u));
-    onAsrDone(() => {
-      // Live worker finished flushing after stop; nothing else pending.
-    }).then((u) => unlisteners.push(u));
-    return () => unlisteners.forEach((u) => u());
-  }, []);
+  // Backend events (useTauriEvent survives StrictMode double-mounting
+  // without leaking duplicate listeners).
+  useTauriEvent(onLevels, (e) => {
+    if (phaseRef.current === "recording" || phaseRef.current === "starting") {
+      setLevels(e);
+    }
+  });
+  useTauriEvent(onAsrSegment, (e) => {
+    setSegments((prev) => [...prev, e]);
+  });
+  useTauriEvent(onAsrDone, () => {
+    // Live worker finished flushing after stop; nothing else pending.
+  });
 
   const start = useCallback(async () => {
     setError(null);
