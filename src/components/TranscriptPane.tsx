@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
 import type { TranscriptSegment } from "@/lib/ipc";
@@ -7,6 +7,10 @@ interface Props {
   segments: TranscriptSegment[];
   /** Auto-scroll to the newest segment (live mode). */
   follow?: boolean;
+  /** Display-name overrides for raw speaker labels (SPEAKER_00 → "Priya"). */
+  renames?: Record<string, string>;
+  /** Called with the raw label + new name when the user renames a speaker. */
+  onRenameSpeaker?: (raw: string, name: string) => void;
   className?: string;
 }
 
@@ -16,25 +20,107 @@ function fmtTime(ms: number): string {
   return `${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
-/** Speaker chip: "Me" for the mic channel, "Speaker" for system (diarized
- *  per-speaker labels arrive in milestone 4). */
-function SpeakerChip({ source }: { source: TranscriptSegment["source"] }) {
-  const me = source === "mic";
+/** Stable-ish color per speaker for quick visual scanning. */
+const CHIP_COLORS = [
+  "bg-blue-500/10 text-blue-700 dark:text-blue-400",
+  "bg-amber-500/10 text-amber-700 dark:text-amber-400",
+  "bg-purple-500/10 text-purple-700 dark:text-purple-400",
+  "bg-teal-500/10 text-teal-700 dark:text-teal-400",
+  "bg-rose-500/10 text-rose-700 dark:text-rose-400",
+  "bg-lime-600/10 text-lime-700 dark:text-lime-400",
+];
+
+function chipColor(raw: string): string {
+  const n = parseInt(raw.replace(/\D/g, ""), 10);
+  return CHIP_COLORS[(Number.isNaN(n) ? 0 : n) % CHIP_COLORS.length];
+}
+
+function SpeakerChip({
+  segment,
+  renames,
+  onRename,
+}: {
+  segment: TranscriptSegment;
+  renames: Record<string, string>;
+  onRename?: (raw: string, name: string) => void;
+}) {
+  const raw = segment.speaker;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) inputRef.current?.focus();
+  }, [editing]);
+
+  if (segment.source === "mic") {
+    return (
+      <span className="inline-flex shrink-0 items-center rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
+        Me
+      </span>
+    );
+  }
+  if (!raw) {
+    return (
+      <span className="inline-flex shrink-0 items-center rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+        Speaker
+      </span>
+    );
+  }
+
+  const display = renames[raw] ?? raw;
+  const renamable = Boolean(onRename);
+
+  const commit = () => {
+    setEditing(false);
+    const name = draft.trim();
+    if (name && onRename) onRename(raw, name);
+  };
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+          if (e.key === "Escape") setEditing(false);
+        }}
+        placeholder={display}
+        className="w-24 shrink-0 rounded-full border bg-background px-2 py-0.5 text-[11px] font-medium outline-none focus:border-ring"
+      />
+    );
+  }
+
   return (
-    <span
+    <button
+      onClick={() => {
+        if (!renamable) return;
+        setDraft(renames[raw] ?? "");
+        setEditing(true);
+      }}
+      disabled={!renamable}
+      title={renamable ? `Rename ${display}` : undefined}
       className={cn(
         "inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
-        me
-          ? "bg-primary/10 text-primary"
-          : "bg-secondary text-muted-foreground",
+        chipColor(raw),
+        renamable && "cursor-pointer hover:ring-1 hover:ring-ring/40",
       )}
     >
-      {me ? "Me" : "Speaker"}
-    </span>
+      {display}
+    </button>
   );
 }
 
-export default function TranscriptPane({ segments, follow, className }: Props) {
+export default function TranscriptPane({
+  segments,
+  follow,
+  renames = {},
+  onRenameSpeaker,
+  className,
+}: Props) {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -60,7 +146,7 @@ export default function TranscriptPane({ segments, follow, className }: Props) {
           <span className="w-9 shrink-0 pt-0.5 text-right font-mono text-[11px] tabular-nums text-muted-foreground/70">
             {fmtTime(s.startMs)}
           </span>
-          <SpeakerChip source={s.source} />
+          <SpeakerChip segment={s} renames={renames} onRename={onRenameSpeaker} />
           <p className="min-w-0 text-sm leading-relaxed">{s.text}</p>
         </div>
       ))}

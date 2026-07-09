@@ -16,14 +16,18 @@ use serde::Serialize;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 /// A transcribed segment, timestamped on the meeting's shared timeline.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
-    /// "mic" (labeled Me) or "system" (diarized in M4).
+    /// "mic" (labeled Me) or "system" (diarized).
     pub source: String,
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
+    /// "Me" for mic; "SPEAKER_xx" for system after diarization; None until
+    /// then (the UI shows a generic "Speaker" chip).
+    #[serde(default)]
+    pub speaker: Option<String>,
 }
 
 pub struct AsrEngine {

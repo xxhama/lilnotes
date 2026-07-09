@@ -15,9 +15,11 @@
 mod asr;
 mod audio;
 mod commands;
+mod diarize;
 mod models;
 mod permissions;
 mod settings;
+mod transcript;
 
 use std::sync::Arc;
 
@@ -26,6 +28,7 @@ use tauri::Manager;
 use asr::AsrEngine;
 use audio::CaptureEngine;
 use commands::AsrSession;
+use diarize::DiarizeEngine;
 use models::DownloadManager;
 use settings::SettingsStore;
 
@@ -35,6 +38,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(CaptureEngine::default())
         .manage(Arc::new(AsrEngine::default()))
+        .manage(Arc::new(DiarizeEngine::default()))
         .manage(AsrSession::default())
         .manage(DownloadManager::default())
         .setup(|app| {
@@ -48,6 +52,7 @@ pub fn run() {
             commands::stop_recording,
             commands::recording_status,
             commands::transcribe_session,
+            commands::diarize_session,
             commands::mic_permission_status,
             commands::request_mic_permission,
             commands::probe_system_audio_permission,

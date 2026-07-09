@@ -24,6 +24,9 @@ hound = "3.5"                 # WAV writing
 crossbeam-channel = "0.5"     # realtime-ish handoff between audio callbacks and writers
 chrono = "0.4"                # session ids / timestamps
 
+# --- diarization (M4) ---
+sherpa-rs = "0.6"  # sherpa-onnx: pyannote segmentation + CAM++ embeddings
+
 # --- transcription (M3) ---
 whisper-rs = { version = "0.16", features = ["metal"] }  # whisper.cpp, Metal backend
 reqwest = { version = "0.12", features = ["blocking"] }  # model downloads (+ Ollama in M6)
