@@ -43,7 +43,7 @@ pub fn unpack_f32(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// L2-normalize in place; returns the original Vec for convenience.
+/// L2-normalize in place. No-ops on a zero vector.
 pub fn l2_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
