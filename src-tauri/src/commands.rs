@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::asr::{chunker, AsrEngine, Segment};
 use crate::audio::{CaptureEngine, StartedRecording};
-use crate::db::{Db, MeetingDetail, MeetingSummary};
+use crate::db::{Db, MeetingDetail, MeetingSummary, Persona};
 use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
 use crate::permissions::{self, PermissionStatus};
@@ -314,15 +314,11 @@ pub async fn diarize_meeting(
         // Milestone 9: identity layer (additive). Runs after speakers are
         // persisted; never blocks the diarize result on failure.
         let settings = db.get_settings();
-        if let Err(e) = {
-            let matches = personas::identify_and_persist(
-                &db, &voiceprint, &app, meeting_id, &system_wav, &turns, &settings,
-            );
-            match matches {
-                Ok(m) => { let _ = app.emit_to("main", "speakers:identified", m); Ok(()) }
-                Err(e) => Err(e),
-            }
-        } {
+        if let Err(e) = personas::identify_and_persist(
+            &db, &voiceprint, &app, meeting_id, &system_wav, &turns, &settings,
+        )
+        .map(|m| { let _ = app.emit_to("main", "speakers:identified", m); })
+        {
             eprintln!("identify_speakers failed (non-fatal): {e}");
         }
 
@@ -392,28 +388,9 @@ pub fn rename_speaker(
 // Personas + voiceprints (milestone 9)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PersonaInfo {
-    pub id: i64,
-    pub display_name: String,
-    pub notes: Option<String>,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
-    pub voiceprint_count: i64,
-}
-
 #[tauri::command]
-pub fn list_personas(db: State<'_, Arc<Db>>) -> Result<Vec<PersonaInfo>, String> {
+pub fn list_personas(db: State<'_, Arc<Db>>) -> Result<Vec<Persona>, String> {
     db.list_personas()
-        .map(|v| v.into_iter().map(|p| PersonaInfo {
-            id: p.id,
-            display_name: p.display_name,
-            notes: p.notes,
-            created_at_ms: p.created_at_ms,
-            updated_at_ms: p.updated_at_ms,
-            voiceprint_count: p.voiceprint_count,
-        }).collect())
 }
 
 #[tauri::command]
@@ -499,7 +476,7 @@ pub async fn confirm_speaker_persona(
             .ok_or("persona not found")?;
         db2.rename_speaker(meeting_id, &raw, Some(&name))?;
         // 3. Enroll the embedding (best-effort if audio still present).
-        let (mic, system) = db2.meeting_wavs(meeting_id)?;
+        let (_, system) = db2.meeting_wavs(meeting_id)?;
         if let Some(system_wav) = system {
             let turns = diarizer.diarize_wav(&app, &system_wav, None)?;
             let cap = db2.get_settings().voiceprint_gallery_cap;
@@ -508,7 +485,6 @@ pub async fn confirm_speaker_persona(
                 Some(&system_wav), &turns, cap,
             );
         }
-        let _ = mic; // mic unused for enrollment
         Ok(())
     })
     .await
@@ -518,7 +494,7 @@ pub async fn confirm_speaker_persona(
 /// Remove the persona link for a raw label and clear any display rename
 /// applied by a prior confirm (revert to the raw `SPEAKER_xx` label).
 #[tauri::command]
-pub async fn unlink_speaker_persona(
+pub fn unlink_speaker_persona(
     db: State<'_, Arc<Db>>,
     meeting_id: i64,
     raw_label: String,
