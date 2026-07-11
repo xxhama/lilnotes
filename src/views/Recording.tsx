@@ -340,7 +340,7 @@ export default function RecordingView({
   return (
     <div className="flex h-full flex-1 flex-col">
       {/* Top: controls */}
-      <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-5 p-6 pb-4">
+      <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-5 p-6 pt-4 pb-4">
         {(micPerm === "denied" || micPerm === "restricted") && (
           <div className="flex w-full items-start gap-3 rounded-lg border border-destructive/30 bg-card p-4 text-sm">
             <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />

@@ -5,6 +5,7 @@ import { Building2, Home, Mic, Settings as SettingsIcon, Users } from "lucide-re
 import logo from "@/../src-tauri/icons/128x128.png";
 
 import {
+  dbExists,
   getSettings,
   listAsrModels,
   onMenuStartRecording,
@@ -36,8 +37,8 @@ const NAV = [
   { route: { name: "home" } as Route, label: "Meetings", icon: Home },
   { route: { name: "recording" } as Route, label: "Record", icon: Mic },
   { route: { name: "customers" } as Route, label: "Customers", icon: Building2 },
-  { route: { name: "settings" } as Route, label: "Settings", icon: SettingsIcon },
   { route: { name: "personas" } as Route, label: "Personas", icon: Users },
+  { route: { name: "settings" } as Route, label: "Settings", icon: SettingsIcon },
 ];
 
 export default function App() {
@@ -47,9 +48,16 @@ export default function App() {
   useSystemTheme();
 
   // First-launch check: show onboarding wizard for new users. Existing users
-  // (who already have an ASR model downloaded) are auto-migrated.
+  // (who already have an ASR model downloaded) are auto-migrated. We check
+  // `dbExists()` first — new users route to onboarding without touching the
+  // DB (and thus without triggering the Keychain prompt).
   useEffect(() => {
     (async () => {
+      const exists = await dbExists().catch(() => false);
+      if (!exists) {
+        setRoute({ name: "onboarding" });
+        return;
+      }
       const settings = await getSettings().catch(() => null);
       if (!settings) {
         setRoute({ name: "home" });
@@ -121,62 +129,90 @@ export default function App() {
       {/* Sidebar — hidden during onboarding */}
       {route && route.name !== "onboarding" && (
         <aside className="flex w-52 shrink-0 flex-col border-r bg-secondary/40">
-          <div className="flex h-10 items-center gap-2 px-4">
-            <img src={logo} alt="LilNotes" className="size-5 rounded-md" />
-            <span className="text-sm font-semibold tracking-tight">LilNotes</span>
+          {/* Brand sits below the traffic-light zone (pt-8 ≈ 32px clears the
+              ~28px-tall lights) so it can use the full sidebar width as a
+              heading for the nav items, rather than crowding next to them.
+              The whole strip stays a drag region — the empty top padding is
+              draggable too. */}
+          <div data-tauri-drag-region className="flex items-center gap-2.5 px-4 pt-9 pb-2">
+            <img src={logo} alt="LilNotes" className="size-8 rounded-lg" />
+            <span className="text-base font-semibold tracking-tight">LilNotes</span>
           </div>
-          <nav className="flex flex-col gap-1 p-2">
-            {NAV.map(({ route: r, label, icon: Icon }) => (
-              <button
-                key={r.name}
-                onClick={() => setRoute(r)}
-                className={cn(
-                  "flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground",
-                  route.name === r.name && "bg-accent text-accent-foreground",
-                )}
-              >
-                <Icon className="size-4" />
-                {label}
-              </button>
-            ))}
+          <nav className="flex flex-1 flex-col gap-1 p-2">
+            {NAV.filter(({ route: r }) => r.name !== "settings").map(
+              ({ route: r, label, icon: Icon }) => (
+                <button
+                  key={r.name}
+                  onClick={() => setRoute(r)}
+                  className={cn(
+                    "flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground",
+                    route.name === r.name && "bg-accent text-accent-foreground",
+                  )}
+                >
+                  <Icon className="size-4" />
+                  {label}
+                </button>
+              ),
+            )}
+            <div className="mt-auto">
+              {NAV.filter(({ route: r }) => r.name === "settings").map(
+                ({ route: r, label, icon: Icon }) => (
+                  <button
+                    key={r.name}
+                    onClick={() => setRoute(r)}
+                    className={cn(
+                      "flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground",
+                      route.name === r.name && "bg-accent text-accent-foreground",
+                    )}
+                  >
+                    <Icon className="size-4" />
+                    {label}
+                  </button>
+                ),
+              )}
+            </div>
           </nav>
         </aside>
       )}
 
-      {/* Main content */}
-      <main className="min-w-0 flex-1 overflow-y-auto">
-        {route?.name === "onboarding" && (
-          <OnboardingWizard onComplete={() => setRoute({ name: "home" })} />
-        )}
-        {route?.name === "home" && <HomeView onNavigate={setRoute} />}
-        {/* Always mounted so recording state (segments, meetingId, notes,
-            live transcript listener) survives navigation away and back. */}
-        <div className={cn("h-full", route?.name === "recording" ? "flex" : "hidden")}>
-          <RecordingView
-            active={route?.name === "recording"}
-            onNavigate={setRoute}
-            autoStart={autoStart}
-            autoStop={autoStop}
-            onAutoStartHandled={() => {
-              autoStartRef.current = false;
-              setAutoStart(false);
-            }}
-            onAutoStopHandled={() => {
-              autoStopRef.current = false;
-              setAutoStop(false);
-            }}
-          />
-        </div>
-        {route?.name === "meeting" && (
-          <MeetingDetailView meetingId={route.meetingId} onNavigate={setRoute} />
-        )}
-        {route?.name === "settings" && <SettingsView />}
-        {route?.name === "personas" && <PersonasView />}
-        {route?.name === "customers" && <CustomersView onNavigate={setRoute} />}
-        {route?.name === "customer" && (
-          <CustomerDetailView customerId={route.customerId} onNavigate={setRoute} />
-        )}
-      </main>
+      {/* Main content — drag row above the scrollable area so the window
+          stays draggable from the top without a floating fixed overlay. */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div data-tauri-drag-region className="h-10 shrink-0" />
+        <main className="min-w-0 flex-1 overflow-y-auto">
+          {route?.name === "onboarding" && (
+            <OnboardingWizard onComplete={() => setRoute({ name: "home" })} />
+          )}
+          {route?.name === "home" && <HomeView onNavigate={setRoute} />}
+          {/* Always mounted so recording state (segments, meetingId, notes,
+              live transcript listener) survives navigation away and back. */}
+          <div className={cn("h-full", route?.name === "recording" ? "flex" : "hidden")}>
+            <RecordingView
+              active={route?.name === "recording"}
+              onNavigate={setRoute}
+              autoStart={autoStart}
+              autoStop={autoStop}
+              onAutoStartHandled={() => {
+                autoStartRef.current = false;
+                setAutoStart(false);
+              }}
+              onAutoStopHandled={() => {
+                autoStopRef.current = false;
+                setAutoStop(false);
+              }}
+            />
+          </div>
+          {route?.name === "meeting" && (
+            <MeetingDetailView meetingId={route.meetingId} onNavigate={setRoute} />
+          )}
+          {route?.name === "settings" && <SettingsView />}
+          {route?.name === "personas" && <PersonasView />}
+          {route?.name === "customers" && <CustomersView onNavigate={setRoute} />}
+          {route?.name === "customer" && (
+            <CustomerDetailView customerId={route.customerId} onNavigate={setRoute} />
+          )}
+        </main>
+      </div>
     </div>
   );
 }

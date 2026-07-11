@@ -4,8 +4,9 @@
 //! single user; contention is not a concern. Migrations run at open via
 //! `PRAGMA user_version`.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -15,6 +16,57 @@ use crate::settings::AppSettings;
 
 pub struct Db {
     conn: Mutex<Connection>,
+}
+
+/// Lazily-initialized `Db` wrapper. For new users the DB (and its
+/// Keychain key) is not opened until `init()` is called from the
+/// onboarding wizard. For returning users — whose DB file already
+/// exists — `init()` is called eagerly in `setup()` so the keychain
+/// access is silent (the key already exists and access was previously
+/// granted). `Deref<Target = Db>` lets command bodies stay unchanged.
+pub struct LazyDb {
+    data_dir: PathBuf,
+    inner: OnceLock<Db>,
+}
+
+impl LazyDb {
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            inner: OnceLock::new(),
+        }
+    }
+
+    /// Open the DB (retrieving the keychain key). Idempotent — safe to
+    /// call multiple times; only the first call opens the connection.
+    pub fn init(&self) -> Result<(), String> {
+        if self.inner.get().is_some() {
+            return Ok(());
+        }
+        let key = crate::keystore::db_key()?;
+        let db = Db::open(&db_path(&self.data_dir), &key)?;
+        crate::settings::migrate_json_settings(&self.data_dir, &db);
+        // `set` returns Err(val) if already set — first writer wins, the
+        // loser's DB is simply discarded. No race in practice: `init()` is
+        // called from `setup()` (returning users) or `init_db` (new users),
+        // never both.
+        let _ = self.inner.set(db);
+        Ok(())
+    }
+
+    /// Returns `Some(&Db)` if already initialized, `None` otherwise.
+    pub fn get(&self) -> Option<&Db> {
+        self.inner.get()
+    }
+}
+
+impl Deref for LazyDb {
+    type Target = Db;
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .get()
+            .expect("DB not initialized — call init_db() before any DB command")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +440,15 @@ impl Db {
             )
             .ok();
         Ok(id)
+    }
+
+    /// Checkpoint the WAL file (TRUNCATE mode). Best-effort; called on
+    /// shutdown to reclaim WAL space. Errors are logged by the caller.
+    pub fn wal_checkpoint(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn list_meetings(&self, search: Option<&str>) -> Result<Vec<MeetingSummary>, String> {

@@ -240,7 +240,7 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="space-y-2 border-b p-6 pb-4">
+      <div className="space-y-2 border-b p-6 pt-4 pb-4">
         <div className="flex items-center justify-between">
           <button
             onClick={() => onNavigate({ name: "customers" })}

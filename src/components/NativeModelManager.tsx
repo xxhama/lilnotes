@@ -27,9 +27,10 @@ interface Props {
 }
 
 /**
- * Built-in LLM model management: lists Qwen3.5 GGUF models with download
- * buttons + live progress bars (reuses the `model:progress` event), and a
- * model picker for which downloaded model is active for summaries.
+ * Built-in LLM model management. Renders as a fragment of rows (no card
+ * wrapper) — `Settings.tsx` provides the card shell so the backend selector
+ * and model list share one card. Emits a status header row + a RadioGroup
+ * of model rows (download + select inline, no separate dropdown).
  */
 export default function NativeModelManager({ settings, onSave }: Props) {
   const [models, setModels] = useState<NativeLlmModelInfo[]>([]);
@@ -82,76 +83,48 @@ export default function NativeModelManager({ settings, onSave }: Props) {
     [refresh],
   );
 
-  const downloaded = models.filter((m) => m.downloaded);
-
   return (
-    <div className="space-y-3">
-      {/* Active model picker */}
-      <div className="divide-y rounded-xl border bg-card">
-        <div className="flex items-center justify-between gap-4 p-4">
-          <div className="space-y-0.5">
-            <div className="flex items-center gap-2 text-sm font-medium">
-              Built-in engine
-              <span
-                className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${
-                  loaded
-                    ? "bg-green-600/10 text-green-700 dark:text-green-400"
-                    : "bg-secondary text-muted-foreground"
-                }`}
-              >
-                {loaded ? (
-                  <>
-                    <CheckCircle2 className="size-3" /> Loaded in memory
-                  </>
-                ) : (
-                  "Not loaded"
-                )}
-              </span>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Runs on-device with Metal acceleration. Loads on demand and frees memory after 5 min
-              idle.
-            </p>
-          </div>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-8"
-            onClick={refresh}
-            aria-label="Refresh"
-          >
-            <RefreshCw className="size-4" />
-          </Button>
-        </div>
-
-        {downloaded.length > 0 && (
-          <div className="flex items-center justify-between gap-4 p-4">
-            <div className="space-y-0.5">
-              <div className="text-sm font-medium">Summary model</div>
-              <p className="text-xs text-muted-foreground">
-                Used for meeting summaries; also selectable per meeting.
-              </p>
-            </div>
-            <select
-              value={settings.summaryModel ?? ""}
-              onChange={(e) => onSave({ ...settings, summaryModel: e.target.value })}
-              className="h-8 max-w-56 rounded-md border bg-card px-2 text-xs outline-none focus:border-ring"
+    <>
+      {/* Status header row */}
+      <div className="flex items-center justify-between gap-4 p-4">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            Built-in engine
+            <span
+              className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${
+                loaded ? "bg-success/10 text-success" : "bg-secondary text-muted-foreground"
+              }`}
             >
-              {downloaded.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+              {loaded ? (
+                <>
+                  <CheckCircle2 className="size-3" /> Loaded in memory
+                </>
+              ) : (
+                "Not loaded"
+              )}
+            </span>
           </div>
-        )}
+          <p className="text-xs text-muted-foreground">
+            Runs on-device with Metal acceleration. Loads on demand and frees memory after 5 min
+            idle.
+          </p>
+        </div>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-8"
+          onClick={refresh}
+          aria-label="Refresh"
+        >
+          <RefreshCw className="size-4" />
+        </Button>
       </div>
 
-      {/* Model cards */}
+      {/* Model radio rows */}
       <RadioGroup
         value={settings.summaryModel ?? undefined}
         onValueChange={(v) => onSave({ ...settings, summaryModel: v })}
-        className="grid gap-0 divide-y rounded-xl border bg-card"
+        className="grid gap-0 divide-y"
       >
         {models.map((m) => {
           const p = progress[m.id];
@@ -172,7 +145,7 @@ export default function NativeModelManager({ settings, onSave }: Props) {
                     </span>
                   )}
                   {m.downloaded && (
-                    <span className="inline-flex items-center gap-1 rounded-full bg-green-600/10 px-2 py-0.5 text-[11px] font-medium text-green-700 dark:text-green-400">
+                    <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-[11px] font-medium text-success">
                       <CheckCircle2 className="size-3" /> Downloaded
                     </span>
                   )}
@@ -213,6 +186,6 @@ export default function NativeModelManager({ settings, onSave }: Props) {
           );
         })}
       </RadioGroup>
-    </div>
+    </>
   );
 }

@@ -25,19 +25,23 @@ mod models;
 mod permissions;
 mod personas;
 mod settings;
+mod shutdown;
 mod summary;
 mod transcript;
 mod tray;
 mod voiceprint;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tauri::Manager;
+
+/// Global AppHandle for the panic hook to access Tauri state (kill the
+/// sidecar) when a panic occurs. Set once in `setup`.
+static PANIC_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 use asr::AsrEngine;
 use audio::CaptureEngine;
 use commands::AsrSession;
-use db::Db;
 use diarize::DiarizeEngine;
 use models::DownloadManager;
 use summary::sidecar::SidecarLlmClient;
@@ -45,6 +49,21 @@ use voiceprint::VoiceprintEngine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Panic hook: kill the llama-server sidecar so a panic doesn't orphan
+    // the child process (which holds GPU memory). Does NOT stop a recording
+    // — joining capture threads from a panic hook risks a deadlock. The
+    // startup orphan cleanup catches any lingering sidecar.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("[panic] {info}");
+        if let Some(handle) = PANIC_APP_HANDLE.get() {
+            if let Some(sidecar) = handle.try_state::<SidecarLlmClient>() {
+                let _ = sidecar.unload(handle);
+            }
+        }
+        (default_hook)(info);
+    }));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -57,13 +76,34 @@ pub fn run() {
         .manage(DownloadManager::default())
         .manage(SidecarLlmClient::default())
         .setup(|app| {
+            // Store the AppHandle for the panic hook.
+            let _ = PANIC_APP_HANDLE.set(app.handle().clone());
+
+            // Kill orphaned llama-server processes from a previous
+            // crashed/killed session. Two patterns cover both builds:
+            //   Dev:  .../src-tauri/binaries/llama-server-<target-triple>
+            //   Prod: .../LilNotes.app/Contents/MacOS/llama-server
+            // Both are specific to our app — an independently-run
+            // llama-server (different path) is not affected.
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "binaries/llama-server-"])
+                .output();
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "LilNotes.app/Contents/MacOS/llama-server"])
+                .output();
+
             let data_dir = app.path().app_data_dir()?;
-            let key = keystore::db_key()
-                .map_err(|e| std::io::Error::other(format!("cannot unlock database: {e}")))?;
-            let db =
-                Arc::new(Db::open(&db::db_path(&data_dir), &key).map_err(std::io::Error::other)?);
-            settings::migrate_json_settings(&data_dir, &db);
-            app.manage(db);
+
+            // Lazy DB: for returning users (DB file exists) we open eagerly
+            // so the keychain access is silent. For new users we defer to
+            // the onboarding wizard's "Security" step via `init_db`.
+            let lazy_db = Arc::new(db::LazyDb::new(data_dir.clone()));
+            if db::db_path(&data_dir).exists() {
+                lazy_db
+                    .init()
+                    .map_err(|e| std::io::Error::other(format!("cannot unlock database: {e}")))?;
+            }
+            app.manage(lazy_db);
             tray::setup(app)?;
             Ok(())
         })
@@ -77,6 +117,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            commands::db_exists,
+            commands::init_db,
             commands::start_recording,
             commands::stop_recording,
             commands::recording_status,
@@ -129,6 +171,9 @@ pub fn run() {
             commands::summarize_customer,
             commands::list_customer_summaries,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(move |app_handle, event| {
+            shutdown::on_run_event(app_handle, event);
+        });
 }

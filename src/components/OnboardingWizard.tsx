@@ -6,7 +6,9 @@ import {
   Download,
   ExternalLink,
   Loader2,
+  Lock,
   Mic,
+  Volume2,
   X,
   XCircle,
   Zap,
@@ -20,6 +22,7 @@ import {
   downloadAsrModel,
   downloadNativeModel,
   getSettings,
+  initDb,
   listAsrModels,
   listNativeModels,
   micPermissionStatus,
@@ -37,10 +40,10 @@ import {
 import { useTauriEvent } from "@/lib/useTauriEvent";
 import { cn } from "@/lib/utils";
 
-type Step = "welcome" | "mic" | "system-audio" | "asr" | "llm";
+type Step = "welcome" | "security" | "permissions" | "models";
 type SysAudioState = "unknown" | "granted" | "denied";
 
-const STEPS: Step[] = ["welcome", "mic", "system-audio", "asr", "llm"];
+const STEPS: Step[] = ["welcome", "security", "permissions", "models"];
 
 function fmtBytes(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)} GB`;
@@ -53,9 +56,9 @@ interface Props {
 }
 
 /**
- * First-launch onboarding wizard. Walks through mic permission, system-audio
- * probe, ASR model download, and LLM model download. Shown when
- * `settings.onboardingComplete` is false.
+ * First-launch onboarding wizard. Walks through secure storage setup
+ * (Keychain), permissions (mic + system audio), and model downloads
+ * (ASR + summary). Shown when the DB file doesn't exist (new user).
  */
 export default function OnboardingWizard({ onComplete }: Props) {
   const [step, setStep] = useState<Step>("welcome");
@@ -69,20 +72,23 @@ export default function OnboardingWizard({ onComplete }: Props) {
   const [selectedLlmId, setSelectedLlmId] = useState<string | null>(null);
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
 
+  // Security step state — DB init is deferred to the "Set up secure storage"
+  // button so the Keychain prompt fires during onboarding, not at launch.
+  const [dbReady, setDbReady] = useState(false);
+  const [initializing, setInitializing] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
+
   const refreshModels = useCallback(async () => {
     setAsrModels(await listAsrModels().catch(() => []));
     setNativeModels(await listNativeModels().catch(() => []));
   }, []);
 
+  // Load only mic permission on mount — no DB access yet.
   useEffect(() => {
-    (async () => {
-      const s = await getSettings().catch(() => null);
-      setSettings(s);
-      const perm = await micPermissionStatus().catch(() => null);
-      setMicPerm(perm);
-      await refreshModels();
-    })();
-  }, [refreshModels]);
+    micPermissionStatus()
+      .then(setMicPerm)
+      .catch(() => null);
+  }, []);
 
   useTauriEvent(onModelProgress, (p) => {
     setProgress((prev) => ({ ...prev, [p.id]: p }));
@@ -100,29 +106,34 @@ export default function OnboardingWizard({ onComplete }: Props) {
     }
   });
 
-  // --- Auto-advance for already-satisfied steps ---------------------------
+  // Auto-finish when both models are already downloaded.
   useEffect(() => {
-    if (step === "mic" && micPerm === "granted") {
-      setStep("system-audio");
-    }
-  }, [step, micPerm]);
-
-  useEffect(() => {
-    if (step === "asr" && selectedAsrId) {
-      const model = asrModels.find((m) => m.id === selectedAsrId);
-      if (model?.downloaded) setStep("llm");
-    }
-  }, [step, selectedAsrId, asrModels]);
-
-  useEffect(() => {
-    if (step === "llm" && selectedLlmId) {
-      const model = nativeModels.find((m) => m.id === selectedLlmId);
-      if (model?.downloaded) finishOnboarding();
+    if (step === "models" && selectedAsrId && selectedLlmId) {
+      const asr = asrModels.find((m) => m.id === selectedAsrId);
+      const llm = nativeModels.find((m) => m.id === selectedLlmId);
+      if (asr?.downloaded && llm?.downloaded) finishOnboarding();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, selectedLlmId, nativeModels]);
+  }, [step, selectedAsrId, selectedLlmId, asrModels, nativeModels]);
 
   // --- Actions -----------------------------------------------------------
+  const handleInitDb = useCallback(async () => {
+    setInitializing(true);
+    setInitError(null);
+    try {
+      await initDb();
+      setDbReady(true);
+      const s = await getSettings().catch(() => null);
+      setSettings(s);
+      await refreshModels();
+      setStep("permissions");
+    } catch (e) {
+      setInitError(String(e));
+    } finally {
+      setInitializing(false);
+    }
+  }, [refreshModels]);
+
   const requestMic = useCallback(async () => {
     const granted = await requestMicPermission();
     setMicPerm(granted ? "granted" : "denied");
@@ -181,8 +192,12 @@ export default function OnboardingWizard({ onComplete }: Props) {
   // --- Step index for indicator -----------------------------------------
   const stepIndex = STEPS.indexOf(step);
 
+  const asrReady = !!selectedAsrId && !!asrModels.find((m) => m.id === selectedAsrId)?.downloaded;
+  const llmReady =
+    !!selectedLlmId && !!nativeModels.find((m) => m.id === selectedLlmId)?.downloaded;
+
   return (
-    <div className="mx-auto max-w-2xl space-y-6 p-8 pt-6">
+    <div className="mx-auto max-w-2xl space-y-6 p-8 pt-4">
       {/* Step indicator */}
       <div className="flex items-center gap-2">
         {STEPS.map((s, i) => (
@@ -211,121 +226,171 @@ export default function OnboardingWizard({ onComplete }: Props) {
               summaries — all on-device, nothing leaves your Mac. Let's get set up in a few steps.
             </p>
           </div>
-          <Button size="lg" className="w-full" onClick={() => setStep("mic")}>
+          <Button size="lg" className="w-full" onClick={() => setStep("security")}>
             Get Started
           </Button>
         </div>
       )}
 
       {/* ----------------------------------------------------------------- */}
-      {/* Microphone permission */}
+      {/* Security — Keychain / encrypted storage */}
       {/* ----------------------------------------------------------------- */}
-      {step === "mic" && (
+      {step === "security" && (
         <div className="space-y-4 rounded-xl border bg-card p-6">
           <div className="space-y-1">
-            <h2 className="text-sm font-medium">Microphone access</h2>
+            <h2 className="text-sm font-medium">Secure storage</h2>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              LilNotes records your side of the meeting on its own track. macOS requires your
-              permission to use the microphone.
+              LilNotes stores all your meeting data — transcripts, voiceprints, and summaries — in
+              an encrypted database. The encryption key is kept in macOS Keychain, so only your Mac
+              can read your data.
             </p>
           </div>
 
-          {micPerm === "granted" ? (
-            <div className="flex items-center gap-2 text-sm text-green-700 dark:text-green-400">
-              <CheckCircle2 className="size-4" /> Microphone access granted
+          {dbReady ? (
+            <div className="flex items-center gap-2 text-sm text-success">
+              <CheckCircle2 className="size-4" /> Secure storage enabled
             </div>
-          ) : micPerm === "denied" || micPerm === "restricted" ? (
+          ) : initError ? (
             <div className="space-y-3">
               <div className="flex items-center gap-2 text-sm text-destructive">
-                <XCircle className="size-4" /> Microphone access denied
+                <XCircle className="size-4" /> {initError}
               </div>
-              <p className="text-xs text-muted-foreground">
-                Enable microphone access in System Settings, then come back.
-              </p>
-              <Button size="sm" variant="outline" onClick={() => openPrivacySettings("microphone")}>
-                <ExternalLink /> Open System Settings
+              <Button size="sm" variant="outline" onClick={handleInitDb} disabled={initializing}>
+                Try again
               </Button>
             </div>
           ) : (
-            <Button size="sm" onClick={requestMic}>
-              <Mic /> Request access
+            <Button size="sm" onClick={handleInitDb} disabled={initializing}>
+              {initializing ? (
+                <>
+                  <Loader2 className="animate-spin" /> Setting up…
+                </>
+              ) : (
+                <>
+                  <Lock /> Set up secure storage
+                </>
+              )}
             </Button>
           )}
 
           <NavButtons
             onBack={() => setStep("welcome")}
-            onNext={() => micPerm === "granted" && setStep("system-audio")}
+            onNext={() => dbReady && setStep("permissions")}
+            nextDisabled={!dbReady}
+          />
+        </div>
+      )}
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Permissions — mic + system audio */}
+      {/* ----------------------------------------------------------------- */}
+      {step === "permissions" && (
+        <div className="space-y-4 rounded-xl border bg-card p-6">
+          <div className="space-y-1">
+            <h2 className="text-sm font-medium">Permissions</h2>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              LilNotes needs microphone access to record your side of the meeting, and system audio
+              access to capture other participants from Zoom, Teams, etc.
+            </p>
+          </div>
+
+          {/* Microphone row */}
+          <div className="space-y-2 border-t pt-4">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Mic className="size-4" />
+              Microphone
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Required for recording your side of the meeting.
+            </p>
+            {micPerm === "granted" ? (
+              <div className="flex items-center gap-2 text-sm text-success">
+                <CheckCircle2 className="size-4" /> Microphone access granted
+              </div>
+            ) : micPerm === "denied" || micPerm === "restricted" ? (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 text-sm text-destructive">
+                  <XCircle className="size-4" /> Microphone access denied
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => openPrivacySettings("microphone")}
+                >
+                  <ExternalLink /> Open System Settings
+                </Button>
+              </div>
+            ) : (
+              <Button size="sm" onClick={requestMic}>
+                <Mic /> Request access
+              </Button>
+            )}
+          </div>
+
+          {/* System audio row */}
+          <div className="space-y-2 border-t pt-4">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Volume2 className="size-4" />
+              System audio
+            </div>
+            <p className="text-xs text-muted-foreground">
+              To capture other participants' voices, LilNotes needs "System Audio Recording"
+              permission. macOS only allows checking this by briefly creating an audio tap.
+            </p>
+            {sysAudio === "granted" ? (
+              <div className="flex items-center gap-2 text-sm text-success">
+                <CheckCircle2 className="size-4" /> System audio access granted
+              </div>
+            ) : sysAudio === "denied" ? (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 text-sm text-destructive">
+                  <XCircle className="size-4" /> System audio access denied
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => openPrivacySettings("systemAudio")}
+                  >
+                    <ExternalLink /> Open System Settings
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setSysAudio("granted")}>
+                    Skip
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <Button size="sm" onClick={probeSystem} disabled={probing}>
+                  {probing ? (
+                    <>
+                      <Loader2 className="animate-spin" /> Testing…
+                    </>
+                  ) : (
+                    "Test access"
+                  )}
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setSysAudio("granted")}>
+                  Skip
+                </Button>
+              </div>
+            )}
+          </div>
+
+          <NavButtons
+            onBack={() => setStep("security")}
+            onNext={() => setStep("models")}
             nextDisabled={micPerm !== "granted"}
           />
         </div>
       )}
 
       {/* ----------------------------------------------------------------- */}
-      {/* System audio permission */}
+      {/* Models — ASR + summary */}
       {/* ----------------------------------------------------------------- */}
-      {step === "system-audio" && (
-        <div className="space-y-4 rounded-xl border bg-card p-6">
-          <div className="space-y-1">
-            <h2 className="text-sm font-medium">System audio access</h2>
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              To capture other participants' voices (from Zoom, Teams, etc.), LilNotes needs "System
-              Audio Recording" permission. macOS only allows checking this by briefly creating an
-              audio tap.
-            </p>
-          </div>
-
-          {sysAudio === "granted" ? (
-            <div className="flex items-center gap-2 text-sm text-green-700 dark:text-green-400">
-              <CheckCircle2 className="size-4" /> System audio access granted
-            </div>
-          ) : sysAudio === "denied" ? (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2 text-sm text-destructive">
-                <XCircle className="size-4" /> System audio access denied
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => openPrivacySettings("systemAudio")}
-                >
-                  <ExternalLink /> Open System Settings
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => setStep("asr")}>
-                  Skip
-                </Button>
-              </div>
-            </div>
-          ) : (
-            <div className="flex gap-2">
-              <Button size="sm" onClick={probeSystem} disabled={probing}>
-                {probing ? (
-                  <>
-                    <Loader2 className="animate-spin" /> Testing…
-                  </>
-                ) : (
-                  "Test access"
-                )}
-              </Button>
-              <Button size="sm" variant="ghost" onClick={() => setStep("asr")}>
-                Skip
-              </Button>
-            </div>
-          )}
-
-          <NavButtons
-            onBack={() => setStep("mic")}
-            onNext={() => setStep("asr")}
-            nextLabel="Next"
-          />
-        </div>
-      )}
-
-      {/* ----------------------------------------------------------------- */}
-      {/* ASR model download */}
-      {/* ----------------------------------------------------------------- */}
-      {step === "asr" && (
+      {step === "models" && (
         <div className="space-y-4">
+          {/* Transcription model */}
           <div className="space-y-1 px-1">
             <h2 className="text-sm font-medium">Download a transcription model</h2>
             <p className="text-xs leading-relaxed text-muted-foreground">
@@ -355,26 +420,8 @@ export default function OnboardingWizard({ onComplete }: Props) {
             ))}
           </RadioGroup>
 
-          <NavButtons
-            onBack={() => setStep("system-audio")}
-            onNext={() => {
-              const model = asrModels.find((m) => m.id === selectedAsrId);
-              if (model?.downloaded) setStep("llm");
-            }}
-            nextLabel="Next"
-            nextDisabled={
-              !selectedAsrId || !asrModels.find((m) => m.id === selectedAsrId)?.downloaded
-            }
-          />
-        </div>
-      )}
-
-      {/* ----------------------------------------------------------------- */}
-      {/* LLM model download */}
-      {/* ----------------------------------------------------------------- */}
-      {step === "llm" && (
-        <div className="space-y-4">
-          <div className="space-y-1 px-1">
+          {/* Summary model */}
+          <div className="space-y-1 px-1 pt-2">
             <h2 className="text-sm font-medium">Download a summary model</h2>
             <p className="text-xs leading-relaxed text-muted-foreground">
               Used to generate meeting summaries. Runs on-device with Metal acceleration. Pick one.
@@ -403,12 +450,10 @@ export default function OnboardingWizard({ onComplete }: Props) {
           </RadioGroup>
 
           <NavButtons
-            onBack={() => setStep("asr")}
+            onBack={() => setStep("permissions")}
             onNext={finishOnboarding}
             nextLabel="Finish"
-            nextDisabled={
-              !selectedLlmId || !nativeModels.find((m) => m.id === selectedLlmId)?.downloaded
-            }
+            nextDisabled={!asrReady || !llmReady}
           />
         </div>
       )}
@@ -484,7 +529,7 @@ function ModelCard({
             </span>
           )}
           {downloaded && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-green-600/10 px-2 py-0.5 text-[11px] font-medium text-green-700 dark:text-green-400">
+            <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-[11px] font-medium text-success">
               <CheckCircle2 className="size-3" /> Downloaded
             </span>
           )}

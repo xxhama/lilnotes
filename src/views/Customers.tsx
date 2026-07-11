@@ -86,7 +86,7 @@ export default function CustomersView({ onNavigate }: Props) {
 
   if (customers.length === 0) {
     return (
-      <div className="mx-auto max-w-2xl space-y-6 p-8 pt-6">
+      <div className="mx-auto max-w-2xl space-y-6 p-8 pt-4">
         <div>
           <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
             <Building2 className="size-5" /> Customers
@@ -115,7 +115,7 @@ export default function CustomersView({ onNavigate }: Props) {
   }
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6 p-8 pt-6">
+    <div className="mx-auto max-w-2xl space-y-6 p-8 pt-4">
       <div>
         <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
           <Building2 className="size-5" /> Customers

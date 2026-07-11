@@ -95,14 +95,19 @@ handlers. Single `Mutex<Connection>`. Migrations via `PRAGMA user_version`.
 
 ## Critical gotchas
 
-1. **Sidecar process — ggml-metal symbol collision.** `llama-cpp-2` (Metal,
-   ggml 0.13.1) and `whisper-rs` (Metal, ggml 0.9.5) cannot coexist in one
-   binary. The LLM runs in a separate process (`src-tauri/llm-sidecar/`).
-   **Never add `llama-cpp-2` as a direct dependency to the main crate.**
+1. **Sidecar process — ggml-metal symbol collision.** `llama-server`
+   (llama.cpp's HTTP server, Metal) and `whisper-rs` (Metal, ggml 0.9.5)
+   cannot coexist in one binary. The LLM runs in a separate `llama-server`
+   process, spawned via `tauri-plugin-shell`'s sidecar mechanism. IPC is
+   HTTP/SSE to `http://127.0.0.1:<port>/v1/chat/completions`. Thinking mode
+   is disabled via `chat_template_kwargs: {"enable_thinking": false}` — the
+   model-agnostic approach that works across Qwen3.5, DeepSeek, Gemma, etc.
+   Build it with `scripts/build-llama-server.sh` (clones + CMake-builds
+   llama.cpp). Source is vendored at `.llama.cpp/`.
 
 2. **`tauri:dev` vs `tauri dev`.** Always use `npm run tauri:dev` (colon) —
-   it builds the sidecar first. `npx tauri dev` skips the sidecar and
-   summarization breaks silently.
+   it builds the llama-server sidecar first. `npx tauri dev` skips the
+   sidecar build and summarization breaks silently.
 
 3. **CoreAudio process tap recipe.** `src/audio/system_tap.rs` has a 6-step
    recipe with load-bearing warnings: do NOT touch `isExclusive`, must use

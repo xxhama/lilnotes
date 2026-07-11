@@ -12,8 +12,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::asr::{chunker, AsrEngine, Segment};
 use crate::audio::{CaptureEngine, StartedRecording};
 use crate::db::{
-    CustomerDetail, CustomerRollupRow, CustomerSearchResult, CustomerSummary, Db, MeetingDetail,
-    MeetingSummary, Persona,
+    CustomerDetail, CustomerRollupRow, CustomerSearchResult, CustomerSummary, LazyDb,
+    MeetingDetail, MeetingSummary, Persona,
 };
 use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
@@ -57,6 +57,30 @@ pub fn ping(message: String) -> PingResponse {
     }
 }
 
+/// Check whether the encrypted database file already exists on disk.
+/// Used by the frontend to decide whether to show onboarding (new user)
+/// or proceed directly to the app (returning user). Does NOT touch the
+/// Keychain — safe to call before `init_db`.
+#[tauri::command]
+pub fn db_exists(app: AppHandle) -> bool {
+    match app.path().app_data_dir() {
+        Ok(dir) => crate::db::db_path(&dir).exists(),
+        Err(_) => false,
+    }
+}
+
+/// Open the encrypted database (retrieving the Keychain key). For new
+/// users this triggers the macOS Keychain prompt; for returning users
+/// the access is silent. Called from the onboarding wizard's "Security"
+/// step.
+#[tauri::command]
+pub async fn init_db(db: State<'_, Arc<LazyDb>>) -> Result<(), String> {
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || db.init())
+        .await
+        .map_err(|e| format!("database init failed: {e}"))?
+}
+
 // ---------------------------------------------------------------------------
 // Recording (milestone 2/3/5)
 // ---------------------------------------------------------------------------
@@ -73,7 +97,7 @@ pub struct RecordingStatus {
 /// the live recording can be saved against it. Title is stamped at start
 /// time (more accurate than stop time for a meeting's "when").
 fn create_meeting_at_start(
-    db: &State<'_, Arc<Db>>,
+    db: &State<'_, Arc<LazyDb>>,
     started: &StartedRecording,
 ) -> Result<i64, String> {
     let title = chrono::Local::now()
@@ -141,7 +165,7 @@ pub async fn start_recording(
     engine: State<'_, CaptureEngine>,
     asr: State<'_, Arc<AsrEngine>>,
     asr_session: State<'_, AsrSession>,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     voiceprint: State<'_, Arc<VoiceprintEngine>>,
 ) -> Result<StartRecordingResponse, String> {
     let cfg = db.get_settings();
@@ -220,7 +244,7 @@ pub async fn start_recording(
 pub async fn stop_recording(
     engine: State<'_, CaptureEngine>,
     asr_session: State<'_, AsrSession>,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
 ) -> Result<StopRecordingResponse, String> {
     // Stopping capture ends the pipelines, which drops the live senders and
     // lets the ASR worker flush its remainder and exit.
@@ -287,7 +311,7 @@ pub fn recording_status(engine: State<'_, CaptureEngine>) -> RecordingStatus {
 pub async fn transcribe_meeting(
     app: AppHandle,
     asr: State<'_, Arc<AsrEngine>>,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
 ) -> Result<Vec<Segment>, String> {
     let asr = asr.inner().clone();
@@ -336,7 +360,7 @@ pub async fn diarize_meeting(
     app: AppHandle,
     diarizer: State<'_, Arc<DiarizeEngine>>,
     voiceprint: State<'_, Arc<VoiceprintEngine>>,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
     num_speakers: Option<i32>,
 ) -> Result<DiarizedTranscript, String> {
@@ -410,20 +434,20 @@ pub async fn diarize_meeting(
 
 #[tauri::command]
 pub fn list_meetings(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     search: Option<String>,
 ) -> Result<Vec<MeetingSummary>, String> {
     db.list_meetings(search.as_deref())
 }
 
 #[tauri::command]
-pub fn get_meeting(db: State<'_, Arc<Db>>, meeting_id: i64) -> Result<MeetingDetail, String> {
+pub fn get_meeting(db: State<'_, Arc<LazyDb>>, meeting_id: i64) -> Result<MeetingDetail, String> {
     db.get_meeting(meeting_id)
 }
 
 #[tauri::command]
 pub fn update_meeting_title(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
     title: String,
 ) -> Result<(), String> {
@@ -436,7 +460,7 @@ pub fn update_meeting_title(
 
 #[tauri::command]
 pub fn update_meeting_notes(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
     notes: String,
 ) -> Result<(), String> {
@@ -445,7 +469,7 @@ pub fn update_meeting_notes(
 
 #[tauri::command]
 pub fn rename_speaker(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
     raw_label: String,
     display_name: Option<String>,
@@ -462,18 +486,18 @@ pub fn rename_speaker(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn list_personas(db: State<'_, Arc<Db>>) -> Result<Vec<Persona>, String> {
+pub fn list_personas(db: State<'_, Arc<LazyDb>>) -> Result<Vec<Persona>, String> {
     db.list_personas()
 }
 
 #[tauri::command]
-pub fn create_persona(db: State<'_, Arc<Db>>, display_name: String) -> Result<i64, String> {
+pub fn create_persona(db: State<'_, Arc<LazyDb>>, display_name: String) -> Result<i64, String> {
     db.create_persona(&display_name)
 }
 
 #[tauri::command]
 pub fn rename_persona(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     persona_id: i64,
     display_name: String,
 ) -> Result<(), String> {
@@ -481,12 +505,12 @@ pub fn rename_persona(
 }
 
 #[tauri::command]
-pub fn delete_persona(db: State<'_, Arc<Db>>, persona_id: i64) -> Result<(), String> {
+pub fn delete_persona(db: State<'_, Arc<LazyDb>>, persona_id: i64) -> Result<(), String> {
     db.delete_persona(persona_id)
 }
 
 #[tauri::command]
-pub fn delete_all_voiceprints(db: State<'_, Arc<Db>>) -> Result<(), String> {
+pub fn delete_all_voiceprints(db: State<'_, Arc<LazyDb>>) -> Result<(), String> {
     db.delete_all_voiceprints()
 }
 
@@ -495,13 +519,13 @@ pub fn delete_all_voiceprints(db: State<'_, Arc<Db>>) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn list_customers(db: State<'_, Arc<Db>>) -> Result<Vec<CustomerSummary>, String> {
+pub fn list_customers(db: State<'_, Arc<LazyDb>>) -> Result<Vec<CustomerSummary>, String> {
     db.list_customers()
 }
 
 #[tauri::command]
 pub fn create_customer(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     name: String,
     notes: Option<String>,
 ) -> Result<i64, String> {
@@ -510,7 +534,7 @@ pub fn create_customer(
 
 #[tauri::command]
 pub fn rename_customer(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     customer_id: i64,
     name: String,
 ) -> Result<(), String> {
@@ -519,7 +543,7 @@ pub fn rename_customer(
 
 #[tauri::command]
 pub fn update_customer_notes(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     customer_id: i64,
     notes: Option<String>,
 ) -> Result<(), String> {
@@ -527,21 +551,24 @@ pub fn update_customer_notes(
 }
 
 #[tauri::command]
-pub fn get_customer(db: State<'_, Arc<Db>>, customer_id: i64) -> Result<CustomerDetail, String> {
+pub fn get_customer(
+    db: State<'_, Arc<LazyDb>>,
+    customer_id: i64,
+) -> Result<CustomerDetail, String> {
     db.get_customer(customer_id)
 }
 
 /// Delete a customer. Its meetings become unassigned (FK ON DELETE SET NULL);
 /// personas are global and untouched.
 #[tauri::command]
-pub fn delete_customer(db: State<'_, Arc<Db>>, customer_id: i64) -> Result<(), String> {
+pub fn delete_customer(db: State<'_, Arc<LazyDb>>, customer_id: i64) -> Result<(), String> {
     db.delete_customer(customer_id)
 }
 
 /// Reassign a meeting to a different customer (or unassign with null).
 #[tauri::command]
 pub fn set_meeting_customer(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
     customer_id: Option<i64>,
 ) -> Result<(), String> {
@@ -553,7 +580,7 @@ pub fn set_meeting_customer(
 /// — target's derived roster naturally reflects the union.
 #[tauri::command]
 pub fn merge_customers(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     source_id: i64,
     target_id: i64,
 ) -> Result<(), String> {
@@ -562,7 +589,7 @@ pub fn merge_customers(
 
 #[tauri::command]
 pub fn search_customer_meetings(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     customer_id: i64,
     query: String,
 ) -> Result<Vec<CustomerSearchResult>, String> {
@@ -571,7 +598,7 @@ pub fn search_customer_meetings(
 
 #[tauri::command]
 pub fn list_customer_summaries(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     customer_id: i64,
 ) -> Result<Vec<CustomerRollupRow>, String> {
     db.list_customer_summaries(customer_id)
@@ -602,7 +629,7 @@ fn turns_from_segments(segments: &[Segment]) -> Vec<crate::diarize::Turn> {
 #[tauri::command]
 pub async fn identify_speakers(
     app: AppHandle,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     voiceprint: State<'_, Arc<VoiceprintEngine>>,
     meeting_id: i64,
 ) -> Result<Vec<personas::SpeakerMatch>, String> {
@@ -638,7 +665,7 @@ pub async fn identify_speakers(
 #[tauri::command]
 pub async fn confirm_speaker_persona(
     app: AppHandle,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     voiceprint: State<'_, Arc<VoiceprintEngine>>,
     meeting_id: i64,
     raw_label: String,
@@ -700,7 +727,7 @@ pub async fn confirm_speaker_persona(
 /// link removed but the persona's name still showing.
 #[tauri::command]
 pub fn unlink_speaker_persona(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
     raw_label: String,
 ) -> Result<(), String> {
@@ -710,7 +737,7 @@ pub fn unlink_speaker_persona(
 
 /// Delete a meeting row; also removes its WAVs from disk.
 #[tauri::command]
-pub fn delete_meeting(db: State<'_, Arc<Db>>, meeting_id: i64) -> Result<(), String> {
+pub fn delete_meeting(db: State<'_, Arc<LazyDb>>, meeting_id: i64) -> Result<(), String> {
     let (mic, system) = db.delete_meeting(meeting_id)?;
     for wav in [mic, system].into_iter().flatten() {
         let path = std::path::PathBuf::from(&wav);
@@ -759,12 +786,15 @@ pub fn open_privacy_settings(section: String) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn get_settings(db: State<'_, Arc<Db>>) -> AppSettings {
+pub fn get_settings(db: State<'_, Arc<LazyDb>>) -> AppSettings {
     db.get_settings()
 }
 
 #[tauri::command]
-pub fn update_settings(db: State<'_, Arc<Db>>, new_settings: AppSettings) -> Result<(), String> {
+pub fn update_settings(
+    db: State<'_, Arc<LazyDb>>,
+    new_settings: AppSettings,
+) -> Result<(), String> {
     db.set_settings(&new_settings)
 }
 
@@ -782,7 +812,7 @@ pub struct AsrModelInfo {
 #[tauri::command]
 pub fn list_asr_models(
     app: AppHandle,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
 ) -> Result<Vec<AsrModelInfo>, String> {
     let active = db.get_settings().asr_model;
     models::WHISPER_MODELS
@@ -849,7 +879,7 @@ pub struct NativeLlmModelInfo {
 #[tauri::command]
 pub fn list_native_models(
     app: AppHandle,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
 ) -> Result<Vec<NativeLlmModelInfo>, String> {
     let settings_model = db.get_settings().summary_model;
     Ok(models::NATIVE_LLM_MODELS
@@ -925,7 +955,7 @@ pub struct OllamaModels {
 }
 
 #[tauri::command]
-pub async fn list_ollama_models(db: State<'_, Arc<Db>>) -> Result<OllamaModels, String> {
+pub async fn list_ollama_models(db: State<'_, Arc<LazyDb>>) -> Result<OllamaModels, String> {
     let installed = ollama::installed_models().await?;
     let names: Vec<String> = installed.iter().map(|m| m.name.clone()).collect();
     let settings_model = db.get_settings().summary_model;
@@ -1010,7 +1040,7 @@ pub struct SummaryResult {
 #[tauri::command]
 pub async fn summarize_meeting(
     app: AppHandle,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
     model: Option<String>,
 ) -> Result<SummaryResult, String> {
@@ -1145,7 +1175,7 @@ async fn dispatch_summary(
 
 #[tauri::command]
 pub fn list_summaries(
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     meeting_id: i64,
 ) -> Result<Vec<crate::db::SummaryRow>, String> {
     db.list_summaries(meeting_id)
@@ -1168,7 +1198,7 @@ pub struct CustomerSummaryResult {
 #[tauri::command]
 pub async fn summarize_customer(
     app: AppHandle,
-    db: State<'_, Arc<Db>>,
+    db: State<'_, Arc<LazyDb>>,
     customer_id: i64,
     model: Option<String>,
 ) -> Result<CustomerSummaryResult, String> {
