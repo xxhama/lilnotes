@@ -14,7 +14,9 @@ pub struct AppSettings {
     pub storage_dir: Option<String>,
     /// Delete the WAVs once a meeting is transcribed + diarized.
     pub delete_audio_after_transcription: bool,
-    /// Ollama model tag for summaries; None = auto-pick from installed.
+    /// Summary backend: "native" (built-in llama.cpp) or "ollama".
+    pub summary_backend: String,
+    /// Model tag/id for summaries within the active backend; None = auto-pick.
     pub summary_model: Option<String>,
     /// Custom summary prompt template; None = built-in default.
     pub summary_template: Option<String>,
@@ -22,8 +24,21 @@ pub struct AppSettings {
     pub persona_auto_threshold: f32,
     /// Cosine score at/above which a persona is a tentative suggestion.
     pub persona_suggest_threshold: f32,
+    /// Cosine score at/above which a known persona is auto-identified live
+    /// during recording (no user confirmation). Stricter than the post-
+    /// diarization auto threshold. 1.0 = effectively disabled.
+    pub persona_live_threshold: f32,
     /// Max voiceprints kept per persona (oldest pruned on enroll). 0 = unlimited.
     pub voiceprint_gallery_cap: i32,
+    /// Software acoustic echo cancellation: feeds the captured system audio
+    /// (what the speakers play) as the reference to WebRTC APM and subtracts
+    /// its echo from the mic. Disables Apple's voice-processing AEC (which
+    /// references lilnotes' own silent playback) and replaces its NS with
+    /// WebRTC's. On by default — disable only when using headphones (no echo
+    /// to cancel) or if you prefer the raw mic.
+    pub aec_enabled: bool,
+    /// Whether the first-launch onboarding wizard has been completed.
+    pub onboarding_complete: bool,
 }
 
 impl Default for AppSettings {
@@ -33,11 +48,15 @@ impl Default for AppSettings {
             live_transcription: true,
             storage_dir: None,
             delete_audio_after_transcription: false,
+            summary_backend: "native".into(),
             summary_model: None,
             summary_template: None,
             persona_auto_threshold: 0.65,
             persona_suggest_threshold: 0.45,
-            voiceprint_gallery_cap: 50,
+            persona_live_threshold: 0.72,
+            voiceprint_gallery_cap: 150,
+            aec_enabled: true,
+            onboarding_complete: false,
         }
     }
 }

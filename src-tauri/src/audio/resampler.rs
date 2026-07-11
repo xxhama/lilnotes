@@ -182,7 +182,11 @@ mod tests {
             out.extend_from_slice(rs.process(chunk));
         }
         // ~16000 output samples, RMS of a unit sine is ~0.707
-        assert!((out.len() as i64 - 16_000).unsigned_abs() < 100, "len={}", out.len());
+        assert!(
+            (out.len() as i64 - 16_000).unsigned_abs() < 100,
+            "len={}",
+            out.len()
+        );
         let r = rms(&out[800..out.len() - 800]);
         assert!((r - 0.707).abs() < 0.02, "rms={r}");
     }
@@ -195,7 +199,11 @@ mod tests {
         for chunk in input.chunks(441) {
             out.extend_from_slice(rs.process(chunk));
         }
-        assert!((out.len() as i64 - 16_000).unsigned_abs() < 100, "len={}", out.len());
+        assert!(
+            (out.len() as i64 - 16_000).unsigned_abs() < 100,
+            "len={}",
+            out.len()
+        );
         let r = rms(&out[800..out.len() - 800]);
         assert!((r - 0.707).abs() < 0.02, "rms={r}");
     }

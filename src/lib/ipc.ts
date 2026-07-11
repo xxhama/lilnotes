@@ -33,6 +33,8 @@ export function ping(message: string): Promise<PingResponse> {
 export interface StartedRecording {
   sessionId: string;
   startedAtMs: number;
+  /** The meeting row created at recording start; notes save against this id. */
+  meetingId: number;
   /** Whether a live transcription worker is attached. */
   liveTranscription: boolean;
   /** Set when live transcription was requested but couldn't start. */
@@ -81,15 +83,21 @@ export function onLevels(cb: (e: LevelsEvent) => void): Promise<UnlistenFn> {
   return listen<LevelsEvent>("capture:levels", (ev) => cb(ev.payload));
 }
 
+/** Tray "Start Recording" — pure signal, no payload. */
+export function onMenuStartRecording(cb: () => void): Promise<UnlistenFn> {
+  return listen("menu:start-recording", () => cb());
+}
+
+/** Tray "Stop Recording" — pure signal, no payload. */
+export function onMenuStopRecording(cb: () => void): Promise<UnlistenFn> {
+  return listen("menu:stop-recording", () => cb());
+}
+
 // ---------------------------------------------------------------------------
 // Permissions (M2)
 // ---------------------------------------------------------------------------
 
-export type PermissionStatus =
-  | "granted"
-  | "denied"
-  | "undetermined"
-  | "restricted";
+export type PermissionStatus = "granted" | "denied" | "undetermined" | "restricted";
 
 export function micPermissionStatus(): Promise<PermissionStatus> {
   return invoke<PermissionStatus>("mic_permission_status");
@@ -108,9 +116,7 @@ export function probeSystemAudioPermission(): Promise<boolean> {
   return invoke<boolean>("probe_system_audio_permission");
 }
 
-export function openPrivacySettings(
-  section: "microphone" | "systemAudio",
-): Promise<void> {
+export function openPrivacySettings(section: "microphone" | "systemAudio"): Promise<void> {
   return invoke("open_privacy_settings", { section });
 }
 
@@ -139,7 +145,9 @@ export interface AppSettings {
   storageDir: string | null;
   /** Delete WAVs once a meeting is transcribed + diarized. */
   deleteAudioAfterTranscription: boolean;
-  /** Ollama model tag for summaries; null = auto-pick from installed. */
+  /** Summary backend: "native" (built-in llama.cpp) or "ollama". */
+  summaryBackend: string;
+  /** Model tag/id for summaries within the active backend; null = auto-pick. */
   summaryModel: string | null;
   /** Custom summary prompt template; null = built-in default. */
   summaryTemplate: string | null;
@@ -147,8 +155,15 @@ export interface AppSettings {
   personaAutoThreshold: number;
   /** Cosine score at/above which a persona is a tentative suggestion. */
   personaSuggestThreshold: number;
+  /** Cosine cutoff for live persona auto-identification during recording. */
+  personaLiveThreshold: number;
   /** Max voiceprints kept per persona (oldest pruned on enroll). 0 = unlimited. */
   voiceprintGalleryCap: number;
+  /** Software acoustic echo cancellation using the system-audio feed as
+   *  reference. Disable when using headphones. */
+  aecEnabled: boolean;
+  /** Whether the first-launch onboarding wizard has been completed. */
+  onboardingComplete: boolean;
 }
 
 export interface AsrModelInfo {
@@ -202,9 +217,7 @@ export function onAsrDone(cb: (sessionId: string) => void): Promise<UnlistenFn> 
   return listen<{ sessionId: string }>("asr:done", (ev) => cb(ev.payload.sessionId));
 }
 
-export function onModelProgress(
-  cb: (e: DownloadProgress) => void,
-): Promise<UnlistenFn> {
+export function onModelProgress(cb: (e: DownloadProgress) => void): Promise<UnlistenFn> {
   return listen<DownloadProgress>("model:progress", (ev) => cb(ev.payload));
 }
 
@@ -267,12 +280,16 @@ export interface MeetingDetail {
   micWav: string | null;
   systemWav: string | null;
   notes: string | null;
+  /** Epoch ms of the last notes save; null until notes have ever been saved. */
+  notesUpdatedAtMs: number | null;
   segments: TranscriptSegment[];
   /** raw label -> user-chosen display name. */
   renames: Record<string, string>;
   /** raw label -> persona link (suggestion/confirmed) per meeting. */
   speakerLinks: Record<string, SpeakerLink>;
   speakerCount: number;
+  /** Customer (account) this meeting belongs to; null = unassigned. */
+  customerId: number | null;
 }
 
 export function listMeetings(search?: string): Promise<MeetingSummary[]> {
@@ -287,6 +304,11 @@ export function updateMeetingTitle(meetingId: number, title: string): Promise<vo
   return invoke("update_meeting_title", { meetingId, title });
 }
 
+/** Persist freeform markdown notes for a meeting (empty string clears them). */
+export function updateMeetingNotes(meetingId: number, notes: string): Promise<void> {
+  return invoke("update_meeting_notes", { meetingId, notes });
+}
+
 /** Persist a display name for a raw speaker label (null clears it). */
 export function renameSpeaker(
   meetingId: number,
@@ -299,6 +321,37 @@ export function renameSpeaker(
 /** Delete a meeting and its audio files. */
 export function deleteMeeting(meetingId: number): Promise<void> {
   return invoke("delete_meeting", { meetingId });
+}
+
+// ---------------------------------------------------------------------------
+// Built-in LLM models (Qwen3.5 GGUF via llama.cpp)
+// ---------------------------------------------------------------------------
+
+export interface NativeLlmModelInfo {
+  id: string;
+  label: string;
+  approxBytes: number;
+  note: string;
+  downloaded: boolean;
+  active: boolean;
+}
+
+export function listNativeModels(): Promise<NativeLlmModelInfo[]> {
+  return invoke<NativeLlmModelInfo[]>("list_native_models");
+}
+
+/** Resolves when the download completes, fails, or is cancelled. */
+export function downloadNativeModel(id: string): Promise<void> {
+  return invoke("download_native_model", { id });
+}
+
+export function cancelNativeModelDownload(id: string): Promise<boolean> {
+  return invoke<boolean>("cancel_native_model_download", { id });
+}
+
+/** Whether a model is currently loaded in GPU memory. */
+export function nativeModelStatus(): Promise<boolean> {
+  return invoke<boolean>("native_model_status");
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +411,7 @@ export interface SummaryResult {
 export interface SummaryToken {
   meetingId: number;
   token: string;
+  isThinking: boolean;
 }
 
 export function ollamaStatus(): Promise<OllamaStatus> {
@@ -386,10 +440,7 @@ export function defaultSummaryTemplate(): Promise<string> {
 }
 
 /** Generate + persist a summary; tokens stream via `summary:token`. */
-export function summarizeMeeting(
-  meetingId: number,
-  model?: string,
-): Promise<SummaryResult> {
+export function summarizeMeeting(meetingId: number, model?: string): Promise<SummaryResult> {
   return invoke<SummaryResult>("summarize_meeting", {
     meetingId,
     model: model ?? null,
@@ -408,9 +459,7 @@ export function onOllamaPull(cb: (e: PullProgress) => void): Promise<UnlistenFn>
   return listen<PullProgress>("ollama:pull", (ev) => cb(ev.payload));
 }
 
-export function onDiarizeProgress(
-  cb: (e: DiarizeProgress) => void,
-): Promise<UnlistenFn> {
+export function onDiarizeProgress(cb: (e: DiarizeProgress) => void): Promise<UnlistenFn> {
   return listen<DiarizeProgress>("diarize:progress", (ev) => cb(ev.payload));
 }
 
@@ -485,20 +534,146 @@ export function confirmSpeakerPersona(
   return invoke<void>("confirm_speaker_persona", { meetingId, rawLabel, personaId });
 }
 
-export function unlinkSpeakerPersona(
-  meetingId: number,
-  rawLabel: string,
-): Promise<void> {
+export function unlinkSpeakerPersona(meetingId: number, rawLabel: string): Promise<void> {
   return invoke<void>("unlink_speaker_persona", { meetingId, rawLabel });
 }
 
-export function onSpeakersIdentified(
-  cb: (e: SpeakerMatch[]) => void,
-): Promise<UnlistenFn> {
+export function onSpeakersIdentified(cb: (e: SpeakerMatch[]) => void): Promise<UnlistenFn> {
   return listen<SpeakerMatch[]>("speakers:identified", (ev) => cb(ev.payload));
 }
 
 /** Fires when a background voiceprint enrollment finishes (refresh counts). */
 export function onVoiceprintsEnrolled(cb: () => void): Promise<UnlistenFn> {
   return listen("voiceprints:enrolled", () => cb());
+}
+
+// ---------------------------------------------------------------------------
+// Customers (accounts)
+// ---------------------------------------------------------------------------
+
+export interface CustomerSummary {
+  id: number;
+  name: string;
+  logo: string | null;
+  meetingCount: number;
+  lastMeetingAtMs: number | null;
+}
+
+export interface CustomerRosterEntry {
+  personaId: number;
+  displayName: string;
+  meetingCount: number;
+  lastSeenMs: number | null;
+}
+
+export interface CustomerRollupRow {
+  id: number;
+  model: string;
+  content: string;
+  createdAtMs: number;
+  meetingCount: number;
+}
+
+export interface CustomerDetail {
+  id: number;
+  name: string;
+  logo: string | null;
+  notes: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+  meetingCount: number;
+  lastMeetingAtMs: number | null;
+  firstMeetingAtMs: number | null;
+  totalDurationMs: number | null;
+  personaRoster: CustomerRosterEntry[];
+  meetings: MeetingSummary[];
+  meetingsWithSummaryCount: number;
+  latestRollup: CustomerRollupRow | null;
+}
+
+export interface CustomerSearchHit {
+  field: string;
+  snippet: string;
+}
+
+export interface CustomerSearchResult {
+  meetingId: number;
+  title: string;
+  startedAtMs: number;
+  hits: CustomerSearchHit[];
+}
+
+export interface CustomerSummaryResult {
+  summaryId: number;
+  model: string;
+  content: string;
+  meetingCount: number;
+}
+
+export interface CustomerSummaryToken {
+  customerId: number;
+  token: string;
+  isThinking: boolean;
+}
+
+export function listCustomers(): Promise<CustomerSummary[]> {
+  return invoke<CustomerSummary[]>("list_customers");
+}
+
+export function createCustomer(name: string, notes?: string): Promise<number> {
+  return invoke<number>("create_customer", { name, notes: notes ?? null });
+}
+
+export function renameCustomer(customerId: number, name: string): Promise<void> {
+  return invoke<void>("rename_customer", { customerId, name });
+}
+
+export function updateCustomerNotes(customerId: number, notes: string | null): Promise<void> {
+  return invoke<void>("update_customer_notes", { customerId, notes });
+}
+
+export function getCustomer(customerId: number): Promise<CustomerDetail> {
+  return invoke<CustomerDetail>("get_customer", { customerId });
+}
+
+export function deleteCustomer(customerId: number): Promise<void> {
+  return invoke<void>("delete_customer", { customerId });
+}
+
+/** Reassign a meeting to a customer (or unassign with null). */
+export function setMeetingCustomer(meetingId: number, customerId: number | null): Promise<void> {
+  return invoke<void>("set_meeting_customer", { meetingId, customerId });
+}
+
+/** Merge source into target (irreversible); returns after source is deleted. */
+export function mergeCustomers(sourceId: number, targetId: number): Promise<void> {
+  return invoke<void>("merge_customers", { sourceId, targetId });
+}
+
+export function searchCustomerMeetings(
+  customerId: number,
+  query: string,
+): Promise<CustomerSearchResult[]> {
+  return invoke<CustomerSearchResult[]>("search_customer_meetings", {
+    customerId,
+    query,
+  });
+}
+
+export function summarizeCustomer(
+  customerId: number,
+  model?: string,
+): Promise<CustomerSummaryResult> {
+  return invoke<CustomerSummaryResult>("summarize_customer", {
+    customerId,
+    model: model ?? null,
+  });
+}
+
+export function listCustomerSummaries(customerId: number): Promise<CustomerRollupRow[]> {
+  return invoke<CustomerRollupRow[]>("list_customer_summaries", { customerId });
+}
+
+export function onCustomerSummaryToken(cb: (e: CustomerSummaryToken) => void): Promise<UnlistenFn> {
+  return listen<CustomerSummaryToken>("customer-summary:token", (ev) => cb(ev.payload));
 }

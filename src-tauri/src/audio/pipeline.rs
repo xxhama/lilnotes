@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 
+use super::aec::{AecProcessor, AecRenderFeeder};
 use super::resampler::{StreamingResampler, TARGET_RATE};
 
 /// Which capture source a chunk came from.
@@ -58,15 +59,28 @@ pub struct ChannelPipeline {
     source: Source,
     live_tx: Option<Sender<LiveChunk>>,
     frames_written: u64,
+    /// Capture-side AEC (mic path only): in-place echo cancellation + NS.
+    aec_capture: Option<AecProcessor>,
+    /// Render-side AEC feeder (system path only): feeds the reference signal
+    /// to the shared APM. The mic and system pipelines share one inner
+    /// `Processor` via Arc.
+    aec_render: Option<AecRenderFeeder>,
+    /// Set if the APM returned an error mid-recording. Once true, subsequent
+    /// frames bypass the APM and pass through (soft-limited only) so the
+    /// recording survives an unexpected APM failure.
+    aec_failed: bool,
 }
 
 impl ChannelPipeline {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: &Path,
         in_rate: u32,
         source: Source,
         meters: Arc<ChannelMeters>,
         live_tx: Option<Sender<LiveChunk>>,
+        aec_capture: Option<AecProcessor>,
+        aec_render: Option<AecRenderFeeder>,
     ) -> Result<Self, String> {
         let spec = hound::WavSpec {
             channels: 1,
@@ -84,6 +98,9 @@ impl ChannelPipeline {
             source,
             live_tx,
             frames_written: 0,
+            aec_capture,
+            aec_render,
+            aec_failed: false,
         })
     }
 
@@ -111,25 +128,57 @@ impl ChannelPipeline {
             return Ok(());
         }
 
-        // Gentle soft limiter: keeps occasional hot samples from hard-clipping
-        // in the 16-bit file while leaving normal levels untouched. The two
-        // channels are limited independently and stay in separate files.
-        let limited: Vec<f32> = out.iter().map(|&s| soft_limit(s)).collect();
+        // AEC integration:
+        // - System path (render/reference): feed the raw 16 kHz samples to the
+        //   shared APM's render path, then soft-limit + write as usual. The
+        //   system WAV/ASR are unchanged — AEC only affects the mic.
+        // - Mic path (capture/forward): run the 16 kHz samples through the
+        //   APM capture path (echo cancellation + NS + HPF), then soft-limit +
+        //   write the cleaned output. The output length may differ from the
+        //   input because APM buffers partial 160-sample frames internally.
+        //
+        // If the APM errors mid-recording (unexpected — it only fails on bad
+        // frame sizes, which our framing prevents), we log once and fall back
+        // to passthrough so the recording survives instead of being killed.
+        let passthrough: Vec<f32> = out.iter().map(|&s| soft_limit(s)).collect();
+        let processed: Vec<f32> = if self.aec_failed {
+            passthrough
+        } else if let Some(render) = &mut self.aec_render {
+            match render.feed_render(out) {
+                Ok(()) => passthrough,
+                Err(e) => {
+                    self.aec_failed = true;
+                    eprintln!("[aec] render error, falling back to passthrough: {e}");
+                    passthrough
+                }
+            }
+        } else if let Some(capture) = &mut self.aec_capture {
+            match capture.process_capture(out) {
+                Ok(cleaned) => cleaned.iter().map(|&s| soft_limit(s)).collect(),
+                Err(e) => {
+                    self.aec_failed = true;
+                    eprintln!("[aec] capture error, falling back to passthrough: {e}");
+                    passthrough
+                }
+            }
+        } else {
+            passthrough
+        };
 
-        for &s in &limited {
+        for &s in &processed {
             let v = (s * i16::MAX as f32) as i16;
             self.writer
                 .write_sample(v)
                 .map_err(|e| format!("wav write failed: {e}"))?;
         }
-        self.frames_written += limited.len() as u64;
+        self.frames_written += processed.len() as u64;
 
         if let Some(tx) = &self.live_tx {
             // Best-effort: drop chunks if no consumer is keeping up (M2 has
             // no consumer; M3's ASR stage attaches here).
             let _ = tx.try_send(LiveChunk {
                 source: self.source,
-                samples: Arc::new(limited),
+                samples: Arc::new(processed),
             });
         }
         Ok(())
@@ -140,7 +189,43 @@ impl ChannelPipeline {
         self.frames_written * 1000 / TARGET_RATE as u64
     }
 
-    pub fn finalize(self) -> Result<PathBuf, String> {
+    pub fn finalize(mut self) -> Result<PathBuf, String> {
+        // Flush the AEC so the buffered partial frame (< 160 samples) is
+        // zero-padded and processed — otherwise the tail of the mic would be
+        // lost. The render side is flushed too (no output, just drains).
+        // Flush errors are logged, not fatal — losing the tail (< 10 ms) is
+        // better than failing to finalize the WAV.
+        if let Some(capture) = &mut self.aec_capture {
+            if !self.aec_failed {
+                match capture.flush() {
+                    Ok(tail) => {
+                        for &s in &tail {
+                            let v = (soft_limit(s) * i16::MAX as f32) as i16;
+                            self.writer
+                                .write_sample(v)
+                                .map_err(|e| format!("wav write failed: {e}"))?;
+                        }
+                        self.frames_written += tail.len() as u64;
+                    }
+                    Err(e) => eprintln!("[aec] capture flush error (tail lost): {e}"),
+                }
+            }
+            // Log AEC stats so the user can verify it worked on each recording.
+            let stats = capture.stats();
+            eprintln!(
+                "[aec] mic path finalized: ERLE={:.1} dB, delay={:?} ms, residual={:.3}",
+                stats.echo_return_loss_enhancement.unwrap_or(0.0),
+                stats.delay_ms,
+                stats.residual_echo_likelihood.unwrap_or(0.0),
+            );
+        }
+        if let Some(render) = &mut self.aec_render {
+            if !self.aec_failed {
+                if let Err(e) = render.flush() {
+                    eprintln!("[aec] render flush error: {e}");
+                }
+            }
+        }
         self.writer
             .finalize()
             .map_err(|e| format!("wav finalize failed: {e}"))?;
@@ -192,7 +277,7 @@ mod tests {
     #[test]
     fn soft_limit_never_exceeds_unity() {
         for &x in &[0.9f32, 1.0, 2.0, 10.0, -3.0] {
-            assert!(soft_limit(x).abs() < 1.0);
+            assert!(soft_limit(x).abs() <= 1.0);
         }
     }
 

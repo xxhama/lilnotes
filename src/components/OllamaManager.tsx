@@ -1,13 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import {
-  CheckCircle2,
-  Download,
-  ExternalLink,
-  RefreshCw,
-  X,
-  Zap,
-} from "lucide-react";
+import { CheckCircle2, Download, ExternalLink, RefreshCw, X, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -84,21 +77,18 @@ export default function OllamaManager({ settings, onSave }: Props) {
     }
   });
 
-  const startPull = useCallback(
-    (tag: string) => {
-      setFailed((prev) => {
-        const next = { ...prev };
-        delete next[tag];
-        return next;
-      });
-      setPulls((prev) => ({
-        ...prev,
-        [tag]: { model: tag, status: "starting", completed: 0, total: 0, done: false, error: null },
-      }));
-      pullOllamaModel(tag).catch(() => {});
-    },
-    [],
-  );
+  const startPull = useCallback((tag: string) => {
+    setFailed((prev) => {
+      const next = { ...prev };
+      delete next[tag];
+      return next;
+    });
+    setPulls((prev) => ({
+      ...prev,
+      [tag]: { model: tag, status: "starting", completed: 0, total: 0, done: false, error: null },
+    }));
+    pullOllamaModel(tag).catch(() => {});
+  }, []);
 
   if (reachable === null) return null;
 
@@ -107,9 +97,8 @@ export default function OllamaManager({ settings, onSave }: Props) {
       <div className="space-y-3 rounded-xl border bg-card p-4 text-sm">
         <p className="font-medium">Ollama isn't running</p>
         <p className="text-xs leading-relaxed text-muted-foreground">
-          Summaries use a local model served by Ollama at localhost:11434.
-          Install it from ollama.com and launch it — the rest of LilNotes
-          works fine without it.
+          Summaries use a local model served by Ollama at localhost:11434. Install it from
+          ollama.com and launch it — the rest of LilNotes works fine without it.
         </p>
         <div className="flex gap-2">
           <Button
@@ -143,7 +132,13 @@ export default function OllamaManager({ settings, onSave }: Props) {
             </div>
             <p className="text-xs text-muted-foreground">localhost:11434</p>
           </div>
-          <Button size="icon" variant="ghost" className="size-8" onClick={refresh} aria-label="Refresh">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-8"
+            onClick={refresh}
+            aria-label="Refresh"
+          >
             <RefreshCw className="size-4" />
           </Button>
         </div>
@@ -178,7 +173,8 @@ export default function OllamaManager({ settings, onSave }: Props) {
         {suggested.map((s) => {
           const pull = pulls[s.tag];
           const pulling = pull && !pull.done;
-          const pct = pulling && pull.total > 0 ? Math.round((pull.completed / pull.total) * 100) : null;
+          const pct =
+            pulling && pull.total > 0 ? Math.round((pull.completed / pull.total) * 100) : null;
           const installed = s.installed || s.mlxInstalled;
           return (
             <div key={s.tag} className="flex items-center gap-4 p-4">
@@ -234,9 +230,7 @@ export default function OllamaManager({ settings, onSave }: Props) {
                       in a terminal, or see{" "}
                       <button
                         className="cursor-pointer underline"
-                        onClick={() =>
-                          openUrl(`https://ollama.com/library/${s.tag.split(":")[0]}`)
-                        }
+                        onClick={() => openUrl(`https://ollama.com/library/${s.tag.split(":")[0]}`)}
                       >
                         the model page
                       </button>

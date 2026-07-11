@@ -66,7 +66,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 pub const MIN_SPEECH_MS: u64 = 3000;
 
 impl VoiceprintEngine {
-    fn ensure_loaded(&self, app: &AppHandle) -> Result<(), String> {
+    pub fn ensure_loaded(&self, app: &AppHandle) -> Result<(), String> {
         let mut guard = self.inner.lock().unwrap();
         if guard.is_some() {
             return Ok(());
@@ -121,7 +121,9 @@ impl VoiceprintEngine {
         }
 
         let mut guard = self.inner.lock().unwrap();
-        let extractor = guard.as_mut().ok_or("voiceprint extractor not initialized")?;
+        let extractor = guard
+            .as_mut()
+            .ok_or("voiceprint extractor not initialized")?;
 
         let mut out = HashMap::new();
         for (speaker, (buf, speech_ms)) in by_speaker {
@@ -141,6 +143,38 @@ impl VoiceprintEngine {
             );
         }
         Ok(out)
+    }
+
+    /// Compute a single L2-normalized embedding from raw mono samples in
+    /// memory (no WAV file needed). Returns `Ok(None)` if the buffer is
+    /// shorter than `MIN_SPEECH_MS` so callers can skip unreliable short
+    /// clips without erroring. Used by the live identification path.
+    pub fn embed_samples(
+        &self,
+        app: &AppHandle,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Option<SpeakerEmbedding>, String> {
+        self.ensure_loaded(app)?;
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        let speech_ms = (samples.len() as u64 * 1000) / sample_rate as u64;
+        if speech_ms < MIN_SPEECH_MS {
+            return Ok(None);
+        }
+        let mut guard = self.inner.lock().unwrap();
+        let extractor = guard
+            .as_mut()
+            .ok_or("voiceprint extractor not initialized")?;
+        let mut emb = extractor
+            .compute_speaker_embedding(samples.to_vec(), sample_rate)
+            .map_err(|e| format!("embedding failed: {e}"))?;
+        l2_normalize(&mut emb);
+        Ok(Some(SpeakerEmbedding {
+            vec: emb,
+            speech_ms,
+        }))
     }
 }
 

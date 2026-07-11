@@ -30,3 +30,31 @@ src-tauri/gen/schemas
 *.njsproj
 *.sln
 *.sw?
+Thumbs.db
+
+# Certificates / keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+
+# Model files and native libraries
+*.gguf
+*.onnx
+*.dylib
+*.so
+*.dll
+
+# Tauri sidecar binaries (built by scripts/build-sidecar.sh)
+src-tauri/binaries/
+
+# Claude Code local artifacts
+.claude/

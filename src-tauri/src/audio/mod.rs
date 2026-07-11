@@ -5,6 +5,7 @@
 //! own WAV (`mic.wav`, `system.wav`). Level meters and elapsed time stream to
 //! the UI via the `capture:levels` Tauri event (~10 Hz).
 
+pub mod aec;
 pub mod mic;
 pub mod pipeline;
 pub mod resampler;
@@ -72,22 +73,29 @@ impl CaptureEngine {
     }
 
     pub fn status(&self) -> Option<(String, u64)> {
-        self.active
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| (s.session_id.clone(), s.started_at.elapsed().as_millis() as u64))
+        self.active.lock().unwrap().as_ref().map(|s| {
+            (
+                s.session_id.clone(),
+                s.started_at.elapsed().as_millis() as u64,
+            )
+        })
     }
 
     /// Start a new capture session. `dir` is the per-session directory the
     /// WAVs are written into. When `live_tx` is set, both pipelines feed
     /// 16 kHz chunks into it for near-live transcription; the senders drop
     /// when capture stops, which is the ASR worker's end-of-stream signal.
+    /// When `aec_enabled` is true, a shared WebRTC APM is created: the system
+    /// pipeline feeds it the render/reference signal and the mic pipeline
+    /// runs its capture/forward path (echo cancellation + NS). The mic's
+    /// Apple voice processing is disabled in that case so the APM sees the
+    /// true echo.
     pub fn start(
         &self,
         app: AppHandle,
         dir: PathBuf,
         live_tx: Option<Sender<LiveChunk>>,
+        aec_enabled: bool,
     ) -> Result<StartedRecording, String> {
         let mut guard = self.active.lock().unwrap();
         if guard.is_some() {
@@ -107,6 +115,19 @@ impl CaptureEngine {
         let mic_meters = Arc::new(ChannelMeters::default());
         let sys_meters = Arc::new(ChannelMeters::default());
 
+        // Build the shared AEC pair when enabled. The AecProcessor (capture)
+        // goes to the mic pipeline; the AecRenderFeeder (render) goes to the
+        // system pipeline. Both share one inner Processor via Arc.
+        let (aec_capture, aec_render) = if aec_enabled {
+            eprintln!("[aec] enabled — software AEC active (raw mic, WebRTC APM)");
+            let (cap, ren) = aec::new_aec_pair(resampler::TARGET_RATE)
+                .map_err(|e| format!("AEC init failed: {e}"))?;
+            (Some(cap), Some(ren))
+        } else {
+            eprintln!("[aec] disabled — Apple voice processing active");
+            (None, None)
+        };
+
         let (mic_ready_tx, mic_ready_rx) = crossbeam_channel::bounded(1);
         let (sys_ready_tx, sys_ready_rx) = crossbeam_channel::bounded(1);
 
@@ -116,6 +137,8 @@ impl CaptureEngine {
             mic_meters.clone(),
             live_tx.clone(),
             mic_ready_tx,
+            !aec_enabled, // raw mic when AEC is on
+            aec_capture,
         );
         let sys_thread = system_tap::spawn(
             dir.join("system.wav"),
@@ -123,14 +146,19 @@ impl CaptureEngine {
             sys_meters.clone(),
             live_tx,
             sys_ready_tx,
+            aec_render,
         );
 
         // Wait for both sources to come up (or fail) before declaring success.
         // The system tap may block on the TCC prompt the first time, so allow
         // a generous window.
         let wait = Duration::from_secs(120);
-        let mic_ok = mic_ready_rx.recv_timeout(wait).map_err(|_| "mic setup timed out")?;
-        let sys_ok = sys_ready_rx.recv_timeout(wait).map_err(|_| "system audio setup timed out")?;
+        let mic_ok = mic_ready_rx
+            .recv_timeout(wait)
+            .map_err(|_| "mic setup timed out")?;
+        let sys_ok = sys_ready_rx
+            .recv_timeout(wait)
+            .map_err(|_| "system audio setup timed out")?;
         if let Err(e) = mic_ok.and(sys_ok) {
             // Abort: stop whichever side started, join threads, clean up.
             stop_flag.store(true, Ordering::Relaxed);
@@ -149,7 +177,8 @@ impl CaptureEngine {
                 while !stop.load(Ordering::Relaxed) {
                     let (mic_rms, mic_peak) = mic_meters.read_and_reset_peak();
                     let (system_rms, system_peak) = sys_meters.read_and_reset_peak();
-                    let _ = app.emit_to("main",
+                    let _ = app.emit_to(
+                        "main",
                         "capture:levels",
                         LevelsEvent {
                             session_id: session.clone(),

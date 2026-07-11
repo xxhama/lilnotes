@@ -9,6 +9,7 @@
 **Tech Stack:** Rust (`sherpa-rs = 0.6.8` → `sherpa_rs::speaker_id::{EmbeddingExtractor, ExtractorConfig}` + `compute_speaker_embedding`; `rusqlite` with `bundled-sqlcipher-vendored-openssl` for encrypted-at-rest SQLite; `security-framework` for Keychain key storage; `rand` OsRng for key generation), React 19 / TS / Tailwind / shadcn, Tauri v2 IPC.
 
 **Confirmed decisions:**
+
 - Pre-fill suggested name on the chip; require one-click confirm (never silent auto-apply).
 - Scoring: max cosine over the persona's gallery (not centroid).
 - Personas management: new dedicated view in the sidebar.
@@ -22,6 +23,7 @@
 ## File Structure
 
 **Backend (Rust) — new/modified:**
+
 - `src-tauri/Cargo.toml` (modify) — `rusqlite` → `bundled-sqlcipher-vendored-openssl`; add `security-framework = "3.7"` and `rand = "0.8"`.
 - `src-tauri/src/keystore/mod.rs` (create) — `db_key() -> Result<Vec<u8>, String>`: get-or-create a 32-byte key in the macOS Keychain (service `co.elastic.lilnote`, account `db-key`) via `security_framework::passwords`; first run generates it with `rand::rngs::OsRng`.
 - `src-tauri/src/db/mod.rs` (modify) — `Db::open(path, key: &[u8])` sets `PRAGMA key = "x'<hex>'"` before any other pragma, then existing pragmas + `migrate()`; migration to `user_version = 2`; `Persona`, `SpeakerLink` row types; CRUD methods for the three new tables; extend `MeetingDetail` with `speaker_links`.
@@ -32,6 +34,7 @@
 - `src-tauri/src/lib.rs` (modify) — `mod keystore; mod voiceprint; mod personas;`, manage `VoiceprintEngine`, fetch the DB key from the Keychain and pass it to `Db::open`, register new commands.
 
 **Frontend — new/modified:**
+
 - `src/lib/ipc.ts` (modify) — new types + typed wrappers + `onSpeakersIdentified`.
 - `src/components/SpeakerPersonaPicker.tsx` (create) — confirm / choose / create / dismiss popover.
 - `src/components/TranscriptPane.tsx` (modify) — persona-aware chip: shows suggested name + confidence + "suggested" affordance; opens the picker.
@@ -41,6 +44,7 @@
 - `src/App.tsx` (modify) — `personas` route + nav item.
 
 **Docs:**
+
 - `README.md` (modify) — milestone 9 row + verification + privacy note about voiceprints.
 
 ---
@@ -50,6 +54,7 @@
 The entire SQLite database is encrypted at rest. The 256-bit key is generated on first run and stored in the macOS Keychain; `Db::open` takes the key as a parameter so the `db` module stays Keychain-agnostic and tests stay hermetic. Do this before any migration task — the encrypted connection must exist before tables are created.
 
 **Files:**
+
 - Modify: `src-tauri/Cargo.toml`
 - Create: `src-tauri/src/keystore/mod.rs`
 - Modify: `src-tauri/src/db/mod.rs:54-68` (`Db::open`)
@@ -138,6 +143,7 @@ In `src-tauri/src/db/mod.rs`, change the signature and set `PRAGMA key` as the *
 - [ ] **Step 4: Wire the key in `lib.rs` setup + register the module**
 
 In `src-tauri/src/lib.rs`:
+
 - Add `mod keystore;` to the module list (before `mod db;`).
 - In `.setup(|app| { ... })`, fetch the key and pass it to `Db::open`:
 
@@ -182,6 +188,7 @@ git commit -m "Milestone 9: SQLCipher full-DB encryption at rest + macOS Keychai
 ## Task 1: SQLite migration to user_version = 2
 
 **Files:**
+
 - Modify: `src-tauri/src/db/mod.rs:70-125` (the `migrate()` method)
 
 - [ ] **Step 1: Add the v2 migration block after the v1 block**
@@ -291,6 +298,7 @@ git commit -m "Milestone 9: SQLite migration to v2 — personas, voiceprints, sp
 ## Task 2: voiceprint module — embedding extraction + vector math
 
 **Files:**
+
 - Create: `src-tauri/src/voiceprint/mod.rs`
 - Modify: `src-tauri/src/lib.rs:15-24` (add `mod voiceprint;`) and `:42-46` (manage state)
 
@@ -510,6 +518,7 @@ impl VoiceprintEngine {
 - [ ] **Step 4: Register the module + managed state**
 
 In `src-tauri/src/lib.rs`:
+
 - Add `mod voiceprint;` to the module list (after `mod transcript;`).
 - Add `use voiceprint::VoiceprintEngine;` to the `use` block.
 - Add `.manage(Arc::new(VoiceprintEngine::default()))` after the `DiarizeEngine` manage line.
@@ -531,6 +540,7 @@ git commit -m "Milestone 9: voiceprint module — CAM++ embedding extraction + v
 ## Task 3: personas module — types, matching, enrollment
 
 **Files:**
+
 - Create: `src-tauri/src/personas/mod.rs`
 - Modify: `src-tauri/src/lib.rs` (add `mod personas;`)
 
@@ -705,6 +715,7 @@ git commit -m "Milestone 9: personas module — Tier classification + gallery ra
 ## Task 4: DB CRUD for personas / voiceprints / links
 
 **Files:**
+
 - Modify: `src-tauri/src/db/mod.rs` (replace the `#[cfg(test)]` stub from Task 3 with real methods + add the rest)
 
 - [ ] **Step 1: Add row types**
@@ -1047,6 +1058,7 @@ git commit -m "Milestone 9: DB CRUD for personas, voiceprints, speaker_persona_l
 ## Task 5: Settings — thresholds + gallery cap
 
 **Files:**
+
 - Modify: `src-tauri/src/settings.rs`
 - Modify: `src-tauri/src/db/mod.rs:131-195` (`get_settings` / `set_settings`)
 
@@ -1127,6 +1139,7 @@ git commit -m "Milestone 9: persona match thresholds + gallery cap in settings"
 ## Task 6: personas — identify_and_persist + enroll orchestration
 
 **Files:**
+
 - Modify: `src-tauri/src/personas/mod.rs` (add `identify_and_persist` + `enroll`)
 
 - [ ] **Step 1: Add `identify_and_persist` and `enroll`**
@@ -1256,6 +1269,7 @@ git commit -m "Milestone 9: identify_and_persist + enroll orchestration"
 ## Task 7: IPC commands + wire identify into diarize_meeting
 
 **Files:**
+
 - Modify: `src-tauri/src/commands.rs`
 - Modify: `src-tauri/src/db/mod.rs` (`MeetingDetail` gets `speaker_links`)
 - Modify: `src-tauri/src/lib.rs` (register commands)
@@ -1494,6 +1508,7 @@ git commit -m "Milestone 9: persona/voiceprint IPC commands + identify runs afte
 ## Task 8: Frontend — ipc.ts types + wrappers
 
 **Files:**
+
 - Modify: `src/lib/ipc.ts`
 
 - [ ] **Step 1: Add types**
@@ -1578,16 +1593,11 @@ export function confirmSpeakerPersona(
   return invoke("confirm_speaker_persona", { meetingId, rawLabel, personaId });
 }
 
-export function unlinkSpeakerPersona(
-  meetingId: number,
-  rawLabel: string,
-): Promise<void> {
+export function unlinkSpeakerPersona(meetingId: number, rawLabel: string): Promise<void> {
   return invoke("unlink_speaker_persona", { meetingId, rawLabel });
 }
 
-export function onSpeakersIdentified(
-  cb: (e: SpeakerMatch[]) => void,
-): Promise<UnlistenFn> {
+export function onSpeakersIdentified(cb: (e: SpeakerMatch[]) => void): Promise<UnlistenFn> {
   return listen<SpeakerMatch[]>("speakers:identified", (ev) => cb(ev.payload));
 }
 ```
@@ -1611,6 +1621,7 @@ git commit -m "Milestone 9: frontend IPC types + wrappers for personas/voiceprin
 ## Task 9: Frontend — SpeakerPersonaPicker + persona-aware chip
 
 **Files:**
+
 - Create: `src/components/SpeakerPersonaPicker.tsx`
 - Modify: `src/components/TranscriptPane.tsx`
 - Modify: `src/views/MeetingDetail.tsx`
@@ -1671,9 +1682,7 @@ export default function SpeakerPersonaPicker({
       onClick={(e) => e.stopPropagation()}
     >
       <div className="mb-1 flex items-center justify-between">
-        <span className="text-[11px] font-medium text-muted-foreground">
-          Assign {rawLabel}
-        </span>
+        <span className="text-[11px] font-medium text-muted-foreground">Assign {rawLabel}</span>
         <button
           className="text-muted-foreground hover:text-foreground"
           onClick={onDismiss}
@@ -1751,6 +1760,7 @@ export default function SpeakerPersonaPicker({
 In `src/components/TranscriptPane.tsx`, extend `Props` with `speakerLinks?: Record<string, SpeakerLink>` and `personas?: Persona[]`, plus callbacks `onConfirmPersona?: (raw: string, personaId: number) => void` and `onUnlinkPersona?: (raw: string) => void` and `onCreatePersona?: (name: string) => Promise<number>`. Import the new types and `SpeakerPersonaPicker`.
 
 Update `SpeakerChip` to:
+
 - Accept the new props.
 - If `speakerLinks[raw]` exists and is **not confirmed**, show the suggested persona name (from the link) with a subtle dashed ring + confidence %; clicking opens the `SpeakerPersonaPicker`.
 - If confirmed, show the name plainly; clicking opens the picker (to reassign/unlink).
@@ -1790,6 +1800,7 @@ Keep the "Me" and unlabeled branches unchanged.
 - [ ] **Step 3: Wire it in `MeetingDetail.tsx`**
 
 In `src/views/MeetingDetail.tsx`:
+
 - Import `confirmSpeakerPersona`, `unlinkSpeakerPersona`, `createPersona`, `listPersonas`, `onSpeakersIdentified`, and the new types.
 - State: `const [personas, setPersonas] = useState<Persona[]>([]);` loaded on mount and reloaded after confirm/create.
 - Subscribe to `onSpeakersIdentified` → `reload()` (the meeting detail now carries updated `speakerLinks`).
@@ -1816,6 +1827,7 @@ git commit -m "Milestone 9: persona-aware speaker chips with confirm/create/dism
 ## Task 10: Frontend — Personas view + nav
 
 **Files:**
+
 - Create: `src/views/Personas.tsx`
 - Modify: `src/App.tsx`
 
@@ -1845,7 +1857,9 @@ export default function PersonasView() {
   const [error, setError] = useState<string | null>(null);
 
   const reload = useCallback(() => {
-    listPersonas().then(setPersonas).catch((e) => setError(String(e)));
+    listPersonas()
+      .then(setPersonas)
+      .catch((e) => setError(String(e)));
   }, []);
 
   useEffect(reload, [reload]);
@@ -1912,8 +1926,8 @@ export default function PersonasView() {
           <Users className="size-5" /> Personas
         </h1>
         <p className="text-sm text-muted-foreground">
-          Named speakers LilNotes learns across meetings. Each persona holds a
-          gallery of voiceprints that grows when you confirm an identity.
+          Named speakers LilNotes learns across meetings. Each persona holds a gallery of
+          voiceprints that grows when you confirm an identity.
         </p>
       </div>
 
@@ -2002,6 +2016,7 @@ export default function PersonasView() {
 - [ ] **Step 2: Add the route + nav item**
 
 In `src/App.tsx`:
+
 - Import `PersonasView` and the `Users` icon (already used in MeetingDetail; import from `lucide-react`).
 - Add `| { name: "personas" }` to the `Route` union.
 - Add to `NAV`: `{ route: { name: "personas" } as Route, label: "Personas", icon: Users }`.
@@ -2024,6 +2039,7 @@ git commit -m "Milestone 9: Personas management view + sidebar nav"
 ## Task 11: Settings — thresholds, gallery cap, privacy controls
 
 **Files:**
+
 - Modify: `src/views/Settings.tsx`
 
 - [ ] **Step 1: Add a "Personas & voiceprints" section**
@@ -2031,107 +2047,109 @@ git commit -m "Milestone 9: Personas management view + sidebar nav"
 In `src/views/Settings.tsx`, after the "Summaries" section, add:
 
 ```tsx
-      {/* ------------------------------------------------------------- */}
-      {/* Personas & voiceprints                                          */}
-      {/* ------------------------------------------------------------- */}
-      <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">
-          Personas &amp; voiceprints
-        </h2>
+{
+  /* ------------------------------------------------------------- */
+}
+{
+  /* Personas & voiceprints                                          */
+}
+{
+  /* ------------------------------------------------------------- */
+}
+<section className="space-y-3">
+  <h2 className="text-sm font-medium text-muted-foreground">Personas &amp; voiceprints</h2>
 
-        <div className="divide-y rounded-xl border bg-card">
-          <div className="space-y-2 p-4">
-            <div className="text-sm font-medium">Match thresholds</div>
-            <p className="text-xs text-muted-foreground">
-              Cosine similarity cutoffs for suggesting known personas on
-              diarized speakers. Higher = fewer false matches.
-            </p>
-            <label className="flex items-center justify-between gap-3 text-xs">
-              <span>Auto-suggest (pre-fill)</span>
-              <input
-                type="number"
-                step="0.01"
-                min="0"
-                max="1"
-                value={settings?.personaAutoThreshold ?? 0.65}
-                onChange={(e) =>
-                  settings &&
-                  saveSettings({
-                    ...settings,
-                    personaAutoThreshold: parseFloat(e.target.value) || 0,
-                  })
-                }
-                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
-              />
-            </label>
-            <label className="flex items-center justify-between gap-3 text-xs">
-              <span>Tentative suggestion</span>
-              <input
-                type="number"
-                step="0.01"
-                min="0"
-                max="1"
-                value={settings?.personaSuggestThreshold ?? 0.45}
-                onChange={(e) =>
-                  settings &&
-                  saveSettings({
-                    ...settings,
-                    personaSuggestThreshold: parseFloat(e.target.value) || 0,
-                  })
-                }
-                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
-              />
-            </label>
-            <label className="flex items-center justify-between gap-3 text-xs">
-              <span>Voiceprints per persona (cap)</span>
-              <input
-                type="number"
-                step="1"
-                min="0"
-                value={settings?.voiceprintGalleryCap ?? 50}
-                onChange={(e) =>
-                  settings &&
-                  saveSettings({
-                    ...settings,
-                    voiceprintGalleryCap: parseInt(e.target.value, 10) || 0,
-                  })
-                }
-                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
-              />
-            </label>
-          </div>
+  <div className="divide-y rounded-xl border bg-card">
+    <div className="space-y-2 p-4">
+      <div className="text-sm font-medium">Match thresholds</div>
+      <p className="text-xs text-muted-foreground">
+        Cosine similarity cutoffs for suggesting known personas on diarized speakers. Higher = fewer
+        false matches.
+      </p>
+      <label className="flex items-center justify-between gap-3 text-xs">
+        <span>Auto-suggest (pre-fill)</span>
+        <input
+          type="number"
+          step="0.01"
+          min="0"
+          max="1"
+          value={settings?.personaAutoThreshold ?? 0.65}
+          onChange={(e) =>
+            settings &&
+            saveSettings({
+              ...settings,
+              personaAutoThreshold: parseFloat(e.target.value) || 0,
+            })
+          }
+          className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+        />
+      </label>
+      <label className="flex items-center justify-between gap-3 text-xs">
+        <span>Tentative suggestion</span>
+        <input
+          type="number"
+          step="0.01"
+          min="0"
+          max="1"
+          value={settings?.personaSuggestThreshold ?? 0.45}
+          onChange={(e) =>
+            settings &&
+            saveSettings({
+              ...settings,
+              personaSuggestThreshold: parseFloat(e.target.value) || 0,
+            })
+          }
+          className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+        />
+      </label>
+      <label className="flex items-center justify-between gap-3 text-xs">
+        <span>Voiceprints per persona (cap)</span>
+        <input
+          type="number"
+          step="1"
+          min="0"
+          value={settings?.voiceprintGalleryCap ?? 50}
+          onChange={(e) =>
+            settings &&
+            saveSettings({
+              ...settings,
+              voiceprintGalleryCap: parseInt(e.target.value, 10) || 0,
+            })
+          }
+          className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+        />
+      </label>
+    </div>
 
-          <div className="flex items-center justify-between gap-4 p-4">
-            <div className="space-y-0.5">
-              <div className="text-sm font-medium">Delete all voiceprints</div>
-              <p className="text-xs text-muted-foreground">
-                Clears every persona's stored voiceprints. Personas stay, but
-                recognition starts over. Manage individual personas in the
-                Personas view.
-              </p>
-            </div>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={async () => {
-                if (!confirm("Delete ALL stored voiceprints?")) return;
-                await deleteAllVoiceprints();
-              }}
-            >
-              Clear
-            </Button>
-          </div>
+    <div className="flex items-center justify-between gap-4 p-4">
+      <div className="space-y-0.5">
+        <div className="text-sm font-medium">Delete all voiceprints</div>
+        <p className="text-xs text-muted-foreground">
+          Clears every persona's stored voiceprints. Personas stay, but recognition starts over.
+          Manage individual personas in the Personas view.
+        </p>
+      </div>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={async () => {
+          if (!confirm("Delete ALL stored voiceprints?")) return;
+          await deleteAllVoiceprints();
+        }}
+      >
+        Clear
+      </Button>
+    </div>
 
-          <div className="p-4 text-xs text-muted-foreground">
-            Voiceprints are biometric data stored only in the local SQLite
-            database at{" "}
-            <code className="rounded bg-secondary px-1">
-              ~/Library/Application Support/co.elastic.lilnote/lilnotes.sqlite3
-            </code>
-            . They never leave your Mac.
-          </div>
-        </div>
-      </section>
+    <div className="p-4 text-xs text-muted-foreground">
+      Voiceprints are biometric data stored only in the local SQLite database at{" "}
+      <code className="rounded bg-secondary px-1">
+        ~/Library/Application Support/co.elastic.lilnote/lilnotes.sqlite3
+      </code>
+      . They never leave your Mac.
+    </div>
+  </div>
+</section>;
 ```
 
 Add `deleteAllVoiceprints` to the imports from `@/lib/ipc`.
@@ -2153,6 +2171,7 @@ git commit -m "Milestone 9: persona thresholds, gallery cap, voiceprint privacy 
 ## Task 12: README — milestone 9 row, verification, privacy note
 
 **Files:**
+
 - Modify: `README.md`
 
 - [ ] **Step 1: Update the milestone status table**
@@ -2206,7 +2225,7 @@ Append after the "Verifying milestone 6" section:
    chip should pre-fill "Priya" with a confidence % (dashed ring = suggested).
    Confirm it → `SELECT COUNT(*) FROM voiceprints;` increments (gallery grew).
 3. Negative: a brand-new voice stays `SPEAKER_xx` (no false auto-match).
-4. Adaptive case: in a meeting where Priya is *not* auto-matched (below
+4. Adaptive case: in a meeting where Priya is _not_ auto-matched (below
    threshold), manually assign her via the picker; confirm a new voiceprint
    row is enrolled, then re-run a similar later recording and check the
    confidence is higher / now clears the threshold.
@@ -2217,7 +2236,7 @@ Append after the "Verifying milestone 6" section:
    unlocks and all data reloads. `sqlite3` on the DB file reports "file is
    not a database" (encrypted). Deleting the Keychain item and relaunching
    makes the DB unreadable (intended factory-reset behavior). `cd src-tauri
-   && cargo test` passes (pack/unpack round-trip, cosine, threshold
+&& cargo test` passes (pack/unpack round-trip, cosine, threshold
    classification, CRUD — all with the fixed test key, no Keychain access).
 ```
 
@@ -2245,6 +2264,7 @@ Expected: both succeed with no errors or warnings about the new code.
 - [ ] **Step 3: Manual smoke test (dev)**
 
 Run: `npm run tauri dev`
+
 - First launch: macOS may show a Keychain authorization prompt to store the DB key — allow it (this is the one-time encryption-setup prompt; the app is self-contained and doesn't use the key for anything else).
 - Open Personas view — empty state shows.
 - Record a short meeting with a remote speaker; transcribe + diarize; after "Identifying speakers…" a chip shows `SPEAKER_00` with no suggestion (gallery empty).
@@ -2266,4 +2286,7 @@ If the smoke test surfaced fixes, commit them. Otherwise no-op.
 - **Type consistency:** `SpeakerLink` (Rust `confirmed: bool` ↔ TS `confirmed: boolean`), `PersonaScore`/`SpeakerMatch`/`Tier` shapes match across `personas/mod.rs`, `commands.rs`, and `ipc.ts`. `MeetingDetail.speaker_links` ↔ `speakerLinks` (camelCase via `rename_all`). `PersonaWithEmbeddings` used only Rust-side by `rank_personas`. `Db::open(path, key)` signature is consistent across `lib.rs` setup and the test helper.
 - **Encryption notes:** `Db::open` takes the key as a parameter (Keychain-agnostic) so tests pass a fixed `[0x42u8; 32]` key and never touch the Keychain. `bundled-sqlcipher-vendored-openssl` is chosen over plain `bundled-sqlcipher` to keep the signed/notarized build self-contained (no system-OpenSSL ambiguity). First build is slower (compiles OpenSSL); subsequent builds are cached. The `PRAGMA key = "x'<hex>'"` raw-key form bypasses SQLCipher's PBKDF2 since we already hold a CSPRNG-generated 256-bit key.
 - **Known limitations surfaced in plan:** `identify_speakers` standalone command re-diarizes to get turns (matches `confirm_speaker_persona`); if audio is deleted, both degrade gracefully (identify errors; confirm marks the link confirmed without enrolling). If the Keychain key is deleted, the DB is unrecoverable (intended privacy behavior — surface a clear error in `lib.rs` setup).
+
+```
+
 ```

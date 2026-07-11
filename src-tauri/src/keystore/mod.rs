@@ -2,7 +2,7 @@
 //!
 //! On first run a 32-byte random key is generated with `OsRng` and stored as
 //! a generic password in the user's login keychain (service
-//! `co.elastic.lilnote`, account `db-key`). Subsequent launches retrieve it.
+//! `com.lilnotes`, account `db-key`). Subsequent launches retrieve it.
 //! If the key is deleted from the Keychain, the encrypted DB becomes
 //! unreadable — which is the correct privacy behavior (effectively a factory
 //! reset of all meeting/voiceprint data).
@@ -11,7 +11,7 @@ use rand::RngCore;
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use security_framework_sys::base::errSecItemNotFound;
 
-const SERVICE: &str = "co.elastic.lilnote";
+const SERVICE: &str = "com.lilnotes";
 const ACCOUNT: &str = "db-key";
 
 /// Get the 32-byte DB key from the Keychain, generating and storing it on
