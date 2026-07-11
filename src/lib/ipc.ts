@@ -26,6 +26,16 @@ export function ping(message: string): Promise<PingResponse> {
   return invoke<PingResponse>("ping", { message });
 }
 
+/** Check whether the encrypted database file exists (no Keychain access). */
+export function dbExists(): Promise<boolean> {
+  return invoke<boolean>("db_exists");
+}
+
+/** Open the encrypted database (triggers the macOS Keychain prompt). */
+export function initDb(): Promise<void> {
+  return invoke<void>("init_db");
+}
+
 // ---------------------------------------------------------------------------
 // Recording (M2)
 // ---------------------------------------------------------------------------

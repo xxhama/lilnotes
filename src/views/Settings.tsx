@@ -46,7 +46,7 @@ function fmtBytes(n: number): string {
 function StatusBadge({ status }: { status: PermissionStatus | SysAudioState | null }) {
   if (status === "granted")
     return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-green-600/10 px-2 py-0.5 text-xs font-medium text-green-700 dark:text-green-400">
+      <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
         <CheckCircle2 className="size-3" /> Granted
       </span>
     );
@@ -105,6 +105,20 @@ export default function SettingsView() {
     getSettings().then(setSettings);
     defaultSummaryTemplate().then(setTemplatePlaceholder);
     refreshModels();
+    // Auto-probe system audio access. There's no status-query API, so the
+    // probe (create + destroy a process tap) is the only way to check. On
+    // first use it surfaces the TCC prompt automatically.
+    (async () => {
+      setProbing(true);
+      try {
+        await probeSystemAudioPermission();
+        setSysAudio("granted");
+      } catch {
+        setSysAudio("denied");
+      } finally {
+        setProbing(false);
+      }
+    })();
   }, [refreshModels]);
 
   useTauriEvent(onModelProgress, (p) => {
@@ -126,18 +140,6 @@ export default function SettingsView() {
     setMicPerm(granted ? "granted" : "denied");
   }, []);
 
-  const probeSystem = useCallback(async () => {
-    setProbing(true);
-    try {
-      await probeSystemAudioPermission();
-      setSysAudio("granted");
-    } catch {
-      setSysAudio("denied");
-    } finally {
-      setProbing(false);
-    }
-  }, []);
-
   const startDownload = useCallback(
     (id: string) => {
       setProgress((prev) => ({
@@ -152,7 +154,7 @@ export default function SettingsView() {
   );
 
   return (
-    <div className="mx-auto max-w-2xl space-y-8 p-8 pt-6">
+    <div className="mx-auto max-w-2xl space-y-8 p-8 pt-4">
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">Transcription, summaries, and permissions.</p>
@@ -201,7 +203,7 @@ export default function SettingsView() {
                       {fmtBytes(m.approxBytes)}
                     </span>
                     {m.downloaded && (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-green-600/10 px-2 py-0.5 text-[11px] font-medium text-green-700 dark:text-green-400">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-[11px] font-medium text-success">
                         <CheckCircle2 className="size-3" /> Downloaded
                       </span>
                     )}
@@ -250,72 +252,65 @@ export default function SettingsView() {
       <section className="space-y-3">
         <h2 className="text-sm font-medium text-muted-foreground">Summaries</h2>
 
-        {/* Backend selector */}
+        {/* Backend selector + model manager (single card) */}
         {settings && (
           <div className="divide-y rounded-xl border bg-card">
             <div className="p-4 space-y-2">
               <div className="text-sm font-medium">Backend</div>
-              <p className="text-xs text-muted-foreground">
-                Built-in runs entirely in-app (no external setup). Ollama is for power users who
-                already run it.
-              </p>
-            </div>
-            <div className="flex gap-2 p-4">
-              <button
-                onClick={() => saveSettings({ ...settings, summaryBackend: "native" })}
-                className={cn(
-                  "flex-1 rounded-lg border p-3 text-left transition-colors",
-                  settings.summaryBackend !== "ollama"
-                    ? "border-primary bg-primary/5"
-                    : "border-border hover:border-ring",
-                )}
-              >
-                <div className="flex items-center gap-2 text-sm font-medium">
-                  {settings.summaryBackend !== "ollama" && (
-                    <CheckCircle2 className="size-4 text-primary" />
+              <div className="flex gap-2">
+                <button
+                  onClick={() => saveSettings({ ...settings, summaryBackend: "native" })}
+                  className={cn(
+                    "flex-1 rounded-lg border p-3 text-left transition-colors",
+                    settings.summaryBackend !== "ollama"
+                      ? "border-primary bg-primary/5"
+                      : "border-border hover:border-ring",
                   )}
-                  Built-in
-                  <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
-                    Recommended
-                  </span>
-                </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Runs entirely on your Mac. No setup needed.
-                </p>
-              </button>
-              <button
-                onClick={() => saveSettings({ ...settings, summaryBackend: "ollama" })}
-                className={cn(
-                  "flex-1 rounded-lg border p-3 text-left transition-colors",
-                  settings.summaryBackend === "ollama"
-                    ? "border-primary bg-primary/5"
-                    : "border-border hover:border-ring",
-                )}
-              >
-                <div className="flex items-center gap-2 text-sm font-medium">
-                  {settings.summaryBackend === "ollama" && (
-                    <CheckCircle2 className="size-4 text-primary" />
+                >
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    {settings.summaryBackend !== "ollama" && (
+                      <CheckCircle2 className="size-4 text-primary" />
+                    )}
+                    Built-in
+                    <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                      Recommended
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Runs entirely on your Mac. No setup needed.
+                  </p>
+                </button>
+                <button
+                  onClick={() => saveSettings({ ...settings, summaryBackend: "ollama" })}
+                  className={cn(
+                    "flex-1 rounded-lg border p-3 text-left transition-colors",
+                    settings.summaryBackend === "ollama"
+                      ? "border-primary bg-primary/5"
+                      : "border-border hover:border-ring",
                   )}
-                  Ollama
-                  <span className="rounded-full bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-                    Advanced
-                  </span>
-                </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Use a locally running Ollama instance with any model.
-                </p>
-              </button>
+                >
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    {settings.summaryBackend === "ollama" && (
+                      <CheckCircle2 className="size-4 text-primary" />
+                    )}
+                    Ollama
+                    <span className="rounded-full bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                      Advanced
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Use a locally running Ollama instance with any model.
+                  </p>
+                </button>
+              </div>
             </div>
+            {settings.summaryBackend === "ollama" ? (
+              <OllamaManager settings={settings} onSave={saveSettings} />
+            ) : (
+              <NativeModelManager settings={settings} onSave={saveSettings} />
+            )}
           </div>
         )}
-
-        {/* Backend-specific model manager */}
-        {settings &&
-          (settings.summaryBackend === "ollama" ? (
-            <OllamaManager settings={settings} onSave={saveSettings} />
-          ) : (
-            <NativeModelManager settings={settings} onSave={saveSettings} />
-          ))}
 
         {/* Template editor */}
         <div className="space-y-2 rounded-xl border bg-card p-4">
@@ -473,10 +468,10 @@ export default function SettingsView() {
       </section>
 
       {/* ------------------------------------------------------------- */}
-      {/* Audio                                                           */}
+      {/* Recording                                                       */}
       {/* ------------------------------------------------------------- */}
       <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">Audio</h2>
+        <h2 className="text-sm font-medium text-muted-foreground">Recording</h2>
 
         <div className="divide-y rounded-xl border bg-card">
           <div className="flex items-center justify-between gap-4 p-4">
@@ -495,16 +490,7 @@ export default function SettingsView() {
               />
             )}
           </div>
-        </div>
-      </section>
 
-      {/* ------------------------------------------------------------- */}
-      {/* Storage                                                         */}
-      {/* ------------------------------------------------------------- */}
-      <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">Storage</h2>
-
-        <div className="divide-y rounded-xl border bg-card">
           <div className="flex items-center justify-between gap-4 p-4">
             <div className="min-w-0 space-y-0.5">
               <div className="text-sm font-medium">Recordings location</div>
@@ -566,7 +552,8 @@ export default function SettingsView() {
           <div className="flex items-center justify-between gap-4 p-4">
             <div className="space-y-0.5">
               <div className="flex items-center gap-2 text-sm font-medium">
-                Microphone <StatusBadge status={micPerm} />
+                <span className="w-24 shrink-0">Microphone</span>
+                <StatusBadge status={micPerm} />
               </div>
               <p className="text-xs text-muted-foreground">
                 Your side of the meeting, recorded to its own track.
@@ -593,27 +580,29 @@ export default function SettingsView() {
           <div className="flex items-center justify-between gap-4 p-4">
             <div className="space-y-0.5">
               <div className="flex items-center gap-2 text-sm font-medium">
-                System audio <StatusBadge status={sysAudio === "unknown" ? null : sysAudio} />
+                <span className="w-24 shrink-0">System audio</span>
+                {probing ? (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-secondary px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                    Checking…
+                  </span>
+                ) : (
+                  <StatusBadge status={sysAudio === "unknown" ? null : sysAudio} />
+                )}
               </div>
               <p className="text-xs text-muted-foreground">
-                Other participants' voices. macOS calls this "System Audio Recording Only" — its
-                status can only be checked by trying.
+                Other participants' voices (Zoom, Teams, etc.). macOS calls this "System Audio
+                Recording Only."
               </p>
             </div>
-            <div className="flex shrink-0 gap-2">
-              <Button size="sm" variant="outline" onClick={probeSystem} disabled={probing}>
-                {probing ? "Testing…" : "Test access"}
+            {sysAudio === "denied" && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => openPrivacySettings("systemAudio")}
+              >
+                <ExternalLink /> System Settings
               </Button>
-              {sysAudio === "denied" && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => openPrivacySettings("systemAudio")}
-                >
-                  <ExternalLink /> System Settings
-                </Button>
-              )}
-            </div>
+            )}
           </div>
         </div>
       </section>

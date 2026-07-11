@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { CheckCircle2, Download, ExternalLink, RefreshCw, X, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   cancelOllamaPull,
   listOllamaModels,
@@ -11,6 +12,7 @@ import {
   pullOllamaModel,
   suggestedOllamaModels,
   type AppSettings,
+  type InstalledOllamaModel,
   type OllamaModels,
   type PullProgress,
   type SuggestedModel,
@@ -29,9 +31,10 @@ interface Props {
 }
 
 /**
- * Ollama status + summary model picker + curated "models to pull" list
- * with live progress. All model management happens through the Ollama HTTP
- * API — the terminal command is shown only as a fallback when a pull fails.
+ * Ollama model management. Renders as a fragment of rows (no card wrapper) —
+ * `Settings.tsx` provides the card shell so the backend selector and model
+ * list share one card. Emits a status header row + a RadioGroup of installed
+ * and suggested model rows (pull + select inline, no separate dropdown).
  */
 export default function OllamaManager({ settings, onSave }: Props) {
   const [reachable, setReachable] = useState<boolean | null>(null);
@@ -94,7 +97,7 @@ export default function OllamaManager({ settings, onSave }: Props) {
 
   if (!reachable) {
     return (
-      <div className="space-y-3 rounded-xl border bg-card p-4 text-sm">
+      <div className="space-y-3 p-4 text-sm">
         <p className="font-medium">Ollama isn't running</p>
         <p className="text-xs leading-relaxed text-muted-foreground">
           Summaries use a local model served by Ollama at localhost:11434. Install it from
@@ -117,67 +120,73 @@ export default function OllamaManager({ settings, onSave }: Props) {
   }
 
   const activeModel = settings.summaryModel ?? models?.active ?? null;
+  const installed = models?.installed ?? [];
+  const suggestedTags = new Set(suggested.map((s) => s.tag));
+  const installedNotSuggested: InstalledOllamaModel[] = installed.filter(
+    (m) => !suggestedTags.has(m.name),
+  );
 
   return (
-    <div className="space-y-3">
-      {/* Status + active model picker */}
-      <div className="divide-y rounded-xl border bg-card">
-        <div className="flex items-center justify-between gap-4 p-4">
-          <div className="space-y-0.5">
-            <div className="flex items-center gap-2 text-sm font-medium">
-              Ollama
-              <span className="inline-flex items-center gap-1 rounded-full bg-green-600/10 px-2 py-0.5 text-xs font-medium text-green-700 dark:text-green-400">
-                <CheckCircle2 className="size-3" /> Running{version ? ` · v${version}` : ""}
-              </span>
-            </div>
-            <p className="text-xs text-muted-foreground">localhost:11434</p>
+    <>
+      {/* Status header row */}
+      <div className="flex items-center justify-between gap-4 p-4">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            Ollama
+            <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
+              <CheckCircle2 className="size-3" /> Running{version ? ` · v${version}` : ""}
+            </span>
           </div>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="size-8"
-            onClick={refresh}
-            aria-label="Refresh"
-          >
-            <RefreshCw className="size-4" />
-          </Button>
+          <p className="text-xs text-muted-foreground">localhost:11434</p>
         </div>
-
-        <div className="flex items-center justify-between gap-4 p-4">
-          <div className="space-y-0.5">
-            <div className="text-sm font-medium">Summary model</div>
-            <p className="text-xs text-muted-foreground">
-              {models && models.installed.length === 0
-                ? "No models installed yet — pull one below."
-                : "Used for meeting summaries; also selectable per meeting."}
-            </p>
-          </div>
-          {models && models.installed.length > 0 && (
-            <select
-              value={activeModel ?? ""}
-              onChange={(e) => onSave({ ...settings, summaryModel: e.target.value })}
-              className="h-8 max-w-56 rounded-md border bg-card px-2 text-xs outline-none focus:border-ring"
-            >
-              {models.installed.map((m) => (
-                <option key={m.name} value={m.name}>
-                  {m.name} ({fmtBytes(m.sizeBytes)})
-                </option>
-              ))}
-            </select>
-          )}
-        </div>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-8"
+          onClick={refresh}
+          aria-label="Refresh"
+        >
+          <RefreshCw className="size-4" />
+        </Button>
       </div>
 
-      {/* Curated suggestions */}
-      <div className="divide-y rounded-xl border bg-card">
+      {/* Model radio rows */}
+      <RadioGroup
+        value={activeModel ?? undefined}
+        onValueChange={(v) => onSave({ ...settings, summaryModel: v })}
+        className="grid gap-0 divide-y"
+      >
+        {/* Installed models not in the curated suggestion list */}
+        {installedNotSuggested.map((m) => (
+          <div key={m.name} className="flex items-center gap-4 p-4">
+            <RadioGroupItem value={m.name} />
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                <span data-selectable>{m.name}</span>
+                {m.parameterSize && (
+                  <span className="text-xs font-normal text-muted-foreground">
+                    {m.parameterSize}
+                  </span>
+                )}
+                <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-[11px] font-medium text-success">
+                  <CheckCircle2 className="size-3" /> Installed
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground">{fmtBytes(m.sizeBytes)}</p>
+            </div>
+          </div>
+        ))}
+
+        {/* Curated suggestions */}
         {suggested.map((s) => {
           const pull = pulls[s.tag];
           const pulling = pull && !pull.done;
           const pct =
             pulling && pull.total > 0 ? Math.round((pull.completed / pull.total) * 100) : null;
-          const installed = s.installed || s.mlxInstalled;
+          const isInstalled = s.installed || s.mlxInstalled;
           return (
             <div key={s.tag} className="flex items-center gap-4 p-4">
+              <RadioGroupItem value={s.tag} disabled={!isInstalled} />
               <div className="min-w-0 flex-1 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
                   <span data-selectable>{s.tag}</span>
@@ -189,8 +198,8 @@ export default function OllamaManager({ settings, onSave }: Props) {
                       <Zap className="size-3" /> recommended
                     </span>
                   )}
-                  {installed && (
-                    <span className="inline-flex items-center gap-1 rounded-full bg-green-600/10 px-2 py-0.5 text-[11px] font-medium text-green-700 dark:text-green-400">
+                  {isInstalled && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-[11px] font-medium text-success">
                       <CheckCircle2 className="size-3" />
                       {s.mlxInstalled ? "installed (mlx)" : "installed"}
                     </span>
@@ -239,7 +248,7 @@ export default function OllamaManager({ settings, onSave }: Props) {
                   </div>
                 )}
               </div>
-              {!installed && !pulling && (
+              {!isInstalled && !pulling && (
                 <Button size="sm" variant="outline" onClick={() => startPull(s.tag)}>
                   <Download /> Pull
                 </Button>
@@ -247,7 +256,7 @@ export default function OllamaManager({ settings, onSave }: Props) {
             </div>
           );
         })}
-      </div>
-    </div>
+      </RadioGroup>
+    </>
   );
 }

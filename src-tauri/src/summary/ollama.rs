@@ -229,6 +229,7 @@ pub async fn chat_stream(
         .json(&json!({
             "model": model,
             "stream": true,
+            "think": false,
             "messages": [ { "role": "user", "content": prompt } ]
         }))
         .send()

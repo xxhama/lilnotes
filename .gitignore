@@ -53,8 +53,11 @@ Thumbs.db
 *.so
 *.dll
 
-# Tauri sidecar binaries (built by scripts/build-sidecar.sh)
+# Tauri sidecar binaries (built by scripts/build-llama-server.sh)
 src-tauri/binaries/
+
+# Vendored llama.cpp source (cloned by scripts/build-llama-server.sh)
+.llama.cpp/
 
 # Claude Code local artifacts
 .claude/
