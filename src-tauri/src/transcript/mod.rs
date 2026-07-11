@@ -94,7 +94,10 @@ mod tests {
     #[test]
     fn no_overlap_falls_back_to_nearest() {
         let mut segs = vec![seg("system", 10_000, 11_000)];
-        let turns = vec![turn(0, 2000, "SPEAKER_00"), turn(12_000, 15_000, "SPEAKER_01")];
+        let turns = vec![
+            turn(0, 2000, "SPEAKER_00"),
+            turn(12_000, 15_000, "SPEAKER_01"),
+        ];
         assign_speakers(&mut segs, &turns);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_01"));
     }

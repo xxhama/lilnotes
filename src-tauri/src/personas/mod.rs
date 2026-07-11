@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use crate::db::Db;
 use crate::diarize::Turn;
 use crate::settings::AppSettings;
-use crate::voiceprint::{SpeakerEmbedding, VoiceprintEngine, cosine};
+use crate::voiceprint::{cosine, SpeakerEmbedding, VoiceprintEngine};
 
 /// Confidence tier for a persona suggestion.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +90,11 @@ pub fn rank_personas(personas: &[PersonaWithEmbeddings], query: &[f32]) -> Vec<P
             }
         })
         .collect();
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored
 }
 
@@ -111,8 +115,7 @@ pub fn identify_and_persist(
     let personas = db.list_personas_with_voiceprints()?;
     // Drop links for labels that no longer appear in the current turns
     // (e.g. a re-diarization merged two clusters into one).
-    let current_labels: HashSet<String> =
-        turns.iter().map(|t| t.speaker.clone()).collect();
+    let current_labels: HashSet<String> = turns.iter().map(|t| t.speaker.clone()).collect();
     db.delete_orphaned_links(meeting_id, &current_labels)?;
     // Snapshot links BEFORE upserting so `already_linked` reflects prior
     // identify runs (not the row we're about to write). Also collapses the
@@ -127,7 +130,11 @@ pub fn identify_and_persist(
     for (raw_label, emb) in &embeddings {
         let mut scores = rank_personas(&personas, &emb.vec);
         for s in scores.iter_mut() {
-            s.tier = classify(s.score, settings.persona_auto_threshold, settings.persona_suggest_threshold);
+            s.tier = classify(
+                s.score,
+                settings.persona_auto_threshold,
+                settings.persona_suggest_threshold,
+            );
         }
         // Persist the top suggestion (if it clears `suggest`); else null link.
         let top = scores.first();
@@ -153,6 +160,7 @@ pub fn identify_and_persist(
 /// human confirmation). Re-derives the embedding from `system_wav_path` for
 /// the given label's turns. If the audio is gone, returns Ok(false) so the
 /// caller can still mark the link confirmed without a voiceprint.
+#[allow(clippy::too_many_arguments)]
 pub fn enroll(
     db: &Db,
     voiceprint: &VoiceprintEngine,
@@ -169,9 +177,12 @@ pub fn enroll(
         None => return Ok(false),
     };
     let embeddings = voiceprint.embed_speakers(app, path, turns)?;
-    let emb: &SpeakerEmbedding = embeddings
-        .get(raw_label)
-        .ok_or_else(|| format!("no embedding for {raw_label} (need >= {} ms speech)", crate::voiceprint::MIN_SPEECH_MS))?;
+    let emb: &SpeakerEmbedding = embeddings.get(raw_label).ok_or_else(|| {
+        format!(
+            "no embedding for {raw_label} (need >= {} ms speech)",
+            crate::voiceprint::MIN_SPEECH_MS
+        )
+    })?;
     let dim = emb.vec.len() as i32;
     db.insert_voiceprint(
         persona_id,
@@ -221,7 +232,7 @@ mod tests {
         let personas = vec![
             persona(1, "A", &[&[1.0, 0.0], &[0.0, 1.0]]), // max = 1.0
             persona(2, "B", &[&[0.707, 0.707]]),          // max ≈ 0.707
-            persona(3, "C", &[]),                          // skipped
+            persona(3, "C", &[]),                         // skipped
         ];
         let ranked = rank_personas(&personas, &q);
         assert_eq!(ranked.len(), 2);

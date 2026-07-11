@@ -9,13 +9,17 @@ edition = "2021"
 name = "lilnotes_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[workspace]
+members = ["llm-sidecar"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -31,8 +35,18 @@ hound = "3.5"                 # WAV writing
 crossbeam-channel = "0.5"     # realtime-ish handoff between audio callbacks and writers
 chrono = "0.4"                # session ids / timestamps
 
+# --- acoustic echo cancellation (AEC) ---
+# WebRTC AudioProcessing (AEC3 + NS). `bundled` compiles Google's C++ APM from
+# source (~1-2 min added to the first build). Pin to ~2.1: minor versions can
+# break the config API.
+webrtc-audio-processing = { version = "~2.1", features = ["bundled"] }
+
 # --- diarization (M4) ---
 sherpa-rs = "0.6"  # sherpa-onnx: pyannote segmentation + CAM++ embeddings
+
+# Native LLM inference (llama-cpp-2 + Metal) now runs in a separate sidecar
+# process to avoid ggml-metal symbol collision with whisper-rs. See
+# llm-sidecar/ crate. The shell plugin spawns + communicates with it.
 
 # --- transcription (M3) ---
 whisper-rs = { version = "0.16", features = ["metal"] }  # whisper.cpp, Metal backend

@@ -1,14 +1,15 @@
+/**
+ * Settings view. Tabs for transcription model management (download with
+ * progress, select active model, live transcription toggle), summary
+ * settings (Ollama connection status, model picker, prompt template
+ * editor), storage (recordings folder, delete-after-transcription), and
+ * personas/voiceprints management.
+ */
 import { useCallback, useEffect, useState } from "react";
-import {
-  CheckCircle2,
-  Download,
-  ExternalLink,
-  HelpCircle,
-  X,
-  XCircle,
-} from "lucide-react";
+import { CheckCircle2, Download, ExternalLink, HelpCircle, X, XCircle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   cancelModelDownload,
   deleteAllVoiceprints,
@@ -28,6 +29,7 @@ import {
 } from "@/lib/ipc";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
+import NativeModelManager from "@/components/NativeModelManager";
 import OllamaManager from "@/components/OllamaManager";
 import { defaultSummaryTemplate } from "@/lib/ipc";
 import { useTauriEvent } from "@/lib/useTauriEvent";
@@ -41,11 +43,7 @@ function fmtBytes(n: number): string {
   return `${Math.round(n / 1000)} kB`;
 }
 
-function StatusBadge({
-  status,
-}: {
-  status: PermissionStatus | SysAudioState | null;
-}) {
+function StatusBadge({ status }: { status: PermissionStatus | SysAudioState | null }) {
   if (status === "granted")
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-green-600/10 px-2 py-0.5 text-xs font-medium text-green-700 dark:text-green-400">
@@ -66,13 +64,7 @@ function StatusBadge({
 }
 
 /** Simple styled toggle (no extra Radix dep needed yet). */
-function Toggle({
-  checked,
-  onChange,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
   return (
     <button
       role="switch"
@@ -85,7 +77,7 @@ function Toggle({
     >
       <span
         className={cn(
-          "size-4.5 rounded-full bg-white shadow transition-transform",
+          "size-4.5 rounded-full bg-primary-foreground shadow transition-transform",
           checked ? "translate-x-[1.125rem]" : "translate-x-[0.1875rem]",
         )}
       />
@@ -103,7 +95,9 @@ export default function SettingsView() {
   const [templatePlaceholder, setTemplatePlaceholder] = useState("");
 
   const refreshModels = useCallback(() => {
-    listAsrModels().then(setAsrModels).catch(() => {});
+    listAsrModels()
+      .then(setAsrModels)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -161,9 +155,7 @@ export default function SettingsView() {
     <div className="mx-auto max-w-2xl space-y-8 p-8 pt-6">
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
-        <p className="text-sm text-muted-foreground">
-          Transcription and permissions. Summary options land with milestone 6.
-        </p>
+        <p className="text-sm text-muted-foreground">Transcription, summaries, and permissions.</p>
       </div>
 
       {/* ------------------------------------------------------------- */}
@@ -177,8 +169,8 @@ export default function SettingsView() {
             <div className="space-y-0.5">
               <div className="text-sm font-medium">Live transcription</div>
               <p className="text-xs text-muted-foreground">
-                Transcribe in near-live chunks while recording. Off = transcribe
-                after the meeting ends.
+                Transcribe in near-live chunks while recording. Off = transcribe after the meeting
+                ends.
               </p>
             </div>
             {settings && (
@@ -188,24 +180,20 @@ export default function SettingsView() {
               />
             )}
           </div>
+        </div>
 
+        <RadioGroup
+          value={settings?.asrModel}
+          onValueChange={(v) => settings && saveSettings({ ...settings, asrModel: v })}
+          className="grid gap-0 divide-y rounded-xl border bg-card"
+        >
           {asrModels.map((m) => {
             const p = progress[m.id];
             const downloading = p && !p.done;
-            const pct =
-              downloading && p.total ? Math.round((p.downloaded / p.total) * 100) : null;
+            const pct = downloading && p.total ? Math.round((p.downloaded / p.total) * 100) : null;
             return (
               <div key={m.id} className="flex items-center gap-4 p-4">
-                <input
-                  type="radio"
-                  name="asr-model"
-                  className="size-4 accent-current"
-                  checked={settings?.asrModel === m.id}
-                  disabled={!m.downloaded}
-                  onChange={() =>
-                    settings && saveSettings({ ...settings, asrModel: m.id })
-                  }
-                />
+                <RadioGroupItem value={m.id} disabled={!m.downloaded} />
                 <div className="min-w-0 flex-1 space-y-0.5">
                   <div className="flex items-center gap-2 text-sm font-medium">
                     {m.label}
@@ -253,15 +241,81 @@ export default function SettingsView() {
               </div>
             );
           })}
-        </div>
+        </RadioGroup>
       </section>
 
       {/* ------------------------------------------------------------- */}
-      {/* Summaries (Ollama)                                              */}
+      {/* Summaries                                                        */}
       {/* ------------------------------------------------------------- */}
       <section className="space-y-3">
         <h2 className="text-sm font-medium text-muted-foreground">Summaries</h2>
-        {settings && <OllamaManager settings={settings} onSave={saveSettings} />}
+
+        {/* Backend selector */}
+        {settings && (
+          <div className="divide-y rounded-xl border bg-card">
+            <div className="p-4 space-y-2">
+              <div className="text-sm font-medium">Backend</div>
+              <p className="text-xs text-muted-foreground">
+                Built-in runs entirely in-app (no external setup). Ollama is for power users who
+                already run it.
+              </p>
+            </div>
+            <div className="flex gap-2 p-4">
+              <button
+                onClick={() => saveSettings({ ...settings, summaryBackend: "native" })}
+                className={cn(
+                  "flex-1 rounded-lg border p-3 text-left transition-colors",
+                  settings.summaryBackend !== "ollama"
+                    ? "border-primary bg-primary/5"
+                    : "border-border hover:border-ring",
+                )}
+              >
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  {settings.summaryBackend !== "ollama" && (
+                    <CheckCircle2 className="size-4 text-primary" />
+                  )}
+                  Built-in
+                  <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                    Recommended
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Runs entirely on your Mac. No setup needed.
+                </p>
+              </button>
+              <button
+                onClick={() => saveSettings({ ...settings, summaryBackend: "ollama" })}
+                className={cn(
+                  "flex-1 rounded-lg border p-3 text-left transition-colors",
+                  settings.summaryBackend === "ollama"
+                    ? "border-primary bg-primary/5"
+                    : "border-border hover:border-ring",
+                )}
+              >
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  {settings.summaryBackend === "ollama" && (
+                    <CheckCircle2 className="size-4 text-primary" />
+                  )}
+                  Ollama
+                  <span className="rounded-full bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                    Advanced
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Use a locally running Ollama instance with any model.
+                </p>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Backend-specific model manager */}
+        {settings &&
+          (settings.summaryBackend === "ollama" ? (
+            <OllamaManager settings={settings} onSave={saveSettings} />
+          ) : (
+            <NativeModelManager settings={settings} onSave={saveSettings} />
+          ))}
 
         {/* Template editor */}
         <div className="space-y-2 rounded-xl border bg-card p-4">
@@ -307,16 +361,13 @@ export default function SettingsView() {
       {/* Personas & voiceprints                                          */}
       {/* ------------------------------------------------------------- */}
       <section className="space-y-3">
-        <h2 className="text-sm font-medium text-muted-foreground">
-          Personas &amp; voiceprints
-        </h2>
+        <h2 className="text-sm font-medium text-muted-foreground">Personas &amp; voiceprints</h2>
 
         <div className="divide-y rounded-xl border bg-card">
           <div className="space-y-2 p-4">
             <div className="text-sm font-medium">Match thresholds</div>
             <p className="text-xs text-muted-foreground">
-              Cosine similarity cutoffs for suggesting known personas on
-              diarized speakers. Higher = fewer false matches.
+              Cosine similarity cutoffs for matching known personas. Higher = fewer false matches.
             </p>
             <label className="flex items-center justify-between gap-3 text-xs">
               <span>Auto-suggest (pre-fill)</span>
@@ -355,6 +406,24 @@ export default function SettingsView() {
               />
             </label>
             <label className="flex items-center justify-between gap-3 text-xs">
+              <span>Live auto-identify</span>
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                max="1"
+                value={settings?.personaLiveThreshold ?? 0.72}
+                onChange={(e) =>
+                  settings &&
+                  saveSettings({
+                    ...settings,
+                    personaLiveThreshold: parseFloat(e.target.value) || 0,
+                  })
+                }
+                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+              />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-xs">
               <span>Voiceprints per persona (cap)</span>
               <input
                 type="number"
@@ -377,9 +446,8 @@ export default function SettingsView() {
             <div className="space-y-0.5">
               <div className="text-sm font-medium">Delete all voiceprints</div>
               <p className="text-xs text-muted-foreground">
-                Clears every persona's stored voiceprints. Personas stay, but
-                recognition starts over. Manage individual personas in the
-                Personas view.
+                Clears every persona's stored voiceprints. Personas stay, but recognition starts
+                over. Manage individual personas in the Personas view.
               </p>
             </div>
             <Button
@@ -395,12 +463,37 @@ export default function SettingsView() {
           </div>
 
           <div className="p-4 text-xs text-muted-foreground">
-            Voiceprints are biometric data stored only in the local SQLite
-            database at{" "}
+            Voiceprints are biometric data stored only in the local SQLite database at{" "}
             <code className="rounded bg-secondary px-1">
               ~/Library/Application Support/co.elastic.lilnote/lilnotes.sqlite3
             </code>
             . They never leave your Mac.
+          </div>
+        </div>
+      </section>
+
+      {/* ------------------------------------------------------------- */}
+      {/* Audio                                                           */}
+      {/* ------------------------------------------------------------- */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">Audio</h2>
+
+        <div className="divide-y rounded-xl border bg-card">
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Echo cancellation</div>
+              <p className="text-xs text-muted-foreground">
+                Cancels speaker echo from the mic using the system-audio feed as a reference (WebRTC
+                AEC3 + noise suppression). On by default. Disable if you use headphones — there's no
+                echo to cancel, and this reverts to Apple's voice processing.
+              </p>
+            </div>
+            {settings && (
+              <Toggle
+                checked={settings.aecEnabled}
+                onChange={(v) => saveSettings({ ...settings, aecEnabled: v })}
+              />
+            )}
           </div>
         </div>
       </section>
@@ -449,16 +542,14 @@ export default function SettingsView() {
             <div className="space-y-0.5">
               <div className="text-sm font-medium">Delete audio after transcription</div>
               <p className="text-xs text-muted-foreground">
-                Remove the WAV files once a meeting is transcribed and speakers
-                are identified. Saves disk space; you can't re-transcribe.
+                Remove the WAV files once a meeting is transcribed and speakers are identified.
+                Saves disk space; you can't re-transcribe.
               </p>
             </div>
             {settings && (
               <Toggle
                 checked={settings.deleteAudioAfterTranscription}
-                onChange={(v) =>
-                  saveSettings({ ...settings, deleteAudioAfterTranscription: v })
-                }
+                onChange={(v) => saveSettings({ ...settings, deleteAudioAfterTranscription: v })}
               />
             )}
           </div>
@@ -502,12 +593,11 @@ export default function SettingsView() {
           <div className="flex items-center justify-between gap-4 p-4">
             <div className="space-y-0.5">
               <div className="flex items-center gap-2 text-sm font-medium">
-                System audio{" "}
-                <StatusBadge status={sysAudio === "unknown" ? null : sysAudio} />
+                System audio <StatusBadge status={sysAudio === "unknown" ? null : sysAudio} />
               </div>
               <p className="text-xs text-muted-foreground">
-                Other participants' voices. macOS calls this "System Audio
-                Recording Only" — its status can only be checked by trying.
+                Other participants' voices. macOS calls this "System Audio Recording Only" — its
+                status can only be checked by trying.
               </p>
             </div>
             <div className="flex shrink-0 gap-2">

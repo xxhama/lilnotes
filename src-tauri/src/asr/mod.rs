@@ -59,10 +59,6 @@ impl AsrEngine {
         Ok(())
     }
 
-    pub fn is_loaded(&self) -> bool {
-        self.ctx.lock().unwrap().is_some()
-    }
-
     /// Transcribe a 16 kHz mono chunk. Returned timestamps are relative to
     /// the chunk start; the caller adds the absolute offset.
     ///

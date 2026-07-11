@@ -100,10 +100,22 @@ pub fn ensure_diarize_models(
 ) -> Result<(PathBuf, PathBuf), String> {
     let (seg, emb) = diarize_model_paths(app)?;
     if !seg.exists() {
-        download_with_progress(app, DIARIZE_SEGMENTATION_ID, DIARIZE_SEGMENTATION_URL, &seg, cancel)?;
+        download_with_progress(
+            app,
+            DIARIZE_SEGMENTATION_ID,
+            DIARIZE_SEGMENTATION_URL,
+            &seg,
+            cancel,
+        )?;
     }
     if !emb.exists() {
-        download_with_progress(app, DIARIZE_EMBEDDING_ID, DIARIZE_EMBEDDING_URL, &emb, cancel)?;
+        download_with_progress(
+            app,
+            DIARIZE_EMBEDDING_ID,
+            DIARIZE_EMBEDDING_URL,
+            &emb,
+            cancel,
+        )?;
     }
     Ok((seg, emb))
 }
@@ -121,6 +133,56 @@ pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
 pub fn whisper_model_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
     let model = whisper_model(id).ok_or_else(|| format!("unknown model: {id}"))?;
     Ok(models_dir(app)?.join(model.filename))
+}
+
+// ---------------------------------------------------------------------------
+// Built-in LLM models (Qwen3.5 GGUF, downloaded in-app like Whisper models)
+// ---------------------------------------------------------------------------
+
+/// A downloadable built-in LLM model (GGUF format, from HuggingFace).
+pub struct NativeLlmModel {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub filename: &'static str,
+    pub url: &'static str,
+    pub approx_bytes: u64,
+    pub note: &'static str,
+}
+
+pub const NATIVE_LLM_MODELS: &[NativeLlmModel] = &[
+    NativeLlmModel {
+        id: "qwen3.5-4b",
+        label: "Qwen3.5 4B",
+        filename: "qwen3.5-4b-q4_k_m.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+        approx_bytes: 2_740_000_000,
+        note: "Recommended — fast, fits any Mac. Good quality for meeting summaries.",
+    },
+    NativeLlmModel {
+        id: "qwen3.5-9b",
+        label: "Qwen3.5 9B",
+        filename: "qwen3.5-9b-q4_k_m.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+        approx_bytes: 5_680_000_000,
+        note: "Higher quality — needs 16 GB+ RAM. Slower but more nuanced summaries.",
+    },
+];
+
+pub fn native_llm_model(id: &str) -> Option<&'static NativeLlmModel> {
+    NATIVE_LLM_MODELS.iter().find(|m| m.id == id)
+}
+
+/// Path to a downloaded native LLM model file.
+pub fn native_llm_model_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    let model = native_llm_model(id).ok_or_else(|| format!("unknown LLM model: {id}"))?;
+    Ok(models_dir(app)?.join("llm").join(model.filename))
+}
+
+/// Directory for native LLM model files.
+pub fn native_llm_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = models_dir(app)?.join("llm");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +241,8 @@ pub fn download_with_progress(
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let emit = |downloaded: u64, total: Option<u64>, done: bool, error: Option<String>| {
-        let _ = app.emit_to("main",
+        let _ = app.emit_to(
+            "main",
             "model:progress",
             DownloadProgress {
                 id: id.to_string(),
@@ -216,7 +279,9 @@ pub fn download_with_progress(
                 let _ = std::fs::remove_file(&part);
                 return Err("cancelled".into());
             }
-            let n = resp.read(&mut buf).map_err(|e| format!("read error: {e}"))?;
+            let n = resp
+                .read(&mut buf)
+                .map_err(|e| format!("read error: {e}"))?;
             if n == 0 {
                 break;
             }

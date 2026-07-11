@@ -1,3 +1,8 @@
+/**
+ * Personas view. Lists all named personas with their voiceprint gallery
+ * counts, supports rename and delete (which removes voiceprints and nulls
+ * speaker links). Reached from the sidebar nav.
+ */
 import { useCallback, useEffect, useState } from "react";
 import { Trash2, Users } from "lucide-react";
 
@@ -19,7 +24,9 @@ export default function PersonasView() {
   const [error, setError] = useState<string | null>(null);
 
   const reload = useCallback(() => {
-    listPersonas().then(setPersonas).catch((e) => setError(String(e)));
+    listPersonas()
+      .then(setPersonas)
+      .catch((e) => setError(String(e)));
   }, []);
 
   useEffect(reload, [reload]);
@@ -86,8 +93,8 @@ export default function PersonasView() {
           <Users className="size-5" /> Personas
         </h1>
         <p className="text-sm text-muted-foreground">
-          Named speakers LilNotes learns across meetings. Each persona holds a
-          gallery of voiceprints that grows when you confirm an identity.
+          Named speakers LilNotes learns across meetings. Each persona holds a gallery of
+          voiceprints that grows when you confirm an identity.
         </p>
       </div>
 

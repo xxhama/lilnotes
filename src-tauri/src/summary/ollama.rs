@@ -32,7 +32,10 @@ pub struct OllamaStatus {
 
 pub async fn status() -> OllamaStatus {
     let Ok(client) = client() else {
-        return OllamaStatus { reachable: false, version: None };
+        return OllamaStatus {
+            reachable: false,
+            version: None,
+        };
     };
     let resp = client
         .get(format!("{BASE}/api/version"))
@@ -46,9 +49,15 @@ pub async fn status() -> OllamaStatus {
                 version: String,
             }
             let version = r.json::<V>().await.ok().map(|v| v.version);
-            OllamaStatus { reachable: true, version }
+            OllamaStatus {
+                reachable: true,
+                version,
+            }
         }
-        _ => OllamaStatus { reachable: false, version: None },
+        _ => OllamaStatus {
+            reachable: false,
+            version: None,
+        },
     }
 }
 

@@ -12,7 +12,7 @@
 //! Both engines are `!Send`-ish (stream/engine must live on one thread), so
 //! one dedicated thread owns the capture for its whole lifetime.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use objc2_avf_audio::{
     AVAudioVoiceProcessingOtherAudioDuckingLevel,
 };
 
+use super::aec::AecProcessor;
 use super::pipeline::{downmix_interleaved, ChannelMeters, ChannelPipeline, LiveChunk, Source};
 
 pub struct MicThread {
@@ -35,17 +36,32 @@ pub struct MicThread {
 }
 
 /// Spawn the mic capture thread. `ready_tx` receives Ok(()) once audio is
-/// flowing or Err(reason) if setup failed on all paths.
+/// flowing or Err(reason) if setup failed on all paths. When `voice_processing`
+/// is false the AVAudioEngine input is raw (no Apple AEC/NS) — used when
+/// software AEC is enabled so it sees the true echo. `aec` is the capture-side
+/// AEC processor (None when AEC is off).
 pub fn spawn(
     wav_path: PathBuf,
     stop: Arc<AtomicBool>,
     meters: Arc<ChannelMeters>,
     live_tx: Option<Sender<LiveChunk>>,
     ready_tx: Sender<Result<(), String>>,
+    voice_processing: bool,
+    aec: Option<AecProcessor>,
 ) -> MicThread {
     let handle = std::thread::Builder::new()
         .name("mic-capture".into())
-        .spawn(move || run(wav_path, stop, meters, live_tx, ready_tx))
+        .spawn(move || {
+            run(
+                wav_path,
+                stop,
+                meters,
+                live_tx,
+                ready_tx,
+                voice_processing,
+                aec,
+            )
+        })
         .expect("failed to spawn mic thread");
     MicThread { handle }
 }
@@ -56,13 +72,28 @@ fn run(
     meters: Arc<ChannelMeters>,
     live_tx: Option<Sender<LiveChunk>>,
     ready_tx: Sender<Result<(), String>>,
+    voice_processing: bool,
+    aec: Option<AecProcessor>,
 ) -> Result<PathBuf, String> {
-    match run_voice_processed(&wav_path, &stop, &meters, &live_tx, &ready_tx) {
+    // `aec` is taken (moved into the pipeline) only after setup succeeds, so a
+    // setup failure leaves it available for the cpal fallback. We pass it as a
+    // mutable reference and `.take()` it inside `run_voice_processed` at the
+    // point the pipeline is created.
+    let mut aec = aec;
+    match run_voice_processed(
+        &wav_path,
+        &stop,
+        &meters,
+        &live_tx,
+        &ready_tx,
+        voice_processing,
+        &mut aec,
+    ) {
         Ok(path) => Ok(path),
         Err(MicError::Runtime(e)) => Err(e),
         Err(MicError::Setup(e)) => {
             eprintln!("voice-processed mic capture unavailable ({e}); falling back to raw mic");
-            run_cpal(wav_path, stop, meters, live_tx, ready_tx)
+            run_cpal(wav_path, stop, meters, live_tx, ready_tx, aec)
         }
     }
 }
@@ -79,11 +110,13 @@ enum MicError {
 // ---------------------------------------------------------------------------
 
 fn run_voice_processed(
-    wav_path: &PathBuf,
+    wav_path: &Path,
     stop: &Arc<AtomicBool>,
     meters: &Arc<ChannelMeters>,
     live_tx: &Option<Sender<LiveChunk>>,
     ready_tx: &Sender<Result<(), String>>,
+    voice_processing: bool,
+    aec: &mut Option<AecProcessor>,
 ) -> Result<PathBuf, MicError> {
     let setup = (|| -> Result<_, String> {
         // SAFETY: engine + nodes are created and used on this thread only.
@@ -91,20 +124,25 @@ fn run_voice_processed(
             let engine = AVAudioEngine::new();
             let input = engine.inputNode();
 
-            // Must happen while the engine is stopped. Enabling VP on the
-            // input node automatically enables it on the output node.
-            input
-                .setVoiceProcessingEnabled_error(true)
-                .map_err(|e| format!("voice processing not available: {e}"))?;
+            // Apple voice processing (AEC + NS) is enabled only when software
+            // AEC is off. When software AEC is on we want the raw mic so the
+            // WebRTC APM sees the true echo; its NS replaces Apple's.
+            if voice_processing {
+                // Must happen while the engine is stopped. Enabling VP on the
+                // input node automatically enables it on the output node.
+                input
+                    .setVoiceProcessingEnabled_error(true)
+                    .map_err(|e| format!("voice processing not available: {e}"))?;
 
-            // Don't let voice processing duck "other audio" — that other
-            // audio is exactly what the system tap is recording.
-            input.setVoiceProcessingOtherAudioDuckingConfiguration(
-                AVAudioVoiceProcessingOtherAudioDuckingConfiguration {
-                    enableAdvancedDucking: objc2::runtime::Bool::NO,
-                    duckingLevel: AVAudioVoiceProcessingOtherAudioDuckingLevel::Min,
-                },
-            );
+                // Don't let voice processing duck "other audio" — that other
+                // audio is exactly what the system tap is recording.
+                input.setVoiceProcessingOtherAudioDuckingConfiguration(
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration {
+                        enableAdvancedDucking: objc2::runtime::Bool::NO,
+                        duckingLevel: AVAudioVoiceProcessingOtherAudioDuckingLevel::Min,
+                    },
+                );
+            }
 
             let format = input.outputFormatForBus(0);
             let sample_rate = format.sampleRate() as u32;
@@ -131,7 +169,7 @@ fn run_voice_processed(
                     }
                     // `floatChannelData` yields NonNull channel pointers.
                     let mono: Vec<f32> = if interleaved {
-                        let stride = (buf.stride() as usize).max(1);
+                        let stride = buf.stride().max(1);
                         let ptr = (*data).as_ptr();
                         let slice = std::slice::from_raw_parts(ptr, frames * stride);
                         downmix_interleaved(slice, stride)
@@ -174,12 +212,18 @@ fn run_voice_processed(
 
     let (engine, input, sample_rate, chunk_rx, _tap) = setup.map_err(MicError::Setup)?;
 
+    // Setup succeeded — take ownership of the AEC for the pipeline. If this
+    // returns Err(Runtime) later, the AEC is dropped with the pipeline.
+    let aec = aec.take();
+
     let mut pipeline = match ChannelPipeline::new(
         wav_path,
         sample_rate,
         Source::Mic,
         meters.clone(),
         live_tx.clone(),
+        aec,
+        None,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -217,6 +261,7 @@ fn run_cpal(
     meters: Arc<ChannelMeters>,
     live_tx: Option<Sender<LiveChunk>>,
     ready_tx: Sender<Result<(), String>>,
+    aec: Option<AecProcessor>,
 ) -> Result<PathBuf, String> {
     let setup = (|| -> Result<_, String> {
         let host = cpal::default_host();
@@ -242,14 +287,21 @@ fn run_cpal(
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.config();
 
-    let mut pipeline =
-        match ChannelPipeline::new(&wav_path, sample_rate, Source::Mic, meters, live_tx) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e.clone()));
-                return Err(e);
-            }
-        };
+    let mut pipeline = match ChannelPipeline::new(
+        &wav_path,
+        sample_rate,
+        Source::Mic,
+        meters,
+        live_tx,
+        aec,
+        None,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e.clone()));
+            return Err(e);
+        }
+    };
 
     let (chunk_tx, chunk_rx) = bounded::<Vec<f32>>(64);
     // Type of `e` (cpal's stream error) is inferred from the trait bound.
@@ -261,7 +313,7 @@ fn run_cpal(
         cpal::SampleFormat::F32 => {
             let tx = chunk_tx.clone();
             device.build_input_stream(
-                config.clone(),
+                config,
                 move |data: &[f32], _| {
                     let _ = tx.try_send(data.to_vec());
                 },
@@ -272,7 +324,7 @@ fn run_cpal(
         cpal::SampleFormat::I16 => {
             let tx = chunk_tx.clone();
             device.build_input_stream(
-                config.clone(),
+                config,
                 move |data: &[i16], _| {
                     let v: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let _ = tx.try_send(v);

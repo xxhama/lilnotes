@@ -11,21 +11,23 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::asr::{chunker, AsrEngine, Segment};
 use crate::audio::{CaptureEngine, StartedRecording};
-use crate::db::{Db, MeetingDetail, MeetingSummary, Persona};
+use crate::db::{
+    CustomerDetail, CustomerRollupRow, CustomerSearchResult, CustomerSummary, Db, MeetingDetail,
+    MeetingSummary, Persona,
+};
 use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
 use crate::permissions::{self, PermissionStatus};
 use crate::personas;
 use crate::settings::AppSettings;
-use crate::summary::{self, ollama};
+use crate::summary::{self, ollama, sidecar::SidecarLlmClient, SummaryBackend};
 use crate::transcript;
 use crate::voiceprint::VoiceprintEngine;
 
 /// Join handle of the live transcription worker for the active session.
 #[derive(Default)]
-pub struct AsrSession(
-    pub Mutex<Option<std::thread::JoinHandle<Result<Vec<Segment>, String>>>>,
-);
+#[allow(clippy::type_complexity)]
+pub struct AsrSession(pub Mutex<Option<std::thread::JoinHandle<Result<Vec<Segment>, String>>>>);
 
 // ---------------------------------------------------------------------------
 // Health check (milestone 1)
@@ -67,11 +69,27 @@ pub struct RecordingStatus {
     pub elapsed_ms: Option<u64>,
 }
 
+/// Insert the meeting row the moment capture starts so notes taken during
+/// the live recording can be saved against it. Title is stamped at start
+/// time (more accurate than stop time for a meeting's "when").
+fn create_meeting_at_start(
+    db: &State<'_, Arc<Db>>,
+    started: &StartedRecording,
+) -> Result<i64, String> {
+    let title = chrono::Local::now()
+        .format("Meeting — %b %-d, %Y %-I:%M %p")
+        .to_string();
+    db.insert_meeting_started(&started.session_id, &title, started.started_at_ms as i64)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartRecordingResponse {
     #[serde(flatten)]
     pub started: StartedRecording,
+    /// The meeting row created at recording start so notes can be saved
+    /// against it during the live recording.
+    pub meeting_id: i64,
     pub live_transcription: bool,
     pub live_transcription_error: Option<String>,
 }
@@ -124,6 +142,7 @@ pub async fn start_recording(
     asr: State<'_, Arc<AsrEngine>>,
     asr_session: State<'_, AsrSession>,
     db: State<'_, Arc<Db>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
 ) -> Result<StartRecordingResponse, String> {
     let cfg = db.get_settings();
     let dir = session_dir(&app, &cfg)?;
@@ -135,23 +154,50 @@ pub async fn start_recording(
         let app2 = app.clone();
         let asr2 = asr.inner().clone();
         let cfg2 = cfg.clone();
-        let load: Result<(), String> =
-            tauri::async_runtime::spawn_blocking(move || ensure_asr_model(&app2, &asr2, &cfg2))
-                .await
-                .map_err(|e| e.to_string())?;
+        let vp2 = voiceprint.inner().clone();
+        let db2 = db.inner().clone();
+        let load: Result<Option<Arc<chunker::LiveVoiceprint>>, String> =
+            tauri::async_runtime::spawn_blocking(move || {
+                ensure_asr_model(&app2, &asr2, &cfg2)?;
+                // Load the persona gallery and pre-warm the voiceprint model
+                // so the first system chunk doesn't pay the load cost. If the
+                // gallery is empty or the model isn't available, live ID is
+                // silently skipped — system segments stay speaker: None.
+                let live_vp = {
+                    let gallery = db2.list_personas_with_voiceprints().unwrap_or_default();
+                    let threshold = cfg2.persona_live_threshold;
+                    if gallery.is_empty() || threshold >= 1.0 {
+                        None
+                    } else {
+                        let _ = vp2.ensure_loaded(&app2);
+                        Some(Arc::new(chunker::LiveVoiceprint::new(
+                            app2.clone(),
+                            vp2,
+                            gallery,
+                            threshold,
+                        )))
+                    }
+                };
+                Ok(live_vp)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
         match load {
-            Ok(()) => {
+            Ok(live_vp) => {
                 let (tx, rx) = crossbeam_channel::bounded(1024);
-                let started = engine.start(app.clone(), dir, Some(tx))?;
+                let started = engine.start(app.clone(), dir, Some(tx), cfg.aec_enabled)?;
                 let handle = chunker::spawn_live_worker(
                     app.clone(),
                     asr.inner().clone(),
                     rx,
                     started.session_id.clone(),
+                    live_vp,
                 );
                 *asr_session.0.lock().unwrap() = Some(handle);
+                let meeting_id = create_meeting_at_start(&db, &started)?;
                 return Ok(StartRecordingResponse {
                     started,
+                    meeting_id,
                     live_transcription: true,
                     live_transcription_error: None,
                 });
@@ -160,9 +206,11 @@ pub async fn start_recording(
         }
     }
 
-    let started = engine.start(app.clone(), dir, None)?;
+    let started = engine.start(app.clone(), dir, None, cfg.aec_enabled)?;
+    let meeting_id = create_meeting_at_start(&db, &started)?;
     Ok(StartRecordingResponse {
         started,
+        meeting_id,
         live_transcription: false,
         live_transcription_error: live_error,
     })
@@ -193,12 +241,13 @@ pub async fn stop_recording(
         }
     };
 
-    // Persist the meeting.
-    let title = chrono::Local::now().format("Meeting — %b %-d, %Y %-I:%M %p").to_string();
-    let meeting_id = db.insert_meeting(
-        &stopped.session_id,
-        &title,
-        stopped.started_at_ms as i64,
+    // Finalize the meeting row created at recording start with the end time
+    // and WAV paths.
+    let meeting_id = db
+        .meeting_id_by_session(&stopped.session_id)?
+        .ok_or_else(|| "no meeting row for this session".to_string())?;
+    db.finalize_meeting(
+        meeting_id,
         (stopped.started_at_ms + stopped.duration_ms) as i64,
         &stopped.mic_wav,
         &stopped.system_wav,
@@ -251,8 +300,13 @@ pub async fn transcribe_meeting(
             _ => return Err("this meeting's audio files have been deleted".into()),
         };
         ensure_asr_model(&app, &asr, &cfg)?;
-        let segments =
-            chunker::transcribe_wavs(app.clone(), &asr, format!("meeting-{meeting_id}"), &mic, &system)?;
+        let segments = chunker::transcribe_wavs(
+            app.clone(),
+            &asr,
+            format!("meeting-{meeting_id}"),
+            &mic,
+            &system,
+        )?;
         db.replace_segments(meeting_id, &segments)?;
         Ok(segments)
     })
@@ -315,10 +369,17 @@ pub async fn diarize_meeting(
         // persisted; never blocks the diarize result on failure.
         let settings = db.get_settings();
         if let Err(e) = personas::identify_and_persist(
-            &db, &voiceprint, &app, meeting_id, &system_wav, &turns, &settings,
+            &db,
+            &voiceprint,
+            &app,
+            meeting_id,
+            &system_wav,
+            &turns,
+            &settings,
         )
-        .map(|m| { let _ = app.emit_to("main", "speakers:identified", m); })
-        {
+        .map(|m| {
+            let _ = app.emit_to("main", "speakers:identified", m);
+        }) {
             eprintln!("identify_speakers failed (non-fatal): {e}");
         }
 
@@ -374,13 +435,25 @@ pub fn update_meeting_title(
 }
 
 #[tauri::command]
+pub fn update_meeting_notes(
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+    notes: String,
+) -> Result<(), String> {
+    db.update_notes(meeting_id, &notes)
+}
+
+#[tauri::command]
 pub fn rename_speaker(
     db: State<'_, Arc<Db>>,
     meeting_id: i64,
     raw_label: String,
     display_name: Option<String>,
 ) -> Result<(), String> {
-    let name = display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let name = display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     db.rename_speaker(meeting_id, &raw_label, name)
 }
 
@@ -415,6 +488,93 @@ pub fn delete_persona(db: State<'_, Arc<Db>>, persona_id: i64) -> Result<(), Str
 #[tauri::command]
 pub fn delete_all_voiceprints(db: State<'_, Arc<Db>>) -> Result<(), String> {
     db.delete_all_voiceprints()
+}
+
+// ---------------------------------------------------------------------------
+// Customers (accounts)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_customers(db: State<'_, Arc<Db>>) -> Result<Vec<CustomerSummary>, String> {
+    db.list_customers()
+}
+
+#[tauri::command]
+pub fn create_customer(
+    db: State<'_, Arc<Db>>,
+    name: String,
+    notes: Option<String>,
+) -> Result<i64, String> {
+    db.create_customer(&name, notes.as_deref())
+}
+
+#[tauri::command]
+pub fn rename_customer(
+    db: State<'_, Arc<Db>>,
+    customer_id: i64,
+    name: String,
+) -> Result<(), String> {
+    db.rename_customer(customer_id, &name)
+}
+
+#[tauri::command]
+pub fn update_customer_notes(
+    db: State<'_, Arc<Db>>,
+    customer_id: i64,
+    notes: Option<String>,
+) -> Result<(), String> {
+    db.update_customer_notes(customer_id, notes.as_deref())
+}
+
+#[tauri::command]
+pub fn get_customer(db: State<'_, Arc<Db>>, customer_id: i64) -> Result<CustomerDetail, String> {
+    db.get_customer(customer_id)
+}
+
+/// Delete a customer. Its meetings become unassigned (FK ON DELETE SET NULL);
+/// personas are global and untouched.
+#[tauri::command]
+pub fn delete_customer(db: State<'_, Arc<Db>>, customer_id: i64) -> Result<(), String> {
+    db.delete_customer(customer_id)
+}
+
+/// Reassign a meeting to a different customer (or unassign with null).
+#[tauri::command]
+pub fn set_meeting_customer(
+    db: State<'_, Arc<Db>>,
+    meeting_id: i64,
+    customer_id: Option<i64>,
+) -> Result<(), String> {
+    db.set_meeting_customer(meeting_id, customer_id)
+}
+
+/// Merge `source_id` into `target_id` (irreversible): reassigns all of
+/// source's meetings to target, then deletes source. Personas need no change
+/// — target's derived roster naturally reflects the union.
+#[tauri::command]
+pub fn merge_customers(
+    db: State<'_, Arc<Db>>,
+    source_id: i64,
+    target_id: i64,
+) -> Result<(), String> {
+    db.merge_customers(source_id, target_id)
+}
+
+#[tauri::command]
+pub fn search_customer_meetings(
+    db: State<'_, Arc<Db>>,
+    customer_id: i64,
+    query: String,
+) -> Result<Vec<CustomerSearchResult>, String> {
+    db.search_customer_meetings(customer_id, &query)
+}
+
+#[tauri::command]
+pub fn list_customer_summaries(
+    db: State<'_, Arc<Db>>,
+    customer_id: i64,
+) -> Result<Vec<CustomerRollupRow>, String> {
+    db.list_customer_summaries(customer_id)
 }
 
 /// Reconstruct diarization turns from persisted system-channel segments.
@@ -454,7 +614,13 @@ pub async fn identify_speakers(
         let turns = turns_from_segments(&db.meeting_segments(meeting_id)?);
         let settings = db.get_settings();
         let matches = personas::identify_and_persist(
-            &db, &voiceprint, &app, meeting_id, &system_wav, &turns, &settings,
+            &db,
+            &voiceprint,
+            &app,
+            meeting_id,
+            &system_wav,
+            &turns,
+            &settings,
         )?;
         let _ = app.emit_to("main", "speakers:identified", matches.clone());
         Ok(matches)
@@ -511,8 +677,15 @@ pub async fn confirm_speaker_persona(
                 let turns = turns_from_segments(&segments);
                 let cap = db3.get_settings().voiceprint_gallery_cap;
                 let _ = personas::enroll(
-                    &db3, &voiceprint2, &app2, persona_id, meeting_id, &raw2,
-                    Some(&system_wav), &turns, cap,
+                    &db3,
+                    &voiceprint2,
+                    &app2,
+                    persona_id,
+                    meeting_id,
+                    &raw2,
+                    Some(&system_wav),
+                    &turns,
+                    cap,
                 );
             }
         }
@@ -571,11 +744,9 @@ pub async fn request_mic_permission() -> Result<bool, String> {
 /// process tap. Surfaces the TCC prompt on first use.
 #[tauri::command]
 pub async fn probe_system_audio_permission() -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        crate::audio::system_tap::probe_access().map(|_| true)
-    })
-    .await
-    .map_err(|e| format!("probe failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(|| crate::audio::system_tap::probe_access().map(|_| true))
+        .await
+        .map_err(|e| format!("probe failed: {e}"))?
 }
 
 #[tauri::command]
@@ -658,6 +829,82 @@ pub async fn download_asr_model(
 #[tauri::command]
 pub fn cancel_model_download(downloads: State<'_, DownloadManager>, id: String) -> bool {
     downloads.cancel(&id)
+}
+
+// ---------------------------------------------------------------------------
+// Built-in LLM models (Qwen3.5 GGUF via llama.cpp)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeLlmModelInfo {
+    pub id: String,
+    pub label: String,
+    pub approx_bytes: u64,
+    pub note: String,
+    pub downloaded: bool,
+    pub active: bool,
+}
+
+#[tauri::command]
+pub fn list_native_models(
+    app: AppHandle,
+    db: State<'_, Arc<Db>>,
+) -> Result<Vec<NativeLlmModelInfo>, String> {
+    let settings_model = db.get_settings().summary_model;
+    Ok(models::NATIVE_LLM_MODELS
+        .iter()
+        .map(|m| {
+            let path = models::native_llm_model_path(&app, m.id).unwrap_or_default();
+            NativeLlmModelInfo {
+                id: m.id.into(),
+                label: m.label.into(),
+                approx_bytes: m.approx_bytes,
+                note: m.note.into(),
+                downloaded: path.exists(),
+                active: settings_model.as_deref() == Some(m.id),
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn download_native_model(
+    app: AppHandle,
+    downloads: State<'_, DownloadManager>,
+    id: String,
+) -> Result<(), String> {
+    let model = models::native_llm_model(&id).ok_or_else(|| format!("unknown LLM model: {id}"))?;
+    let dest = models::native_llm_model_path(&app, &id)?;
+    if dest.exists() {
+        return Ok(());
+    }
+    // Ensure the llm/ subdirectory exists before the download writes into it.
+    models::native_llm_dir(&app)?;
+    let key = format!("llm:{id}");
+    let cancel = downloads.begin(&key)?;
+    let url = model.url;
+    let id2 = id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        models::download_with_progress(&app, &id2, url, &dest, &cancel)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    downloads.finish(&key);
+    result
+}
+
+#[tauri::command]
+pub fn cancel_native_model_download(downloads: State<'_, DownloadManager>, id: String) -> bool {
+    downloads.cancel(&format!("llm:{id}"))
+}
+
+#[tauri::command]
+pub async fn native_model_status(
+    app: AppHandle,
+    client: State<'_, SidecarLlmClient>,
+) -> Result<bool, String> {
+    Ok(client.status(&app).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +1005,8 @@ pub struct SummaryResult {
 
 /// Generate a summary for a meeting, streaming tokens via `summary:token`
 /// events, and persist it. `model` overrides the configured/auto-picked one.
+/// Dispatches to the built-in llama.cpp engine or Ollama based on
+/// `settings.summary_backend`.
 #[tauri::command]
 pub async fn summarize_meeting(
     app: AppHandle,
@@ -770,47 +1019,128 @@ pub async fn summarize_meeting(
         return Err("transcribe the meeting before summarizing".into());
     }
 
-    // Resolve model: explicit > settings > curated auto-pick.
     let settings = db.get_settings();
-    let model = match model.or(settings.summary_model) {
-        Some(m) => m,
-        None => {
-            let installed: Vec<String> = ollama::installed_models()
-                .await?
-                .into_iter()
-                .map(|m| m.name)
-                .collect();
-            summary::pick_default_model(&installed).ok_or(
-                "no Ollama model installed — pull one in Settings → Summaries",
-            )?
-        }
-    };
 
     let template = settings
         .summary_template
+        .clone()
         .unwrap_or_else(|| summary::DEFAULT_TEMPLATE.to_string());
     let transcript = summary::transcript_text(&meeting.segments, &meeting.renames);
     let prompt = summary::build_prompt(&template, &meeting.title, &transcript);
 
-    let app2 = app.clone();
-    let content = ollama::chat_stream(&model, &prompt, |token| {
-        let _ = app2.emit_to(
-            "main",
-            "summary:token",
-            summary::SummaryToken {
-                meeting_id,
-                token: token.to_string(),
-            },
-        );
-    })
+    let app_for_tokens = app.clone();
+    let (content, model_id) = dispatch_summary(
+        app,
+        settings,
+        prompt,
+        model,
+        Box::new(move |token, is_thinking| {
+            let _ = app_for_tokens.emit_to(
+                "main",
+                "summary:token",
+                summary::SummaryToken {
+                    meeting_id,
+                    token: token.to_string(),
+                    is_thinking,
+                },
+            );
+        }),
+    )
     .await?;
 
-    let summary_id = db.insert_summary(meeting_id, &model, &template, &content)?;
+    let summary_id = db.insert_summary(meeting_id, &model_id, &template, &content)?;
     Ok(SummaryResult {
         summary_id,
-        model,
+        model: model_id,
         content,
     })
+}
+
+/// Shared LLM dispatch for per-meeting summaries and customer rollups. Picks
+/// the backend from `settings.summary_backend`, resolves the model (explicit,
+/// then settings, then auto-pick), streams tokens through `on_token`, and
+/// returns `(content, model_id)`. The caller owns event emission (closes over
+/// the right event name + entity id).
+#[allow(clippy::type_complexity)]
+async fn dispatch_summary(
+    app: AppHandle,
+    settings: AppSettings,
+    prompt: String,
+    model: Option<String>,
+    on_token: Box<dyn FnMut(&str, bool) + Send>,
+) -> Result<(String, String), String> {
+    let backend = SummaryBackend::from_str(&settings.summary_backend);
+    match backend {
+        SummaryBackend::Native => {
+            // Resolve model id: explicit > settings.summary_model > first downloaded.
+            let model_id = match model.clone().or(settings.summary_model.clone()) {
+                Some(m) => m,
+                None => {
+                    let downloaded: Vec<&str> = models::NATIVE_LLM_MODELS
+                        .iter()
+                        .filter(|m| {
+                            models::native_llm_model_path(&app, m.id)
+                                .map(|p| p.exists())
+                                .unwrap_or(false)
+                        })
+                        .map(|m| m.id)
+                        .collect();
+                    downloaded
+                        .first()
+                        .copied()
+                        .ok_or(
+                            "no built-in model downloaded — download one in Settings → Summaries",
+                        )?
+                        .to_string()
+                }
+            };
+
+            let gguf_path = models::native_llm_model_path(&app, &model_id)?;
+            if !gguf_path.exists() {
+                return Err(format!(
+                    "model file not found for {model_id} — re-download in Settings → Summaries"
+                ));
+            }
+
+            let client = app.state::<SidecarLlmClient>();
+            let mut on_token = on_token;
+            let content = client
+                .generate(
+                    &app,
+                    &gguf_path.to_string_lossy(),
+                    &prompt,
+                    move |token, is_thinking| {
+                        on_token(token, is_thinking);
+                    },
+                )
+                .await?;
+
+            Ok((content, model_id))
+        }
+        SummaryBackend::Ollama => {
+            // Resolve model: explicit > settings > curated auto-pick.
+            let model_id = match model.clone().or(settings.summary_model.clone()) {
+                Some(m) => m,
+                None => {
+                    let installed: Vec<String> = ollama::installed_models()
+                        .await?
+                        .into_iter()
+                        .map(|m| m.name)
+                        .collect();
+                    summary::pick_default_model(&installed)
+                        .ok_or("no Ollama model installed — pull one in Settings → Summaries")?
+                }
+            };
+
+            let mut on_token = on_token;
+            let content = ollama::chat_stream(&model_id, &prompt, |token| {
+                on_token(token, false);
+            })
+            .await?;
+
+            Ok((content, model_id))
+        }
+    }
 }
 
 #[tauri::command]
@@ -819,4 +1149,75 @@ pub fn list_summaries(
     meeting_id: i64,
 ) -> Result<Vec<crate::db::SummaryRow>, String> {
     db.list_summaries(meeting_id)
+}
+
+/// Result of a customer rollup generation.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerSummaryResult {
+    pub summary_id: i64,
+    pub model: String,
+    pub content: String,
+    pub meeting_count: i64,
+}
+
+/// Generate a "customer at a glance" rollup: condenses the latest summaries
+/// of the customer's recent meetings into a short topics overview, streamed
+/// via `customer-summary:token` events and persisted to `customer_summaries`.
+/// Requires at least 2 meetings with a saved summary.
+#[tauri::command]
+pub async fn summarize_customer(
+    app: AppHandle,
+    db: State<'_, Arc<Db>>,
+    customer_id: i64,
+    model: Option<String>,
+) -> Result<CustomerSummaryResult, String> {
+    let customer = db.get_customer(customer_id)?;
+    // Gather the last 6 meetings (reverse-chrono) that have a saved summary.
+    let rows = db.customer_meetings_with_latest_summary(customer_id, 6)?;
+    if rows.len() < 2 {
+        return Err("generate summaries on at least two of this customer's meetings first".into());
+    }
+    let meeting_ids: Vec<i64> = rows.iter().map(|(id, _, _, _)| *id).collect();
+    let entries: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|(_, title, started, content)| {
+            let date = chrono::DateTime::from_timestamp_millis(*started)
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| started.to_string());
+            (title.clone(), date, content.clone())
+        })
+        .collect();
+    let summaries_text = summary::format_rollup_summaries(&entries);
+    let template = summary::DEFAULT_CUSTOMER_ROLLUP_TEMPLATE;
+    let prompt = summary::build_customer_rollup_prompt(template, &customer.name, &summaries_text);
+
+    let settings = db.get_settings();
+    let app_for_tokens = app.clone();
+    let (content, model_id) = dispatch_summary(
+        app,
+        settings,
+        prompt,
+        model,
+        Box::new(move |token, is_thinking| {
+            let _ = app_for_tokens.emit_to(
+                "main",
+                "customer-summary:token",
+                summary::CustomerSummaryToken {
+                    customer_id,
+                    token: token.to_string(),
+                    is_thinking,
+                },
+            );
+        }),
+    )
+    .await?;
+
+    let summary_id = db.insert_customer_summary(customer_id, &model_id, &content, &meeting_ids)?;
+    Ok(CustomerSummaryResult {
+        summary_id,
+        model: model_id,
+        content,
+        meeting_count: meeting_ids.len() as i64,
+    })
 }

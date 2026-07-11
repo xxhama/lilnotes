@@ -11,10 +11,27 @@
 //! - summarize: POST /api/chat (streaming; tokens relayed as events)
 
 pub mod ollama;
+pub mod sidecar;
 
 use serde::Serialize;
 
 use crate::asr::Segment;
+
+/// Which LLM backend to use for summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryBackend {
+    Native,
+    Ollama,
+}
+
+impl SummaryBackend {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "ollama" => SummaryBackend::Ollama,
+            _ => SummaryBackend::Native, // default
+        }
+    }
+}
 
 /// Built-in speaker-aware summary template. Users can override it in
 /// Settings; `{transcript}` and `{title}` are substituted at run time.
@@ -39,6 +56,28 @@ Rules: base everything strictly on the transcript — never invent facts, names,
 Transcript:
 
 {transcript}"#;
+
+/// Template for the customer-level "recent topics" rollup. `{customer}` is
+/// the customer name; `{summaries}` is replaced with the recent meetings'
+/// summaries (title, date, content). Bases strictly on those summaries.
+pub const DEFAULT_CUSTOMER_ROLLUP_TEMPLATE: &str = r#"You are reviewing a series of meetings with a customer ("{customer}"). Below are the AI summaries of the most recent meetings, each preceded by its title and date.
+
+Synthesize a concise "Customer at a glance" overview in Markdown with exactly these sections:
+
+## Recent themes
+3-5 bullets of recurring topics or themes across these meetings.
+
+## Latest developments
+2-4 bullets on what is most recent or currently in progress.
+
+## Watch items
+2-4 bullets of open questions or things to follow up on.
+
+Rules: base everything strictly on the provided summaries — never invent facts, names, or dates. Refer to "Me" as the note-taker. Keep the whole overview under 350 words.
+
+Meeting summaries:
+
+{summaries}"#;
 
 /// A curated, meeting-summarization-friendly seed list (sizes are
 /// approximate; live sizes come from /api/tags). Ordered by preference.
@@ -161,6 +200,33 @@ pub fn build_prompt(template: &str, title: &str, transcript: &str) -> String {
 pub struct SummaryToken {
     pub meeting_id: i64,
     pub token: String,
+    pub is_thinking: bool,
+}
+
+/// Payload of the `customer-summary:token` event (customer-level rollup).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerSummaryToken {
+    pub customer_id: i64,
+    pub token: String,
+    pub is_thinking: bool,
+}
+
+/// Render the per-meeting summaries block fed to the customer rollup prompt.
+/// Each entry: `### {title} ({date})` followed by the summary content.
+pub fn format_rollup_summaries(entries: &[(String, String, String)]) -> String {
+    let mut out = String::new();
+    for (title, date, content) in entries {
+        out.push_str(&format!("### {title} ({date})\n{content}\n\n"));
+    }
+    out
+}
+
+/// Fill the customer rollup template placeholders.
+pub fn build_customer_rollup_prompt(template: &str, customer: &str, summaries: &str) -> String {
+    template
+        .replace("{customer}", customer)
+        .replace("{summaries}", summaries)
 }
 
 #[cfg(test)]
@@ -170,18 +236,27 @@ mod tests {
     #[test]
     fn picks_mlx_over_plain() {
         let installed = vec!["gemma4:26b".to_string(), "gemma4:26b-mlx".to_string()];
-        assert_eq!(pick_default_model(&installed).as_deref(), Some("gemma4:26b-mlx"));
+        assert_eq!(
+            pick_default_model(&installed).as_deref(),
+            Some("gemma4:26b-mlx")
+        );
     }
 
     #[test]
     fn respects_curated_order() {
         let installed = vec!["qwen3.5:9b".to_string(), "qwen3.5:27b".to_string()];
-        assert_eq!(pick_default_model(&installed).as_deref(), Some("qwen3.5:27b"));
+        assert_eq!(
+            pick_default_model(&installed).as_deref(),
+            Some("qwen3.5:27b")
+        );
     }
 
     #[test]
     fn falls_back_to_any_non_embedding() {
-        let installed = vec!["nomic-embed-text:latest".to_string(), "llama3:8b".to_string()];
+        let installed = vec![
+            "nomic-embed-text:latest".to_string(),
+            "llama3:8b".to_string(),
+        ];
         assert_eq!(pick_default_model(&installed).as_deref(), Some("llama3:8b"));
     }
 

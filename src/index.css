@@ -106,3 +106,242 @@
     cursor: auto;
   }
 }
+
+/* Milkdown notes editor — fully scoped typography so the editor's styling
+   never leaks into the rest of the app. Colors reference the app theme tokens
+   so the editor follows light/dark mode. */
+.milkdown {
+  background: var(--background);
+  color: var(--foreground);
+}
+.milkdown .ProseMirror {
+  background: var(--background);
+  color: var(--foreground);
+  outline: none;
+  padding: 1rem 1.25rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+/* Layout: the NotesEditor wrapper is the scroll container (a normal ancestor of
+   the editable, so ProseMirror's caret-scroll-into-view behaves correctly). Each
+   Milkdown level is a flex column with `flex: 1 0 auto` so the editable fills the
+   area when notes are short (any click lands on the contenteditable → focus) AND
+   grows with content to drive the wrapper's scroll when notes are long. The
+   `data-milkdown-root` div (rendered by <Milkdown/>) has no height by default, so
+   it must be forced into the flex chain or the whole subtree collapses to
+   content height. */
+.notes-editor-root {
+  height: 100%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.notes-editor-root > [data-milkdown-root] {
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+.notes-editor-root .milkdown {
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+.notes-editor-root .ProseMirror {
+  flex: 1 0 auto;
+}
+.milkdown .ProseMirror:focus {
+  outline: none;
+}
+.milkdown .ProseMirror h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 1rem 0 0.5rem;
+}
+.milkdown .ProseMirror h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 0.9rem 0 0.4rem;
+}
+.milkdown .ProseMirror h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0.75rem 0 0.35rem;
+}
+.milkdown .ProseMirror h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0.6rem 0 0.3rem;
+}
+.milkdown .ProseMirror p {
+  margin: 0.4rem 0;
+}
+.milkdown .ProseMirror ul {
+  list-style: disc;
+  padding-left: 1.5rem;
+  margin: 0.4rem 0;
+}
+.milkdown .ProseMirror ol {
+  list-style: decimal;
+  padding-left: 1.5rem;
+  margin: 0.4rem 0;
+}
+.milkdown .ProseMirror li {
+  margin: 0.15rem 0;
+}
+.milkdown .ProseMirror li > p {
+  margin: 0;
+}
+.milkdown .ProseMirror blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 1rem;
+  color: var(--muted-foreground);
+  font-style: italic;
+  margin: 0.5rem 0;
+}
+.milkdown .ProseMirror code {
+  background: var(--muted);
+  color: var(--foreground);
+  border-radius: var(--radius-sm);
+  padding: 0.1em 0.35em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.85em;
+}
+.milkdown .ProseMirror pre {
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+.milkdown .ProseMirror pre code {
+  background: transparent;
+  padding: 0;
+  border: none;
+}
+.milkdown .ProseMirror a {
+  color: var(--primary);
+  text-decoration: underline;
+}
+.milkdown .ProseMirror hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1rem 0;
+}
+.milkdown .ProseMirror strong {
+  font-weight: 600;
+}
+.milkdown .ProseMirror em {
+  font-style: italic;
+}
+.milkdown .ProseMirror ::selection {
+  background: var(--accent);
+}
+/* Heading-level markers shown when the cursor is inside a heading (added as a
+   node decoration class by headingMarkerPlugin). The marker is `position:
+   absolute` so it is taken out of the inline flow: the caret navigates the
+   normal content flow (the `<br>` / text) and never anchors to the generated
+   `#` box. This avoids the caret-before-`#` glitch that occurs on empty
+   headings when the marker is in flow. `padding-left` reserves the gutter. */
+.milkdown .ProseMirror .milkdown-heading-marker {
+  position: relative;
+}
+.milkdown .ProseMirror .milkdown-heading-marker::before {
+  position: absolute;
+  left: 0;
+  top: 0;
+  color: var(--muted-foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  user-select: none;
+  pointer-events: none;
+  white-space: pre;
+}
+.milkdown .ProseMirror h1.milkdown-heading-marker {
+  padding-left: 1.4em;
+}
+.milkdown .ProseMirror h2.milkdown-heading-marker {
+  padding-left: 2em;
+}
+.milkdown .ProseMirror h3.milkdown-heading-marker {
+  padding-left: 2.6em;
+}
+.milkdown .ProseMirror h4.milkdown-heading-marker {
+  padding-left: 3.2em;
+}
+.milkdown .ProseMirror h5.milkdown-heading-marker {
+  padding-left: 3.8em;
+}
+.milkdown .ProseMirror h6.milkdown-heading-marker {
+  padding-left: 4.4em;
+}
+.milkdown .ProseMirror h1.milkdown-heading-marker::before {
+  content: "# ";
+}
+.milkdown .ProseMirror h2.milkdown-heading-marker::before {
+  content: "## ";
+}
+.milkdown .ProseMirror h3.milkdown-heading-marker::before {
+  content: "### ";
+}
+.milkdown .ProseMirror h4.milkdown-heading-marker::before {
+  content: "#### ";
+}
+.milkdown .ProseMirror h5.milkdown-heading-marker::before {
+  content: "##### ";
+}
+.milkdown .ProseMirror h6.milkdown-heading-marker::before {
+  content: "###### ";
+}
+
+/* Active transcript row: a rotating conic-gradient border (the "AI" gradient
+   look). A masked ::before paints a conic gradient ring around the row's
+   perimeter and rotates it via an animatable @property angle. The mask cuts
+   out the content box so only the 2px padding ring is visible — the row's own
+   background shows through the center. */
+@property --transcript-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes transcript-rotate {
+  to {
+    --transcript-angle: 360deg;
+  }
+}
+.transcript-row-active {
+  position: relative;
+}
+.transcript-row-active::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--transcript-angle),
+    #3b82f6,
+    #6366f1,
+    #8b5cf6,
+    #6366f1,
+    #3b82f6
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: transcript-rotate 6s linear infinite;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .transcript-row-active::before {
+    animation: none;
+    background: linear-gradient(90deg, #3b82f6, #6366f1, #8b5cf6);
+  }
+}

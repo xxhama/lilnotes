@@ -45,12 +45,17 @@ pub struct MeetingDetail {
     pub mic_wav: Option<String>,
     pub system_wav: Option<String>,
     pub notes: Option<String>,
+    /// Wall-clock epoch ms of the last `update_notes` write; null until notes
+    /// have ever been saved. Surfaced to the UI for the "Saved at" tooltip.
+    pub notes_updated_at_ms: Option<i64>,
     pub segments: Vec<Segment>,
     /// raw_label -> display_name (only rows the user renamed).
     pub renames: std::collections::HashMap<String, String>,
     /// raw_label -> persona link (suggestion/confirmed) per meeting.
     pub speaker_links: std::collections::HashMap<String, crate::db::SpeakerLink>,
     pub speaker_count: i64,
+    /// Customer (account) this meeting belongs to; null = unassigned.
+    pub customer_id: Option<i64>,
 }
 
 impl Db {
@@ -169,6 +174,46 @@ impl Db {
             )
             .map_err(|e| format!("migration to v2 failed: {e}"))?;
         }
+        if version < 3 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE meetings ADD COLUMN notes_updated_at INTEGER;
+                PRAGMA user_version = 3;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v3 failed: {e}"))?;
+        }
+        if version < 4 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE customers(
+                    id          INTEGER PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    logo        TEXT,
+                    notes       TEXT,
+                    created_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL
+                );
+                ALTER TABLE meetings ADD COLUMN customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL;
+                CREATE INDEX idx_meetings_customer ON meetings(customer_id);
+                CREATE TABLE customer_summaries(
+                    id              INTEGER PRIMARY KEY,
+                    customer_id     INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                    model           TEXT NOT NULL,
+                    content         TEXT NOT NULL,
+                    from_meeting_ids TEXT NOT NULL,
+                    created_at      INTEGER NOT NULL
+                );
+                CREATE INDEX idx_customer_summaries ON customer_summaries(customer_id, created_at DESC);
+                PRAGMA user_version = 4;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v4 failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -223,10 +268,24 @@ impl Db {
                 s.persona_suggest_threshold = f;
             }
         }
+        if let Some(v) = get("persona_live_threshold") {
+            if let Ok(f) = v.parse::<f32>() {
+                s.persona_live_threshold = f;
+            }
+        }
         if let Some(v) = get("voiceprint_gallery_cap") {
             if let Ok(n) = v.parse::<i32>() {
                 s.voiceprint_gallery_cap = n;
             }
+        }
+        if let Some(v) = get("aec_enabled") {
+            s.aec_enabled = v == "true";
+        }
+        if let Some(v) = get("onboarding_complete") {
+            s.onboarding_complete = v == "true";
+        }
+        if let Some(v) = get("summary_backend") {
+            s.summary_backend = v;
         }
         s
     }
@@ -263,9 +322,16 @@ impl Db {
             s.persona_suggest_threshold.to_string(),
         )?;
         put(
+            "persona_live_threshold",
+            s.persona_live_threshold.to_string(),
+        )?;
+        put(
             "voiceprint_gallery_cap",
             s.voiceprint_gallery_cap.to_string(),
         )?;
+        put("aec_enabled", s.aec_enabled.to_string())?;
+        put("onboarding_complete", s.onboarding_complete.to_string())?;
+        put("summary_backend", s.summary_backend.clone())?;
         Ok(())
     }
 
@@ -273,23 +339,55 @@ impl Db {
     // Meetings
     // -----------------------------------------------------------------------
 
-    pub fn insert_meeting(
+    /// Insert a meeting row the moment recording starts, so notes taken
+    /// during the live recording have a row to attach to. `ended_at` and the
+    /// WAV paths are NULL until `finalize_meeting` is called on stop.
+    pub fn insert_meeting_started(
         &self,
         session_id: &str,
         title: &str,
         started_at_ms: i64,
-        ended_at_ms: i64,
-        mic_wav: &str,
-        system_wav: &str,
     ) -> Result<i64, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO meetings(session_id, title, started_at, ended_at, mic_wav, system_wav)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session_id, title, started_at_ms, ended_at_ms, mic_wav, system_wav],
+             VALUES(?1, ?2, ?3, NULL, NULL, NULL)",
+            params![session_id, title, started_at_ms],
         )
         .map_err(|e| e.to_string())?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Fill in `ended_at` and WAV paths on a row created by
+    /// `insert_meeting_started`. Called when recording stops.
+    pub fn finalize_meeting(
+        &self,
+        id: i64,
+        ended_at_ms: i64,
+        mic_wav: &str,
+        system_wav: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE meetings SET ended_at = ?2, mic_wav = ?3, system_wav = ?4 WHERE id = ?1",
+            params![id, ended_at_ms, mic_wav, system_wav],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Look up a meeting id by session_id (session_id is UNIQUE). Used by
+    /// `stop_recording` to find the row created at start.
+    pub fn meeting_id_by_session(&self, session_id: &str) -> Result<Option<i64>, String> {
+        let conn = self.conn.lock().unwrap();
+        let id = conn
+            .query_row(
+                "SELECT id FROM meetings WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok();
+        Ok(id)
     }
 
     pub fn list_meetings(&self, search: Option<&str>) -> Result<Vec<MeetingSummary>, String> {
@@ -318,10 +416,11 @@ impl Db {
                    (SELECT s.text FROM segments s WHERE s.meeting_id = m.id
                      ORDER BY s.start_ms LIMIT 1)
             FROM meetings m
-            WHERE ?1 IS NULL
+            WHERE m.ended_at IS NOT NULL
+              AND (?1 IS NULL
                OR m.title LIKE ?1
                OR EXISTS(SELECT 1 FROM segments s
-                          WHERE s.meeting_id = m.id AND s.text LIKE ?1)
+                          WHERE s.meeting_id = m.id AND s.text LIKE ?1))
             ORDER BY m.started_at DESC
         "#;
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -349,9 +448,9 @@ impl Db {
 
     pub fn get_meeting(&self, id: i64) -> Result<MeetingDetail, String> {
         let conn = self.conn.lock().unwrap();
-        let (session_id, title, started_at_ms, ended_at_ms, mic_wav, system_wav, notes) = conn
+        let (session_id, title, started_at_ms, ended_at_ms, mic_wav, system_wav, notes, notes_updated_at_ms, customer_id) = conn
             .query_row(
-                "SELECT session_id, title, started_at, ended_at, mic_wav, system_wav, notes
+                "SELECT session_id, title, started_at, ended_at, mic_wav, system_wav, notes, notes_updated_at, customer_id
                  FROM meetings WHERE id = ?1",
                 params![id],
                 |r| {
@@ -363,6 +462,8 @@ impl Db {
                         r.get::<_, Option<String>>(4)?,
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
                     ))
                 },
             )
@@ -450,10 +551,12 @@ impl Db {
             mic_wav,
             system_wav,
             notes,
+            notes_updated_at_ms,
             segments,
             renames,
             speaker_links,
             speaker_count,
+            customer_id,
         })
     }
 
@@ -496,7 +599,26 @@ impl Db {
         self.conn
             .lock()
             .unwrap()
-            .execute("UPDATE meetings SET title = ?2 WHERE id = ?1", params![id, title])
+            .execute(
+                "UPDATE meetings SET title = ?2 WHERE id = ?1",
+                params![id, title],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_notes(&self, id: i64, notes: &str) -> Result<(), String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET notes = ?2, notes_updated_at = ?3 WHERE id = ?1",
+                params![id, notes, now_ms],
+            )
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -507,7 +629,12 @@ impl Db {
             .query_row(
                 "SELECT mic_wav, system_wav FROM meetings WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| e.to_string())?
@@ -538,8 +665,11 @@ impl Db {
     pub fn replace_segments(&self, meeting_id: i64, segments: &[Segment]) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM segments WHERE meeting_id = ?1", params![meeting_id])
-            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM segments WHERE meeting_id = ?1",
+            params![meeting_id],
+        )
+        .map_err(|e| e.to_string())?;
         {
             let mut stmt = tx
                 .prepare(
@@ -661,6 +791,72 @@ pub struct SpeakerLink {
     pub confirmed: bool,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerSummary {
+    pub id: i64,
+    pub name: String,
+    pub logo: Option<String>,
+    pub meeting_count: i64,
+    pub last_meeting_at_ms: Option<i64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerRosterEntry {
+    pub persona_id: i64,
+    pub display_name: String,
+    pub meeting_count: i64,
+    pub last_seen_ms: Option<i64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerRollupRow {
+    pub id: i64,
+    pub model: String,
+    pub content: String,
+    pub created_at_ms: i64,
+    pub meeting_count: i64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerDetail {
+    pub id: i64,
+    pub name: String,
+    pub logo: Option<String>,
+    pub notes: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub meeting_count: i64,
+    pub last_meeting_at_ms: Option<i64>,
+    pub first_meeting_at_ms: Option<i64>,
+    pub total_duration_ms: Option<i64>,
+    pub persona_roster: Vec<CustomerRosterEntry>,
+    pub meetings: Vec<MeetingSummary>,
+    /// Count of this customer's meetings that have at least one saved summary
+    /// (drives whether a customer rollup can be generated).
+    pub meetings_with_summary_count: i64,
+    pub latest_rollup: Option<CustomerRollupRow>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerSearchHit {
+    pub field: String,
+    pub snippet: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerSearchResult {
+    pub meeting_id: i64,
+    pub title: String,
+    pub started_at_ms: i64,
+    pub hits: Vec<CustomerSearchHit>,
+}
+
 impl Db {
     // -----------------------------------------------------------------------
     // Summaries (milestone 6)
@@ -764,7 +960,9 @@ impl Db {
                 .query_map(params![id], |r| {
                     let blob: Vec<u8> = r.get(0)?;
                     let dim: i64 = r.get(1)?;
-                    Ok(crate::voiceprint::unpack_f32(&blob[..blob.len().min(dim as usize * 4)]))
+                    Ok(crate::voiceprint::unpack_f32(
+                        &blob[..blob.len().min(dim as usize * 4)],
+                    ))
                 })
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
@@ -844,8 +1042,10 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
-    /// Insert a voiceprint. If the persona now exceeds `cap`, drop the
-    /// oldest rows beyond the cap (by `created_at`, then `id`).
+    /// Insert a voiceprint. If the persona now exceeds `cap`, drop the most
+    /// redundant print (see `prune_redundant`) — keeping the gallery diverse
+    /// and quality-weighted rather than FIFO.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_voiceprint(
         &self,
         persona_id: i64,
@@ -867,14 +1067,7 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         if cap > 0 {
-            tx.execute(
-                "DELETE FROM voiceprints WHERE persona_id = ?1 AND id NOT IN (
-                    SELECT id FROM voiceprints WHERE persona_id = ?1
-                    ORDER BY created_at DESC, id DESC LIMIT ?2
-                 )",
-                params![persona_id, cap],
-            )
-            .map_err(|e| e.to_string())?;
+            prune_redundant(&tx, persona_id, cap)?;
         }
         tx.execute(
             "UPDATE personas SET updated_at = ?2 WHERE id = ?1",
@@ -932,11 +1125,7 @@ impl Db {
     /// rename for that label (revert to the raw `SPEAKER_xx` chip). Wrapping
     /// both in one transaction prevents a partial-failure state where the
     /// link is gone but the persona's name persists.
-    pub fn unlink_and_clear_rename(
-        &self,
-        meeting_id: i64,
-        raw_label: &str,
-    ) -> Result<(), String> {
+    pub fn unlink_and_clear_rename(&self, meeting_id: i64, raw_label: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute(
@@ -1010,16 +1199,617 @@ impl Db {
     }
 }
 
+impl Db {
+    // -------------------------------------------------------------------
+    // Customers (accounts) + customer-level rollups
+    // -------------------------------------------------------------------
+
+    pub fn list_customers(&self) -> Result<Vec<CustomerSummary>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.name, c.logo,
+                        (SELECT COUNT(*) FROM meetings m
+                          WHERE m.customer_id = c.id AND m.ended_at IS NOT NULL),
+                        (SELECT MAX(m.started_at) FROM meetings m
+                          WHERE m.customer_id = c.id AND m.ended_at IS NOT NULL)
+                 FROM customers c
+                 ORDER BY c.name COLLATE NOCASE",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CustomerSummary {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    logo: r.get(2)?,
+                    meeting_count: r.get(3)?,
+                    last_meeting_at_ms: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn create_customer(&self, name: &str, notes: Option<&str>) -> Result<i64, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("customer name cannot be empty".into());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO customers(name, notes, created_at, updated_at) VALUES(?1, ?2, ?3, ?3)",
+            params![name, notes, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn rename_customer(&self, id: i64, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("customer name cannot be empty".into());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE customers SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, name, now],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_customer_notes(&self, id: i64, notes: Option<&str>) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE customers SET notes = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, notes, now],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Completed meetings for a customer, reverse-chronological. Mirrors the
+    /// `list_meetings` row shape but filtered by `customer_id`.
+    fn customer_meetings(&self, customer_id: i64) -> Result<Vec<MeetingSummary>, String> {
+        let conn = self.conn.lock().unwrap();
+        let sql = r#"
+            SELECT m.id, m.title, m.started_at, m.ended_at, m.mic_wav,
+                   (SELECT COUNT(*) FROM segments s WHERE s.meeting_id = m.id),
+                   (SELECT COUNT(DISTINCT
+                       CASE
+                         WHEN s.speaker = 'Me' THEN 'me'
+                         ELSE COALESCE(
+                           (SELECT 'p:' || l.persona_id
+                            FROM speaker_persona_links l
+                            WHERE l.meeting_id = m.id
+                              AND l.raw_label = s.speaker
+                              AND l.persona_id IS NOT NULL
+                              AND l.confirmed = 1
+                            LIMIT 1),
+                           s.speaker)
+                       END)
+                    FROM segments s
+                    WHERE s.meeting_id = m.id AND s.speaker IS NOT NULL),
+                   (SELECT s.text FROM segments s WHERE s.meeting_id = m.id
+                     ORDER BY s.start_ms LIMIT 1)
+            FROM meetings m
+            WHERE m.customer_id = ?1 AND m.ended_at IS NOT NULL
+            ORDER BY m.started_at DESC
+        "#;
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![customer_id], |r| {
+                let ended: Option<i64> = r.get(3)?;
+                let started: i64 = r.get(2)?;
+                let mic: Option<String> = r.get(4)?;
+                Ok(MeetingSummary {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    started_at_ms: started,
+                    duration_ms: ended.map(|e| e - started),
+                    segment_count: r.get(5)?,
+                    speaker_count: r.get(6)?,
+                    preview: r.get(7)?,
+                    has_audio: mic.is_some(),
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Distinct personas with confirmed links in this customer's meetings,
+    /// with per-persona meeting count and last-seen time.
+    fn customer_roster(&self, customer_id: i64) -> Result<Vec<CustomerRosterEntry>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.id, p.display_name, COUNT(DISTINCT m.id), MAX(m.started_at)
+                 FROM meetings m
+                 JOIN speaker_persona_links l ON l.meeting_id = m.id
+                 JOIN personas p ON p.id = l.persona_id
+                 WHERE m.customer_id = ?1
+                   AND l.confirmed = 1
+                   AND l.persona_id IS NOT NULL
+                 GROUP BY p.id, p.display_name
+                 ORDER BY COUNT(DISTINCT m.id) DESC, MAX(m.started_at) DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![customer_id], |r| {
+                Ok(CustomerRosterEntry {
+                    persona_id: r.get(0)?,
+                    display_name: r.get(1)?,
+                    meeting_count: r.get(2)?,
+                    last_seen_ms: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    pub fn get_customer(&self, id: i64) -> Result<CustomerDetail, String> {
+        let conn = self.conn.lock().unwrap();
+        let (name, logo, notes, created_at, updated_at) = conn
+            .query_row(
+                "SELECT name, logo, notes, created_at, updated_at FROM customers WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("customer {id} not found: {e}"))?;
+        let (meeting_count, first_meeting_at_ms, last_meeting_at_ms, total_duration_ms) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(started_at), MAX(started_at),
+                        COALESCE(SUM(ended_at - started_at), 0)
+                 FROM meetings
+                 WHERE customer_id = ?1 AND ended_at IS NOT NULL",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        // total_duration is returned as 0 (not NULL) by COALESCE when no meetings.
+        let total_duration_ms = if total_duration_ms == Some(0) && meeting_count == 0 {
+            None
+        } else {
+            total_duration_ms
+        };
+        drop(conn);
+
+        let persona_roster = self.customer_roster(id)?;
+        let meetings = self.customer_meetings(id)?;
+        let meetings_with_summary_count = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM meetings m
+                 WHERE m.customer_id = ?1 AND m.ended_at IS NOT NULL
+                   AND EXISTS(SELECT 1 FROM summaries su WHERE su.meeting_id = m.id)",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        let latest_rollup = self.list_customer_summaries(id)?.into_iter().next();
+
+        Ok(CustomerDetail {
+            id,
+            name,
+            logo,
+            notes,
+            created_at_ms: created_at,
+            updated_at_ms: updated_at,
+            meeting_count,
+            last_meeting_at_ms,
+            first_meeting_at_ms,
+            total_duration_ms,
+            persona_roster,
+            meetings,
+            meetings_with_summary_count,
+            latest_rollup,
+        })
+    }
+
+    /// Relies on `ON DELETE SET NULL` for meetings (they become unassigned).
+    /// Personas are never owned by a customer and are untouched.
+    pub fn delete_customer(&self, id: i64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM customers WHERE id = ?1", params![id])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Reassign a meeting to a customer (or unassign when `customer_id` is None).
+    pub fn set_meeting_customer(
+        &self,
+        meeting_id: i64,
+        customer_id: Option<i64>,
+    ) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET customer_id = ?2 WHERE id = ?1",
+                params![meeting_id, customer_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Merge `source_id` into `target_id`: reassign all of source's meetings
+    /// to target, then delete source. Personas are global and need no changes
+    /// — target's roster naturally reflects the union after the meetings move.
+    pub fn merge_customers(&self, source_id: i64, target_id: i64) -> Result<(), String> {
+        if source_id == target_id {
+            return Err("cannot merge a customer into itself".into());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE meetings SET customer_id = ?2 WHERE customer_id = ?1",
+            params![source_id, target_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM customers WHERE id = ?1", params![source_id])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Scoped search across a customer's meetings: title, notes, transcript
+    /// text, summary content, and persona display names.
+    pub fn search_customer_meetings(
+        &self,
+        customer_id: i64,
+        query: &str,
+    ) -> Result<Vec<CustomerSearchResult>, String> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let like = format!("%{}%", q);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.title, m.started_at, m.notes FROM meetings m
+                 WHERE m.customer_id = ?1
+                   AND (m.title LIKE ?2
+                        OR (m.notes IS NOT NULL AND m.notes LIKE ?2)
+                        OR EXISTS(SELECT 1 FROM segments s
+                                   WHERE s.meeting_id = m.id AND s.text LIKE ?2)
+                        OR EXISTS(SELECT 1 FROM summaries su
+                                   WHERE su.meeting_id = m.id AND su.content LIKE ?2)
+                        OR EXISTS(SELECT 1 FROM speaker_persona_links l
+                                   JOIN personas p ON p.id = l.persona_id
+                                   WHERE l.meeting_id = m.id
+                                     AND l.persona_id IS NOT NULL
+                                     AND p.display_name LIKE ?2))
+                 ORDER BY m.started_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let matched: Vec<(i64, String, i64, Option<String>)> = stmt
+            .query_map(params![customer_id, like], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(matched.len());
+        for (mid, title, started, notes) in matched {
+            let mut hits = Vec::new();
+            if title.to_lowercase().contains(&q.to_lowercase()) {
+                hits.push(CustomerSearchHit {
+                    field: "title".into(),
+                    snippet: snippet_around(&title, q, 40),
+                });
+            }
+            if let Some(n) = notes.as_ref() {
+                if n.to_lowercase().contains(&q.to_lowercase()) {
+                    hits.push(CustomerSearchHit {
+                        field: "notes".into(),
+                        snippet: snippet_around(n, q, 60),
+                    });
+                }
+            }
+            // First matching transcript segment.
+            if let Ok(text) = conn.query_row(
+                "SELECT text FROM segments WHERE meeting_id = ?1 AND text LIKE ?2
+                     ORDER BY start_ms LIMIT 1",
+                params![mid, like],
+                |r| r.get::<_, String>(0),
+            ) {
+                hits.push(CustomerSearchHit {
+                    field: "transcript".into(),
+                    snippet: snippet_around(&text, q, 80),
+                });
+            }
+            // Latest matching summary.
+            if let Ok(text) = conn.query_row(
+                "SELECT content FROM summaries WHERE meeting_id = ?1 AND content LIKE ?2
+                     ORDER BY created_at DESC LIMIT 1",
+                params![mid, like],
+                |r| r.get::<_, String>(0),
+            ) {
+                hits.push(CustomerSearchHit {
+                    field: "summary".into(),
+                    snippet: snippet_around(&text, q, 80),
+                });
+            }
+            // Matching persona name.
+            if let Ok(name) = conn.query_row(
+                "SELECT p.display_name FROM speaker_persona_links l
+                     JOIN personas p ON p.id = l.persona_id
+                     WHERE l.meeting_id = ?1 AND l.persona_id IS NOT NULL
+                       AND p.display_name LIKE ?2 LIMIT 1",
+                params![mid, like],
+                |r| r.get::<_, String>(0),
+            ) {
+                hits.push(CustomerSearchHit {
+                    field: "persona".into(),
+                    snippet: name,
+                });
+            }
+            out.push(CustomerSearchResult {
+                meeting_id: mid,
+                title,
+                started_at_ms: started,
+                hits,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn insert_customer_summary(
+        &self,
+        customer_id: i64,
+        model: &str,
+        content: &str,
+        from_meeting_ids: &[i64],
+    ) -> Result<i64, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let ids_json = serde_json::to_string(from_meeting_ids).unwrap_or_else(|_| "[]".into());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO customer_summaries(customer_id, model, content, from_meeting_ids, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![customer_id, model, content, ids_json, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Customer rollups, newest first.
+    pub fn list_customer_summaries(
+        &self,
+        customer_id: i64,
+    ) -> Result<Vec<CustomerRollupRow>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, model, content, from_meeting_ids, created_at
+                 FROM customer_summaries WHERE customer_id = ?1
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![customer_id], |r| {
+                let ids_json: String = r.get(3)?;
+                let meeting_count = serde_json::from_str::<Vec<i64>>(&ids_json)
+                    .map(|v| v.len() as i64)
+                    .unwrap_or(0);
+                Ok(CustomerRollupRow {
+                    id: r.get(0)?,
+                    model: r.get(1)?,
+                    content: r.get(2)?,
+                    created_at_ms: r.get(4)?,
+                    meeting_count,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// The last `limit` meetings (reverse-chronological) for a customer that
+    /// have at least one saved summary, with their latest summary content.
+    /// Used to build the customer rollup prompt.
+    pub fn customer_meetings_with_latest_summary(
+        &self,
+        customer_id: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, i64, String)>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.title, m.started_at,
+                        (SELECT su.content FROM summaries su
+                          WHERE su.meeting_id = m.id
+                          ORDER BY su.created_at DESC LIMIT 1) AS content
+                 FROM meetings m
+                 WHERE m.customer_id = ?1 AND m.ended_at IS NOT NULL
+                   AND EXISTS(SELECT 1 FROM summaries su WHERE su.meeting_id = m.id)
+                 ORDER BY m.started_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![customer_id, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+}
+
+/// Extract a short snippet around the first case-insensitive occurrence of
+/// `needle` in `haystack`, with `pad` chars of context on each side.
+fn snippet_around(haystack: &str, needle: &str, pad: usize) -> String {
+    let hl = haystack.to_lowercase();
+    let nl = needle.to_lowercase();
+    let (start, end) = match hl.find(&nl) {
+        Some(pos) => {
+            let s = pos.saturating_sub(pad);
+            let e = (pos + needle.len() + pad).min(haystack.len());
+            (s, e)
+        }
+        None => {
+            // Fallback: first 80 chars.
+            let e = haystack.len().min(80);
+            (0, e)
+        }
+    };
+    let mut s = String::new();
+    if start > 0 {
+        s.push('…');
+    }
+    s.push_str(&haystack[start..end]);
+    if end < haystack.len() {
+        s.push('…');
+    }
+    s
+}
+
 /// Default database location: `<app data>/lilnotes.sqlite3`.
 pub fn db_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("lilnotes.sqlite3")
 }
 
+/// Redundancy-based gallery pruning: when a persona's voiceprint count
+/// exceeds `cap`, drop the lower-quality member of the most-redundant pair
+/// (highest cosine similarity). This keeps the gallery diverse — exactly
+/// what max-over-gallery matching rewards — and quality-weighted.
+///
+/// Of the most-redundant pair, the dropped row is the one with **lower
+/// `speech_ms`** (less speech → less reliable embedding); tiebreak: older
+/// `created_at` (favor freshness when quality is equal); then lower `id`.
+/// So a high-quality old print survives over a marginal new duplicate, and
+/// a high-quality new duplicate replaces an old marginal one.
+///
+/// Runs inside the caller's transaction (atomic with the enroll insert).
+/// Inserts are one-at-a-time, so the gallery is at most 1 over cap → one
+/// deletion per call.
+fn prune_redundant(
+    tx: &rusqlite::Transaction<'_>,
+    persona_id: i64,
+    cap: i32,
+) -> Result<(), String> {
+    let count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM voiceprints WHERE persona_id = ?1",
+            params![persona_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if count <= cap as i64 {
+        return Ok(());
+    }
+
+    // Load all voiceprints for this persona: (id, embedding, speech_ms,
+    // created_at). Embeddings are unpacked from their BLOB (clipped to
+    // dim*4 bytes, as in list_personas_with_voiceprints).
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, embedding, dim, speech_ms, created_at
+             FROM voiceprints WHERE persona_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(i64, Vec<f32>, i64, i64)> = stmt
+        .query_map(params![persona_id], |r| {
+            let id: i64 = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            let dim: i64 = r.get(2)?;
+            let speech_ms: i64 = r.get(3)?;
+            let created_at: i64 = r.get(4)?;
+            let emb = crate::voiceprint::unpack_f32(&blob[..blob.len().min(dim as usize * 4)]);
+            Ok((id, emb, speech_ms, created_at))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt); // release the prepared statement before the DELETE.
+
+    if rows.len() < 2 {
+        return Ok(());
+    }
+
+    // Find the most-redundant unordered pair by cosine similarity. O(N²)
+    // over at most cap+1 (~151) prints — sub-millisecond, runs only on
+    // enroll (user-triggered, rare).
+    let mut best_sim = f32::NEG_INFINITY;
+    let mut best: (usize, usize) = (0, 1);
+    for i in 0..rows.len() {
+        for j in (i + 1)..rows.len() {
+            let sim = crate::voiceprint::cosine(&rows[i].1, &rows[j].1);
+            if sim > best_sim {
+                best_sim = sim;
+                best = (i, j);
+            }
+        }
+    }
+
+    // Of the most-redundant pair, pick the lower-quality row to delete:
+    // lower speech_ms, then older created_at, then lower id.
+    let (ai, bi) = best;
+    let drop_idx = if rows[ai].2 != rows[bi].2 {
+        if rows[ai].2 < rows[bi].2 {
+            ai
+        } else {
+            bi
+        }
+    } else if rows[ai].3 != rows[bi].3 {
+        if rows[ai].3 < rows[bi].3 {
+            ai
+        } else {
+            bi
+        }
+    } else if rows[ai].0 < rows[bi].0 {
+        ai
+    } else {
+        bi
+    };
+    let drop_id = rows[drop_idx].0;
+    tx.execute("DELETE FROM voiceprints WHERE id = ?1", params![drop_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1040,17 +1830,19 @@ mod tests {
     }
 
     #[test]
-    fn migrates_to_v2_with_tables() {
+    fn migrates_to_latest_with_tables() {
         let db = tmp_db();
         let conn = db.conn.lock().unwrap();
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 4);
         for table in ["personas", "voiceprints", "speaker_persona_links"] {
             let n: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"),
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+                    ),
                     [],
                     |r| r.get(0),
                 )
@@ -1062,9 +1854,7 @@ mod tests {
     #[test]
     fn persona_voiceprint_link_roundtrip() {
         let db = tmp_db();
-        let meeting_id = db
-            .insert_meeting("s1", "t", 0, 0, "m.wav", "s.wav")
-            .unwrap();
+        let meeting_id = db.insert_meeting_started("s1", "t", 0).unwrap();
         let pid = db.create_persona("Priya").unwrap();
         let emb = vec![0.1, 0.2, 0.3];
         db.insert_voiceprint(pid, &emb, 3, Some(meeting_id), Some("SPEAKER_00"), 5000, 50)
@@ -1086,7 +1876,8 @@ mod tests {
         assert_eq!(links[0].persona_name.as_deref(), Some("Priya"));
         assert!(!links[0].confirmed);
 
-        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid).unwrap();
+        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid)
+            .unwrap();
         let links = db.meeting_speaker_links(meeting_id).unwrap();
         assert!(links[0].confirmed);
 
@@ -1095,15 +1886,23 @@ mod tests {
             .unwrap();
         let links = db.meeting_speaker_links(meeting_id).unwrap();
         assert!(links[0].confirmed, "upsert must preserve confirmed=1");
-        assert_eq!(links[0].confidence, Some(0.8), "upsert should update confidence");
+        assert_eq!(
+            links[0].confidence,
+            Some(0.8),
+            "upsert should update confidence"
+        );
 
-        db.unlink_and_clear_rename(meeting_id, "SPEAKER_00").unwrap();
+        db.unlink_and_clear_rename(meeting_id, "SPEAKER_00")
+            .unwrap();
         assert!(db.meeting_speaker_links(meeting_id).unwrap().is_empty());
 
         db.delete_persona(pid).unwrap();
         assert!(db.list_personas().unwrap().is_empty());
 
-        // Gallery cap pruning: with cap=1, a second insert drops the oldest.
+        // Gallery cap pruning: with cap=1, the second insert drops the
+        // lower-quality member of the (only, hence most-redundant) pair.
+        // The first print has speech_ms=1000, the second 2000 → the first
+        // is dropped and the higher-quality second print survives.
         let pid2 = db.create_persona("CapTest").unwrap();
         db.insert_voiceprint(pid2, &[0.1, 0.2, 0.3], 3, None, None, 1000, 1)
             .unwrap();
@@ -1114,25 +1913,87 @@ mod tests {
         assert_eq!(
             cap_persona.embeddings.len(),
             1,
-            "cap=1 should keep only the newest voiceprint"
+            "cap=1 should keep only the higher-quality voiceprint"
         );
+        assert_eq!(
+            cap_persona.embeddings[0],
+            vec![0.4, 0.5, 0.6],
+            "lower-speech_ms print is the one dropped"
+        );
+    }
+
+    #[test]
+    fn voiceprint_pruning_keeps_higher_quality() {
+        // Two near-duplicate embeddings, cap=1. The older print has MORE
+        // speech (higher quality); the newer has the minimum. Smart pruning
+        // must keep the high-quality old print, proving quality beats age
+        // (unlike the old FIFO policy, which would have dropped the old one).
+        let db = tmp_db();
+        let pid = db.create_persona("Q").unwrap();
+        // Near-identical direction so they form the most-redundant pair.
+        db.insert_voiceprint(pid, &[1.0, 0.0, 0.0], 3, None, None, 30_000, 1)
+            .unwrap(); // old, high quality
+        db.insert_voiceprint(pid, &[1.0, 0.0, 0.0], 3, None, None, 3_100, 1)
+            .unwrap(); // new, low quality
+        let with_emb = db.list_personas_with_voiceprints().unwrap();
+        assert_eq!(with_emb[0].embeddings.len(), 1, "only one print survives");
+        // The low-quality new print is the redundant duplicate that gets
+        // dropped; the high-quality old one stays.
+        assert_eq!(
+            with_emb[0].embeddings[0],
+            vec![1.0, 0.0, 0.0],
+            "high-quality old print retained over low-quality new duplicate"
+        );
+    }
+
+    #[test]
+    fn voiceprint_pruning_drops_most_redundant() {
+        // Three prints, cap=2. Two are near-identical (a redundant pair);
+        // the third is unique. Pruning must drop the lower-quality member of
+        // the redundant pair and keep the unique print regardless of age.
+        let db = tmp_db();
+        let pid = db.create_persona("D").unwrap();
+        // Two near-duplicates (different quality), then one unique direction.
+        db.insert_voiceprint(pid, &[1.0, 0.0, 0.0], 3, None, None, 5_000, 2)
+            .unwrap(); // redundant, low quality
+        db.insert_voiceprint(pid, &[1.0, 0.0, 0.0], 3, None, None, 20_000, 2)
+            .unwrap(); // redundant, high quality
+        db.insert_voiceprint(pid, &[0.0, 1.0, 0.0], 3, None, None, 3_100, 2)
+            .unwrap(); // unique (orthogonal), lowest quality
+        let with_emb = db.list_personas_with_voiceprints().unwrap();
+        assert_eq!(with_emb[0].embeddings.len(), 2, "cap=2 keeps two prints");
+        // The redundant low-quality print is dropped; the high-quality
+        // redundant one AND the unique low-quality one both survive.
+        let embs = &with_emb[0].embeddings;
+        assert!(
+            embs.contains(&vec![1.0, 0.0, 0.0]),
+            "high-quality redundant print survives"
+        );
+        assert!(
+            embs.contains(&vec![0.0, 1.0, 0.0]),
+            "unique print survives even though it's lowest quality"
+        );
+        assert_eq!(embs.len(), 2);
     }
 
     #[test]
     fn delete_persona_clears_display_renames() {
         let db = tmp_db();
-        let meeting_id = db
-            .insert_meeting("s1", "t", 0, 0, "m.wav", "s.wav")
-            .unwrap();
+        let meeting_id = db.insert_meeting_started("s1", "t", 0).unwrap();
         let pid = db.create_persona("Priya").unwrap();
         // Simulate a prior confirm: link + display rename applied.
         db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
             .unwrap();
-        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid).unwrap();
-        db.rename_speaker(meeting_id, "SPEAKER_00", Some("Priya")).unwrap();
+        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid)
+            .unwrap();
+        db.rename_speaker(meeting_id, "SPEAKER_00", Some("Priya"))
+            .unwrap();
         // Sanity: the rename is present.
         let detail = db.get_meeting(meeting_id).unwrap();
-        assert_eq!(detail.renames.get("SPEAKER_00").map(String::as_str), Some("Priya"));
+        assert_eq!(
+            detail.renames.get("SPEAKER_00").map(String::as_str),
+            Some("Priya")
+        );
 
         db.delete_persona(pid).unwrap();
         // After delete: link's persona_id is NULL, rename cleared.
@@ -1142,23 +2003,29 @@ mod tests {
             "delete_persona should clear the display rename"
         );
         let link = detail.speaker_links.get("SPEAKER_00").unwrap();
-        assert!(link.persona_id.is_none(), "link persona_id should be NULL after persona delete");
+        assert!(
+            link.persona_id.is_none(),
+            "link persona_id should be NULL after persona delete"
+        );
     }
 
     #[test]
     fn unlink_and_clear_rename_is_atomic() {
         let db = tmp_db();
-        let meeting_id = db
-            .insert_meeting("s2", "t", 0, 0, "m.wav", "s.wav")
-            .unwrap();
+        let meeting_id = db.insert_meeting_started("s2", "t", 0).unwrap();
         let pid = db.create_persona("Jordan").unwrap();
         db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.8))
             .unwrap();
-        db.rename_speaker(meeting_id, "SPEAKER_01", Some("Jordan")).unwrap();
+        db.rename_speaker(meeting_id, "SPEAKER_01", Some("Jordan"))
+            .unwrap();
 
-        db.unlink_and_clear_rename(meeting_id, "SPEAKER_01").unwrap();
+        db.unlink_and_clear_rename(meeting_id, "SPEAKER_01")
+            .unwrap();
         let detail = db.get_meeting(meeting_id).unwrap();
-        assert!(detail.speaker_links.get("SPEAKER_01").is_none(), "link should be gone");
+        assert!(
+            detail.speaker_links.get("SPEAKER_01").is_none(),
+            "link should be gone"
+        );
         assert!(
             detail.renames.get("SPEAKER_01").is_none(),
             "display rename should be cleared"
@@ -1168,9 +2035,7 @@ mod tests {
     #[test]
     fn delete_orphaned_links_keeps_current_labels() {
         let db = tmp_db();
-        let meeting_id = db
-            .insert_meeting("s3", "t", 0, 0, "m.wav", "s.wav")
-            .unwrap();
+        let meeting_id = db.insert_meeting_started("s3", "t", 0).unwrap();
         let pid = db.create_persona("Priya").unwrap();
         // Two speakers linked from a prior run.
         db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
@@ -1192,7 +2057,9 @@ mod tests {
     #[test]
     fn speaker_identity_count_collapses_confirmed_personas() {
         let db = tmp_db();
-        let meeting_id = db.insert_meeting("s4", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        let meeting_id = db.insert_meeting_started("s4", "t", 0).unwrap();
+        db.finalize_meeting(meeting_id, 0, "m.wav", "s.wav")
+            .unwrap();
 
         // 3 remote raw labels + local user = 4 identities.
         db.replace_segments(
@@ -1238,17 +2105,22 @@ mod tests {
 
         // Confirm two remote labels are the same persona -> count drops to 3.
         let pid = db.create_persona("Priya").unwrap();
-        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9)).unwrap();
-        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid).unwrap();
-        db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.85)).unwrap();
-        db.set_link_confirmed(meeting_id, "SPEAKER_01", pid).unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
+            .unwrap();
+        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid)
+            .unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.85))
+            .unwrap();
+        db.set_link_confirmed(meeting_id, "SPEAKER_01", pid)
+            .unwrap();
 
         assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 3);
         assert_eq!(db.list_meetings(None).unwrap()[0].speaker_count, 3);
         assert_eq!(db.get_meeting(meeting_id).unwrap().speaker_count, 3);
 
         // Unlink one -> count returns to 4.
-        db.unlink_and_clear_rename(meeting_id, "SPEAKER_01").unwrap();
+        db.unlink_and_clear_rename(meeting_id, "SPEAKER_01")
+            .unwrap();
         assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 4);
         assert_eq!(db.list_meetings(None).unwrap()[0].speaker_count, 4);
     }
@@ -1256,7 +2128,7 @@ mod tests {
     #[test]
     fn speaker_identity_count_ignores_unconfirmed_suggestions() {
         let db = tmp_db();
-        let meeting_id = db.insert_meeting("s5", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        let meeting_id = db.insert_meeting_started("s5", "t", 0).unwrap();
 
         db.replace_segments(
             meeting_id,
@@ -1281,7 +2153,8 @@ mod tests {
 
         // Suggestion (confirmed = 0) should NOT merge the two labels.
         let pid = db.create_persona("Priya").unwrap();
-        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9)).unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
+            .unwrap();
 
         assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 2);
     }
@@ -1289,10 +2162,10 @@ mod tests {
     #[test]
     fn speaker_identity_count_edge_cases() {
         let db = tmp_db();
-        let empty_id = db.insert_meeting("empty", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        let empty_id = db.insert_meeting_started("empty", "t", 0).unwrap();
         assert_eq!(db.count_speaker_identities(empty_id).unwrap(), 0);
 
-        let me_id = db.insert_meeting("me", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        let me_id = db.insert_meeting_started("me", "t", 0).unwrap();
         db.replace_segments(
             me_id,
             &[
@@ -1315,18 +2188,16 @@ mod tests {
         .unwrap();
         assert_eq!(db.count_speaker_identities(me_id).unwrap(), 1);
 
-        let null_id = db.insert_meeting("null", "t", 0, 0, "m.wav", "s.wav").unwrap();
+        let null_id = db.insert_meeting_started("null", "t", 0).unwrap();
         db.replace_segments(
             null_id,
-            &[
-                Segment {
-                    source: "system".into(),
-                    speaker: None,
-                    start_ms: 0,
-                    end_ms: 1000,
-                    text: "no speaker".into(),
-                },
-            ],
+            &[Segment {
+                source: "system".into(),
+                speaker: None,
+                start_ms: 0,
+                end_ms: 1000,
+                text: "no speaker".into(),
+            }],
         )
         .unwrap();
         assert_eq!(db.count_speaker_identities(null_id).unwrap(), 0);

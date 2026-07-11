@@ -90,8 +90,8 @@ impl DiarizeEngine {
         let num_clusters = num_speakers.filter(|&n| n > 0).unwrap_or(-1);
         self.ensure_loaded(app, num_clusters)?;
 
-        let mut reader = hound::WavReader::open(wav_path)
-            .map_err(|e| format!("cannot open {wav_path}: {e}"))?;
+        let mut reader =
+            hound::WavReader::open(wav_path).map_err(|e| format!("cannot open {wav_path}: {e}"))?;
         let samples: Vec<f32> = reader
             .samples::<i16>()
             .map(|s| s.map(|v| v as f32 / 32768.0))
@@ -106,7 +106,11 @@ impl DiarizeEngine {
         let callback = Box::new(move |processed: i32, total: i32| -> i32 {
             let mut last = last_emit.lock().unwrap();
             if last.elapsed() > Duration::from_millis(200) {
-                let _ = progress_app.emit_to("main", "diarize:progress", DiarizeProgress { processed, total });
+                let _ = progress_app.emit_to(
+                    "main",
+                    "diarize:progress",
+                    DiarizeProgress { processed, total },
+                );
                 *last = Instant::now();
             }
             0 // continue

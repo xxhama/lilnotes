@@ -53,9 +53,7 @@ export default function SpeakerPersonaPicker({
       onClick={(e) => e.stopPropagation()}
     >
       <div className="mb-1 flex items-center justify-between">
-        <span className="text-[11px] font-medium text-muted-foreground">
-          Assign {rawLabel}
-        </span>
+        <span className="text-[11px] font-medium text-muted-foreground">Assign {rawLabel}</span>
         <button
           className="text-muted-foreground hover:text-foreground"
           onClick={onDismiss}

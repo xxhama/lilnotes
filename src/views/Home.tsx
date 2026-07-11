@@ -1,7 +1,23 @@
+/**
+ * Home / Meetings list view. Shows all persisted meetings with search
+ * (matches titles and transcript text), delete, and navigation to the
+ * meeting detail page. This is the default landing route.
+ */
 import { useCallback, useEffect, useState } from "react";
-import { Mic, Search, Trash2, Users } from "lucide-react";
+import { Loader2, Mic, Search, Trash2, Users } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { deleteMeeting, listMeetings, type MeetingSummary } from "@/lib/ipc";
 import type { Route } from "@/App";
 
@@ -31,6 +47,9 @@ function fmtDuration(ms: number | null): string {
 export default function HomeView({ onNavigate }: Props) {
   const [meetings, setMeetings] = useState<MeetingSummary[] | null>(null);
   const [search, setSearch] = useState("");
+  /** Meeting pending deletion confirmation (null = dialog closed). */
+  const [pendingDelete, setPendingDelete] = useState<MeetingSummary | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const refresh = useCallback((query: string) => {
     listMeetings(query || undefined)
@@ -43,17 +62,17 @@ export default function HomeView({ onNavigate }: Props) {
     return () => clearTimeout(t);
   }, [search, refresh]);
 
-  const remove = useCallback(
-    async (e: React.MouseEvent, id: number) => {
-      e.stopPropagation();
-      if (!window.confirm("Delete this meeting and its audio? This cannot be undone.")) {
-        return;
-      }
-      await deleteMeeting(id);
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    try {
+      await deleteMeeting(pendingDelete.id);
+      setPendingDelete(null);
       refresh(search);
-    },
-    [refresh, search],
-  );
+    } finally {
+      setDeleting(false);
+    }
+  }, [pendingDelete, refresh, search]);
 
   if (meetings === null) {
     return <div className="p-8" />; // loading flash guard
@@ -120,9 +139,7 @@ export default function HomeView({ onNavigate }: Props) {
                       {m.speakerCount}
                     </span>
                   )}
-                  {m.segmentCount === 0 && (
-                    <span className="text-amber-600">not transcribed</span>
-                  )}
+                  {m.segmentCount === 0 && <span className="text-amber-600">not transcribed</span>}
                 </div>
                 {m.preview && (
                   <p className="truncate text-xs text-muted-foreground/70">{m.preview}</p>
@@ -132,7 +149,10 @@ export default function HomeView({ onNavigate }: Props) {
                 size="icon"
                 variant="ghost"
                 className="size-8 opacity-0 transition-opacity group-hover:opacity-100"
-                onClick={(e) => remove(e, m.id)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPendingDelete(m);
+                }}
                 aria-label="Delete meeting"
                 asChild
               >
@@ -144,6 +164,40 @@ export default function HomeView({ onNavigate }: Props) {
           ))}
         </div>
       )}
+
+      <AlertDialog
+        open={pendingDelete != null}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setPendingDelete(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete meeting?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently deletes{" "}
+              <span className="font-medium text-foreground">{pendingDelete?.title}</span> and its
+              audio. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className={cn(buttonVariants({ variant: "destructive" }))}
+              disabled={deleting}
+              // Prevent radix's auto-close so the dialog stays open while the
+              // delete runs; we close it ourselves on success.
+              onClick={(e) => {
+                e.preventDefault();
+                confirmDelete();
+              }}
+            >
+              {deleting ? <Loader2 className="animate-spin" /> : <Trash2 />}
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -32,22 +32,23 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
     kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapAutoStartKey,
-    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey,
-    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertyStreams, kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioObjectUnknown,
-    kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
-    kAudioTapPropertyFormat, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID,
-    AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
-    AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-    AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
-    AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
+    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceUID,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
+    kAudioObjectUnknown, kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey,
+    kAudioSubTapUIDKey, kAudioTapPropertyFormat, AudioDeviceCreateIOProcID,
+    AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop,
+    AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+    AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress, CATapDescription,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
+use super::aec::AecRenderFeeder;
 use super::pipeline::{ChannelMeters, ChannelPipeline, LiveChunk, Source};
 
 pub struct SystemThread {
@@ -60,10 +61,11 @@ pub fn spawn(
     meters: Arc<ChannelMeters>,
     live_tx: Option<Sender<LiveChunk>>,
     ready_tx: Sender<Result<(), String>>,
+    aec_render: Option<AecRenderFeeder>,
 ) -> SystemThread {
     let handle = std::thread::Builder::new()
         .name("system-capture".into())
-        .spawn(move || run(wav_path, stop, meters, live_tx, ready_tx))
+        .spawn(move || run(wav_path, stop, meters, live_tx, ready_tx, aec_render))
         .expect("failed to spawn system capture thread");
     SystemThread { handle }
 }
@@ -184,7 +186,7 @@ impl AggregateHandle {
             ],
         );
 
-        let agg_uid = format!("co.elastic.lilnote.tap-aggregate.{}", std::process::id());
+        let agg_uid = format!("com.lilnotes.tap-aggregate.{}", std::process::id());
         let desc = dict(
             &[
                 &key(kAudioAggregateDeviceNameKey),
@@ -209,13 +211,11 @@ impl AggregateHandle {
         );
 
         // NSDictionary is toll-free bridged to CFDictionary.
-        let cf: &CFDictionary =
-            unsafe { &*(Retained::as_ptr(&desc) as *const CFDictionary) };
+        let cf: &CFDictionary = unsafe { &*(Retained::as_ptr(&desc) as *const CFDictionary) };
 
         let mut agg_id: AudioObjectID = kAudioObjectUnknown;
         // SAFETY: cf is a valid dictionary; agg_id a valid out-pointer.
-        let status =
-            unsafe { AudioHardwareCreateAggregateDevice(cf, NonNull::from(&mut agg_id)) };
+        let status = unsafe { AudioHardwareCreateAggregateDevice(cf, NonNull::from(&mut agg_id)) };
         if status != 0 || agg_id == kAudioObjectUnknown {
             return Err(format!(
                 "could not create aggregate device for the system tap (OSStatus {status})"
@@ -285,7 +285,9 @@ impl IOProcHandle {
                 AudioDeviceDestroyIOProcID(device, proc_id);
                 drop(Box::from_raw(ctx));
             }
-            return Err(format!("could not start aggregate device (OSStatus {status})"));
+            return Err(format!(
+                "could not start aggregate device (OSStatus {status})"
+            ));
         }
         Ok(Self {
             device,
@@ -373,7 +375,10 @@ unsafe extern "C-unwind" fn io_proc(
             if b.mData.is_null() {
                 continue;
             }
-            let ch = std::slice::from_raw_parts(b.mData as *const f32, frames.min((b.mDataByteSize as usize) / 4));
+            let ch = std::slice::from_raw_parts(
+                b.mData as *const f32,
+                frames.min((b.mDataByteSize as usize) / 4),
+            );
             for (a, &s) in acc.iter_mut().zip(ch.iter()) {
                 *a += s;
             }
@@ -397,7 +402,8 @@ unsafe extern "C-unwind" fn io_proc(
     };
 
     if ctx.tx.try_send(mono).is_err() {
-        ctx.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     0
 }
@@ -447,11 +453,13 @@ fn default_output_device() -> Result<(AudioObjectID, String), String> {
         )
     };
     if status != 0 || uid_ptr.is_null() {
-        return Err(format!("could not read output device UID (OSStatus {status})"));
+        return Err(format!(
+            "could not read output device UID (OSStatus {status})"
+        ));
     }
     // SAFETY: we own the +1 reference returned by the property call.
-    let uid = unsafe { Retained::from_raw(uid_ptr) }
-        .ok_or_else(|| "device UID was null".to_string())?;
+    let uid =
+        unsafe { Retained::from_raw(uid_ptr) }.ok_or_else(|| "device UID was null".to_string())?;
     Ok((device, uid.to_string()))
 }
 
@@ -468,7 +476,13 @@ fn input_stream_count(device: AudioObjectID) -> usize {
     let mut size: u32 = 0;
     // SAFETY: standard property-size query.
     let status = unsafe {
-        AudioObjectGetPropertyDataSize(device, NonNull::from(&addr), 0, std::ptr::null(), NonNull::from(&mut size))
+        AudioObjectGetPropertyDataSize(
+            device,
+            NonNull::from(&addr),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+        )
     };
     if status != 0 {
         return 0;
@@ -509,6 +523,7 @@ fn run(
     meters: Arc<ChannelMeters>,
     live_tx: Option<Sender<LiveChunk>>,
     ready_tx: Sender<Result<(), String>>,
+    aec_render: Option<AecRenderFeeder>,
 ) -> Result<PathBuf, String> {
     let setup = (|| -> Result<(TapHandle, AggregateHandle, u32, usize), String> {
         let tap = TapHandle::create()?;
@@ -540,14 +555,21 @@ fn run(
         }
     };
 
-    let mut pipeline =
-        match ChannelPipeline::new(&wav_path, sample_rate, Source::System, meters, live_tx) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e.clone()));
-                return Err(e);
-            }
-        };
+    let mut pipeline = match ChannelPipeline::new(
+        &wav_path,
+        sample_rate,
+        Source::System,
+        meters,
+        live_tx,
+        None,
+        aec_render,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e.clone()));
+            return Err(e);
+        }
+    };
 
     // 256 chunks ≈ several seconds of headroom at typical IO cycle sizes.
     let (chunk_tx, chunk_rx) = bounded::<Vec<f32>>(256);

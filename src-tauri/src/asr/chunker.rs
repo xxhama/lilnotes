@@ -21,6 +21,8 @@ use tauri::{AppHandle, Emitter};
 use super::{AsrEngine, Segment};
 use crate::audio::pipeline::{LiveChunk, Source};
 use crate::audio::resampler::TARGET_RATE;
+use crate::personas::{rank_personas, PersonaWithEmbeddings};
+use crate::voiceprint::VoiceprintEngine;
 
 const MAX_CHUNK_S: usize = 12;
 const MIN_CHUNK_S: usize = 4;
@@ -28,6 +30,50 @@ const SILENCE_TAIL_MS: usize = 600;
 const SILENCE_RMS: f32 = 0.006;
 /// Max characters of trailing transcript used as the next chunk's prompt.
 const PROMPT_TAIL_CHARS: usize = 200;
+
+/// Live known-persona identification state. Created at recording start when
+/// the persona gallery is non-empty; the system `ChannelBuffer` calls
+/// `identify` on each flushed chunk to tag segments with a persona name.
+pub struct LiveVoiceprint {
+    app: AppHandle,
+    engine: Arc<VoiceprintEngine>,
+    gallery: Vec<PersonaWithEmbeddings>,
+    threshold: f32,
+}
+
+impl LiveVoiceprint {
+    pub fn new(
+        app: AppHandle,
+        engine: Arc<VoiceprintEngine>,
+        gallery: Vec<PersonaWithEmbeddings>,
+        threshold: f32,
+    ) -> Self {
+        Self {
+            app,
+            engine,
+            gallery,
+            threshold,
+        }
+    }
+
+    /// Compute an embedding from `samples`, match against the gallery, and
+    /// return the persona display name if the best cosine score clears the
+    /// threshold. Returns `None` on any error or below-threshold match so
+    /// the recording is never affected by voiceprint failures.
+    fn identify(&self, samples: &[f32]) -> Option<String> {
+        let emb = self
+            .engine
+            .embed_samples(&self.app, samples, TARGET_RATE)
+            .ok()??;
+        let scores = rank_personas(&self.gallery, &emb.vec);
+        let best = scores.first()?;
+        if best.score >= self.threshold {
+            Some(best.display_name.clone())
+        } else {
+            None
+        }
+    }
+}
 
 /// Payload of the `asr:segment` event.
 #[derive(Serialize, Clone)]
@@ -86,7 +132,14 @@ impl ChannelBuffer {
     }
 
     /// Transcribe and clear the buffer; returns absolute-timestamped segments.
-    fn flush(&mut self, engine: &AsrEngine) -> Result<Vec<Segment>, String> {
+    /// `vp` is the live voiceprint identifier (system channel only); when
+    /// present, the speaker is identified from the chunk audio before it's
+    /// cleared.
+    fn flush(
+        &mut self,
+        engine: &AsrEngine,
+        vp: Option<&LiveVoiceprint>,
+    ) -> Result<Vec<Segment>, String> {
         if self.buf.is_empty() {
             return Ok(Vec::new());
         }
@@ -104,6 +157,14 @@ impl ChannelBuffer {
             Some(self.prompt.as_str())
         };
         let raw = engine.transcribe_chunk(&self.buf, prompt)?;
+
+        // Identify the speaker from the chunk audio before clearing the
+        // buffer. Only the system channel is identified — mic is always "Me".
+        let identified = match self.source {
+            Source::System => vp.and_then(|v| v.identify(&self.buf)),
+            Source::Mic => None,
+        };
+
         self.buf.clear();
 
         let mut segments = Vec::with_capacity(raw.len());
@@ -117,7 +178,7 @@ impl ChannelBuffer {
                 text,
                 speaker: match self.source {
                     Source::Mic => Some("Me".into()),
-                    Source::System => None, // diarization fills this in
+                    Source::System => identified.clone(), // persona name or None
                 },
             });
         }
@@ -149,38 +210,44 @@ pub struct SessionChunker {
     mic: ChannelBuffer,
     system: ChannelBuffer,
     collected: Vec<Segment>,
+    live_vp: Option<Arc<LiveVoiceprint>>,
 }
 
 impl SessionChunker {
-    pub fn new(app: AppHandle, session_id: String) -> Self {
+    pub fn new(app: AppHandle, session_id: String, live_vp: Option<Arc<LiveVoiceprint>>) -> Self {
         Self {
             app,
             session_id,
             mic: ChannelBuffer::new(Source::Mic),
             system: ChannelBuffer::new(Source::System),
             collected: Vec::new(),
+            live_vp,
         }
     }
 
     pub fn feed(&mut self, chunk: &LiveChunk, engine: &AsrEngine) -> Result<(), String> {
+        // Clone the Arc upfront so we don't borrow self while mutating the
+        // channel buffer.
+        let vp = self.live_vp.clone();
         let ch = match chunk.source {
             Source::Mic => &mut self.mic,
             Source::System => &mut self.system,
         };
         ch.buf.extend_from_slice(&chunk.samples);
         if ch.should_flush() {
-            let segments = ch.flush(engine)?;
+            let segments = ch.flush(engine, vp.as_deref())?;
             self.emit(segments);
         }
         Ok(())
     }
 
     /// Flush both channels and return everything transcribed this session,
-    /// ordered by start time.
+    /// ordered by start time. Remainders are flushed without live ID —
+    /// they're typically too short for a reliable embedding.
     pub fn finish(mut self, engine: &AsrEngine) -> Result<Vec<Segment>, String> {
-        let mic = self.mic.flush(engine)?;
+        let mic = self.mic.flush(engine, None)?;
         self.emit(mic);
-        let system = self.system.flush(engine)?;
+        let system = self.system.flush(engine, None)?;
         self.emit(system);
         self.collected.sort_by_key(|s| s.start_ms);
         Ok(self.collected)
@@ -188,7 +255,8 @@ impl SessionChunker {
 
     fn emit(&mut self, segments: Vec<Segment>) {
         for segment in segments {
-            let _ = self.app.emit_to("main",
+            let _ = self.app.emit_to(
+                "main",
                 "asr:segment",
                 SegmentEvent {
                     session_id: self.session_id.clone(),
@@ -207,11 +275,12 @@ pub fn spawn_live_worker(
     engine: Arc<AsrEngine>,
     rx: crossbeam_channel::Receiver<LiveChunk>,
     session_id: String,
+    live_vp: Option<Arc<LiveVoiceprint>>,
 ) -> std::thread::JoinHandle<Result<Vec<Segment>, String>> {
     std::thread::Builder::new()
         .name("asr-live".into())
         .spawn(move || {
-            let mut chunker = SessionChunker::new(app.clone(), session_id.clone());
+            let mut chunker = SessionChunker::new(app.clone(), session_id.clone(), live_vp);
             let mut worker_err: Option<String> = None;
             while let Ok(chunk) = rx.recv() {
                 if let Err(e) = chunker.feed(&chunk, &engine) {
@@ -227,7 +296,11 @@ pub fn spawn_live_worker(
                 },
                 Err(e) => Err(e),
             };
-            let _ = app.emit_to("main", "asr:done", serde_json::json!({ "sessionId": session_id }));
+            let _ = app.emit_to(
+                "main",
+                "asr:done",
+                serde_json::json!({ "sessionId": session_id }),
+            );
             result
         })
         .expect("failed to spawn asr worker")
@@ -242,7 +315,7 @@ pub fn transcribe_wavs(
     mic_wav: &str,
     system_wav: &str,
 ) -> Result<Vec<Segment>, String> {
-    let mut chunker = SessionChunker::new(app.clone(), session_id.clone());
+    let mut chunker = SessionChunker::new(app.clone(), session_id.clone(), None);
     for (path, source) in [(mic_wav, Source::Mic), (system_wav, Source::System)] {
         let mut reader =
             hound::WavReader::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
@@ -251,6 +324,12 @@ pub fn transcribe_wavs(
             .map(|s| s.map(|v| v as f32 / 32768.0))
             .collect::<Result<_, _>>()
             .map_err(|e| format!("cannot read {path}: {e}"))?;
+        eprintln!(
+            "[asr] transcribe_wavs {}: {} samples ({:.1}s)",
+            path,
+            samples.len(),
+            samples.len() as f32 / TARGET_RATE as f32
+        );
         // Feed in ~2s slices so flushes happen at the same cadence as live.
         for slice in samples.chunks(TARGET_RATE as usize * 2) {
             chunker.feed(
@@ -266,6 +345,10 @@ pub fn transcribe_wavs(
         // feeds is fine).
     }
     let segments = chunker.finish(engine)?;
-    let _ = app.emit_to("main", "asr:done", serde_json::json!({ "sessionId": session_id }));
+    let _ = app.emit_to(
+        "main",
+        "asr:done",
+        serde_json::json!({ "sessionId": session_id }),
+    );
     Ok(segments)
 }

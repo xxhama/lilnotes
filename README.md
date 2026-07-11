@@ -12,7 +12,7 @@ model. No cloud, no telemetry, no Python at runtime.
 - **Summaries:** Ollama HTTP API at `http://localhost:11434`, streaming
 - **Storage:** SQLite; WAVs + models in Application Support
 
-**Target:** Apple Silicon, macOS 26 (Tahoe)+. Bundle ID: `co.elastic.lilnote`.
+**Target:** Apple Silicon, macOS 26 (Tahoe)+. Bundle ID: `com.lilnotes`.
 
 ## Development
 
@@ -21,23 +21,33 @@ Tools, and CMake for the whisper.cpp build (`brew install cmake`).
 
 ```sh
 npm install
-npm run tauri dev     # dev app window
-npm run tauri build   # release .app/.dmg
+npm run tauri:dev     # dev app window (builds sidecar first)
+npm run tauri:build   # release .app/.dmg (builds sidecar + fixes dylibs)
+```
+
+## Testing
+
+```sh
+npm test                          # Rust unit tests
+npm run typecheck                 # TypeScript typecheck
+npm run lint                      # ESLint
+cd src-tauri && cargo clippy      # Rust lints
+cd src-tauri && cargo fmt --check # Rust format check
 ```
 
 ## Milestone status
 
-| # | Milestone | Status |
-|---|-----------|--------|
-| 1 | Scaffold: app shell, IPC round-trip | ✅ done |
-| 2 | Dual-source capture → two 16 kHz WAVs, level meters, permissions | ✅ done |
-| 3 | Transcription (whisper-rs Metal), model download, near-live chunks | ✅ done |
-| 4 | Diarization + merged speaker-labeled transcript | ✅ done |
-| 5 | SQLite persistence, history/detail UI, speaker rename | ✅ done |
-| 6 | Ollama summaries + in-app model manager (pull w/ progress) | ✅ done |
-| 7 | Export: Markdown, PDF, clipboard | ⬜ |
-| 8 | Signing, notarization, .dmg, first-run flow | ⬜ |
-| 9 | Cross-meeting voiceprints & named personas | ✅ done |
+| #   | Milestone                                                          | Status  |
+| --- | ------------------------------------------------------------------ | ------- |
+| 1   | Scaffold: app shell, IPC round-trip                                | ✅ done |
+| 2   | Dual-source capture → two 16 kHz WAVs, level meters, permissions   | ✅ done |
+| 3   | Transcription (whisper-rs Metal), model download, near-live chunks | ✅ done |
+| 4   | Diarization + merged speaker-labeled transcript                    | ✅ done |
+| 5   | SQLite persistence, history/detail UI, speaker rename              | ✅ done |
+| 6   | Ollama summaries + in-app model manager (pull w/ progress)         | ✅ done |
+| 7   | Export: Markdown, PDF, clipboard                                   | ⬜      |
+| 8   | Signing, notarization, .dmg, first-run flow                        | ⬜      |
+| 9   | Cross-meeting voiceprints & named personas                         | ✅ done |
 
 ### Verifying milestone 1
 
@@ -51,7 +61,7 @@ show the backend version, round-trip latency, and echoed message.
    then the System Audio Recording prompt (first run only).
 2. Talk, and play something (music, a video) so both meters move.
 3. Stop. The card shows the two WAV paths under
-   `~/Library/Application Support/co.elastic.lilnote/recordings/<session>/`.
+   `~/Library/Application Support/com.lilnotes/recordings/<session>/`.
 4. Inspect: `afinfo mic.wav system.wav` (both 16 kHz mono 16-bit) and play
    them — mic.wav has only your voice, system.wav only the playback.
 
@@ -59,13 +69,13 @@ Rust unit tests (resampler + limiter): `cd src-tauri && cargo test`.
 
 **Troubleshooting capture**
 
-- *No system-audio prompt appears / OSStatus error on start:* the
+- _No system-audio prompt appears / OSStatus error on start:_ the
   system-audio TCC category requires a signed binary. Dev builds are ad-hoc
   signed, which normally works; if not, run `npm run tauri build` once and
   launch the bundled app from `src-tauri/target/release/bundle/macos/`.
-- *Re-test the prompts:* `tccutil reset Microphone co.elastic.lilnote` and
-  `tccutil reset SystemAudioCaptureRequests co.elastic.lilnote`.
-- *system.wav is silent:* make sure something is actually playing to the
+- _Re-test the prompts:_ `tccutil reset Microphone com.lilnotes` and
+  `tccutil reset SystemAudioCaptureRequests com.lilnotes`.
+- _system.wav is silent:_ make sure something is actually playing to the
   default output device (the tap follows the default output).
 
 ### Verifying milestone 3
@@ -104,7 +114,7 @@ the speaker count is unknown. Rust tests: `cd src-tauri && cargo test`.
 2. Rename a speaker and the meeting title, quit the app fully, relaunch —
    everything (transcript, labels, names, title) reloads from SQLite
    (`<app data>/lilnotes.sqlite3`).
-3. Meetings shows the history; search matches titles *and* transcript text;
+3. Meetings shows the history; search matches titles _and_ transcript text;
    hovering a row reveals delete.
 4. Settings → Storage: change the recordings folder (new sessions land
    there) and try "Delete audio after transcription" — after the next
@@ -146,24 +156,24 @@ ASR.
    with SQLCipher, so plain `sqlite3` reports "file is not a database" — that
    itself confirms encryption is active. To inspect rows, install
    `sqlcipher` (`brew install sqlcipher`), fetch the key from the Keychain
-   (`security find-generic-password -s co.elastic.lilnote -a db-key -w`),
+   (`security find-generic-password -s com.lilnotes -a db-key -w`),
    hex-encode it, and open with `PRAGMA key = "x'<64 hex chars>'"`.
 2. Record a **second** meeting with the same person. After diarization the
    chip should pre-fill "Priya" with a confidence % (dashed ring = suggested).
    Confirm it → `SELECT COUNT(*) FROM voiceprints;` increments (gallery grew).
 3. Negative: a brand-new voice stays `SPEAKER_xx` (no false auto-match).
-4. Adaptive case: in a meeting where Priya is *not* auto-matched (below
+4. Adaptive case: in a meeting where Priya is _not_ auto-matched (below
    threshold), manually assign her via the picker; confirm a new voiceprint
    row is enrolled, then re-run a similar later recording and check the
    confidence is higher / now clears the threshold.
 5. `delete_persona("Priya")` (Personas view) removes her voiceprints and
    nulls links; the transcript falls back to the raw `SPEAKER_xx` label.
 6. Encryption: on first launch a Keychain entry is created (service
-   `co.elastic.lilnote`, account `db-key` — verify with `security find-generic-password -s co.elastic.lilnote -a db-key`). Quit, relaunch — the DB
+   `com.lilnotes`, account `db-key` — verify with `security find-generic-password -s com.lilnotes -a db-key`). Quit, relaunch — the DB
    unlocks and all data reloads. `sqlite3` on the DB file reports "file is
    not a database" (encrypted). Deleting the Keychain item and relaunching
    makes the DB unreadable (intended factory-reset behavior). `cd src-tauri
-   && cargo test` passes (pack/unpack round-trip, cosine, threshold
+&& cargo test` passes (pack/unpack round-trip, cosine, threshold
    classification, CRUD — all with the fixed test key, no Keychain access).
 
 ## Architecture
@@ -190,7 +200,7 @@ biometric data at rest and never leave your Mac. Manage or delete them in
 **Encryption at rest.** The entire SQLite database (meetings, transcripts,
 summaries, personas, and voiceprints) is encrypted with SQLCipher. The
 256-bit key is generated on first run and stored in the macOS Keychain
-(service `co.elastic.lilnote`); it is protected by your login keychain
+(service `com.lilnotes`); it is protected by your login keychain
 (FileVault + user password). If the key is deleted, the database becomes
 unreadable — effectively a factory reset. Nothing in the database or the
 key ever leaves your Mac.
