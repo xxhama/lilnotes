@@ -27,6 +27,8 @@ jobs:
         working-directory: src-tauri
     steps:
       - uses: actions/checkout@v4
+      - name: Install meson/ninja (webrtc-audio-processing build deps)
+        run: brew install meson ninja pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
