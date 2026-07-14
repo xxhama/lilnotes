@@ -34,8 +34,11 @@ mkdir -p "$FRAMEWORKS"
 for lib in "${DYLIBS[@]}"; do
   SRC="$TARGET/$lib"
   if [ ! -f "$SRC" ]; then
-    echo "fix-bundle: $lib not found in $TARGET — skipping" >&2
-    continue
+    # Hard error: the app cannot run without these. A restored CI cache can
+    # leave the sherpa-rs build script "fresh" without re-copying its dylibs
+    # into target/release — shipping without them means a crash on launch.
+    echo "fix-bundle: ERROR: $lib not found in $TARGET" >&2
+    exit 1
   fi
   cp "$SRC" "$FRAMEWORKS/$lib"
   echo "  ✓ $lib"
