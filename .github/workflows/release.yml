@@ -1,0 +1,121 @@
+name: Release
+
+# Builds the macOS app when a version tag (v*) is pushed and uploads the DMG
+# + SHA-256 checksums to a DRAFT GitHub Release. Review the draft, edit notes
+# if needed, and click Publish.
+#
+# The app is ad-hoc signed (no Apple Developer ID yet), so the release notes
+# include the Gatekeeper workaround users need on first launch. When a
+# Developer ID is available, add proper codesign + notarytool steps here and
+# in scripts/fix-bundle.sh.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    # macos-latest is Apple Silicon (aarch64) — matches the app's only target.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches app version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match tauri.conf.json version $CONF_VERSION. Bump the version (package.json + src-tauri/tauri.conf.json + src-tauri/Cargo.toml) before tagging."
+            exit 1
+          fi
+
+      - name: Install meson/ninja (webrtc-audio-processing build deps)
+        run: brew install meson ninja pkg-config
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same cache config as ci.yml so release builds reuse CI caches.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          prefix-key: v1-rust
+          cache-directories: ~/Library/Caches/sherpa-rs
+
+      - name: Cache llama.cpp build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .llama.cpp
+            src-tauri/binaries
+          key: llama-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-llama-server.sh') }}
+
+      - run: npm ci
+
+      # Builds the llama-server sidecar, runs `tauri build`, then
+      # scripts/fix-bundle.sh (copies sherpa/onnxruntime dylibs into the .app,
+      # ad-hoc re-signs, and re-creates the DMG from the fixed bundle).
+      - name: Build app
+        run: npm run tauri:build
+
+      - name: Collect artifacts
+        id: artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG="src-tauri/target/release/bundle/dmg/LilNotes_${VERSION}_aarch64.dmg"
+          if [ ! -f "$DMG" ]; then
+            echo "::error::Expected DMG not found: $DMG"
+            ls -la src-tauri/target/release/bundle/dmg/ || true
+            exit 1
+          fi
+          mkdir -p dist-release
+          cp "$DMG" dist-release/
+          cd dist-release
+          shasum -a 256 ./* > checksums.txt
+          cat checksums.txt
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > release-notes.md <<'EOF'
+          ## Installation
+
+          1. Download `LilNotes_*_aarch64.dmg` below (Apple Silicon, macOS 26+ only).
+          2. Open the DMG and drag **LilNotes** to Applications.
+
+          ### First launch (important)
+
+          LilNotes is not yet notarized by Apple, so macOS will refuse to open
+          it with a "damaged" or "cannot be opened" warning. Two ways past it:
+
+          - Run this once in Terminal, then launch normally:
+
+            ```sh
+            xattr -cr /Applications/LilNotes.app
+            ```
+
+          - Or: try to open the app, then go to **System Settings → Privacy &
+            Security**, scroll down, and click **Open Anyway**.
+
+          ### Verify your download (optional)
+
+          ```sh
+          shasum -a 256 -c checksums.txt
+          ```
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "LilNotes $VERSION" \
+            --notes-file release-notes.md \
+            --generate-notes \
+            dist-release/*
