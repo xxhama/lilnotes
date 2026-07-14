@@ -65,7 +65,8 @@ echo "  ✓ signed"
 # BEFORE this script runs, so the shipped .dmg would contain the unfixed
 # app (no dylibs, no rpath). We rebuild it here from the corrected .app.
 DMG_DIR="$TARGET/bundle/dmg"
-DMG="$DMG_DIR/LilNotes_0.1.0_aarch64.dmg"
+VERSION=$(node -p "require('$ROOT/src-tauri/tauri.conf.json').version")
+DMG="$DMG_DIR/LilNotes_${VERSION}_aarch64.dmg"
 if [ -d "$DMG_DIR" ]; then
   echo "fix-bundle: re-creating .dmg from fixed .app…"
   rm -f "$DMG"
