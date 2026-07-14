@@ -1252,13 +1252,6 @@ impl Db {
             .map_err(|e| e.to_string())?;
         Ok(rows)
     }
-
-    /// The most recent summary for a meeting, or `None` if there isn't one.
-    /// Used by task extraction, which sources its candidate tasks from the
-    /// latest summary's action-items blocks.
-    pub fn get_latest_summary(&self, meeting_id: i64) -> Result<Option<SummaryRow>, String> {
-        Ok(self.list_summaries(meeting_id)?.into_iter().next())
-    }
 }
 
 impl Db {
