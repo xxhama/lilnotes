@@ -101,7 +101,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           ## Installation
 
-          1. Download `LilNotes_*_aarch64.dmg` below (Apple Silicon, macOS 26+ only).
+          1. Download `LilNotes_*_aarch64.dmg` below (Apple Silicon, macOS 15+ only).
           2. Open the DMG and drag **LilNotes** to Applications.
 
           ### First launch (important)
