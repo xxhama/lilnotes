@@ -60,6 +60,17 @@ jobs:
 
       - run: npm ci
 
+      # A full-match target/ restore marks the sherpa-rs-sys build script
+      # fresh, so it never re-copies its dylibs into target/release — and
+      # rust-cache prunes them from the saved cache. fix-bundle.sh needs
+      # them there to bundle into the .app; it fails hard if they're
+      # missing. Re-materialize from the cached download dir. No-op on a
+      # fresh build (the build script copies them itself; -n keeps those).
+      - name: Restore sherpa dylibs into target/release
+        run: |
+          mkdir -p src-tauri/target/release
+          find ~/Library/Caches/sherpa-rs -name '*.dylib' -exec cp -n {} src-tauri/target/release/ \; || true
+
       # Builds the llama-server sidecar, runs `tauri build`, then
       # scripts/fix-bundle.sh (copies sherpa/onnxruntime dylibs into the .app,
       # ad-hoc re-signs, and re-creates the DMG from the fixed bundle).
