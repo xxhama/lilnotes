@@ -32,9 +32,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # cache-directories: sherpa-rs-sys downloads the prebuilt sherpa-onnx /
+      # onnxruntime libs into ~/Library/Caches/sherpa-rs and the linker search
+      # path points there. Without caching that dir, a restored target/ (build
+      # script "fresh") + missing lib dir breaks linking for any NEW binary or
+      # example target. prefix-key v1 busted the poisoned pre-existing cache.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          prefix-key: v1-rust
+          cache-directories: ~/Library/Caches/sherpa-rs
       - run: cargo fmt --check
       # The lilnotes build script (tauri_build) validates that the
       # `binaries/llama-server-<triple>` sidecar resource declared in

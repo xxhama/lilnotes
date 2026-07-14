@@ -129,7 +129,7 @@ handlers. Single `Mutex<Connection>`. Migrations via `PRAGMA user_version`.
    runs, every sample is zero — no error anywhere):
    - TCC evaluates System Audio Recording against the process's
      **responsible process**. Anything spawned from a terminal pipeline
-     (cargo/npm/tauri dev) is attributed to the *terminal*, which has no
+     (cargo/npm/tauri dev) is attributed to the _terminal_, which has no
      `NSAudioCaptureUsageDescription` → denied with no prompt. The dev
      runner launches the app through `scripts/disclaim.c`
      (`responsibility_spawnattrs_setdisclaim` + `POSIX_SPAWN_SETEXEC`, the
