@@ -43,7 +43,6 @@ import TranscriptToolbar from "@/components/TranscriptToolbar";
 import PickerCombobox from "@/components/PickerCombobox";
 import SummaryPanel from "@/components/SummaryPanel";
 import TranscriptPane from "@/components/TranscriptPane";
-import MeetingTasksSection from "@/components/MeetingTasksSection";
 import { cn } from "@/lib/utils";
 import {
   confirmSpeakerPersona,
@@ -147,7 +146,7 @@ export default function MeetingDetailView({
   const [customers, setCustomers] = useState<CustomerSummary[]>([]);
   const [assigning, setAssigning] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [tab, setTab] = useState<"review" | "transcript" | "tasks">("review");
+  const [tab, setTab] = useState<"review" | "transcript">("review");
   /** When true, the transcript tab shows echo-marked + soft-deleted segments
    * (fetched via `listHiddenSegments`) with Unmark/Restore actions. */
   const [showHidden, setShowHidden] = useState(false);
@@ -805,7 +804,7 @@ export default function MeetingDetailView({
 
       {/* Tabs */}
       <div className="flex gap-1 border-b px-6 pt-2 pb-2">
-        {(["review", "transcript", "tasks"] as const).map((t) => (
+        {(["review", "transcript"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -946,31 +945,6 @@ export default function MeetingDetailView({
                 : "No transcript — the audio was deleted before transcription."}
             </div>
           )}
-        </div>
-
-        {/* Tasks tab: meeting-scoped tasks + create-from-meeting form. Stays
-            mounted (hidden via CSS) like the other panes so its add-form state
-            survives tab switches. */}
-        <div className={"absolute inset-0 overflow-y-auto " + (tab === "tasks" ? "" : "hidden")}>
-          <MeetingTasksSection
-            meetingId={id}
-            meetingCustomerId={meeting.customerId}
-            customers={customers}
-            onCreateCustomer={createCustomerInline}
-            onNavigate={onNavigate}
-            hasTranscript={hasTranscript}
-            onJumpToTranscript={
-              hasTranscript
-                ? (ms) => {
-                    setTab("transcript");
-                    // Seek drives the audio player (rendered only with audio);
-                    // without audio it's inert, but switching to the transcript
-                    // tab still shows the discussion at this offset.
-                    setSeek((prev) => ({ ms, n: (prev?.n ?? 0) + 1 }));
-                  }
-                : undefined
-            }
-          />
         </div>
       </div>
 

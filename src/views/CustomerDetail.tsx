@@ -10,7 +10,6 @@ import {
   Calendar,
   Clock,
   Loader2,
-  ListTodo,
   Merge,
   Search,
   Trash2,
@@ -19,7 +18,6 @@ import {
 
 import CustomerAvatar from "@/components/CustomerAvatar";
 import CustomerSummaryPanel from "@/components/CustomerSummaryPanel";
-import CustomerTasksSection from "@/components/CustomerTasksSection";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -267,7 +265,6 @@ export default function CustomerDetailView({ customerId, focusMeetings, onNaviga
     { icon: Calendar, label: "First contact", value: fmtDate(customer.firstMeetingAtMs) },
     { icon: Users, label: "Roster", value: String(customer.personaRoster.length) },
     { icon: Clock, label: "Total time", value: fmtDuration(customer.totalDurationMs) },
-    { icon: ListTodo, label: "Open tasks", value: String(customer.openTaskCount) },
   ];
 
   return (
@@ -466,9 +463,6 @@ export default function CustomerDetailView({ customerId, focusMeetings, onNaviga
                 </div>
               )}
             </section>
-
-            {/* Tasks (scoped to this customer) */}
-            <CustomerTasksSection customerId={id} onNavigate={onNavigate} />
 
             {/* Persona roster (derived) */}
             <section className="space-y-1.5">
