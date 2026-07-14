@@ -124,10 +124,30 @@ handlers. Single `Mutex<Connection>`. Migrations via `PRAGMA user_version`.
    (`security find-generic-password -s com.lilnotes -a db-key -w`),
    hex-encode it, open with `PRAGMA key = "x'<64 hex chars>'"`.
 
-6. **TCC permissions.** System audio prompt only fires for signed binaries.
-   Dev builds are ad-hoc signed (normally works). If no prompt appears: run
-   `npm run tauri:build` once and launch the bundled `.app`. Reset prompts:
-   `tccutil reset SystemAudioCaptureRequests com.lilnotes`.
+6. **TCC permissions — dev system audio records SILENCE without the
+   runner.** Two traps, both dev-only, both silent (tap creates fine, IOProc
+   runs, every sample is zero — no error anywhere):
+   - TCC evaluates System Audio Recording against the process's
+     **responsible process**. Anything spawned from a terminal pipeline
+     (cargo/npm/tauri dev) is attributed to the *terminal*, which has no
+     `NSAudioCaptureUsageDescription` → denied with no prompt. The dev
+     runner launches the app through `scripts/disclaim.c`
+     (`responsibility_spawnattrs_setdisclaim` + `POSIX_SPAWN_SETEXEC`, the
+     Chromium/VS Code trick) so the app is self-responsible, as if launched
+     from Finder.
+   - The grant is keyed to the code signature. A bare `cargo run` binary is
+     only linker-signed (identity = per-build cdhash), so any grant dies on
+     rebuild. The runner wraps the binary in a signed
+     `target/debug/LilNotesDev.app` (stable id `com.lilnotes.dev`, same
+     shape as the release bundle) before launching.
+
+   Wiring: `src-tauri/.cargo/config.toml` sets
+   `scripts/macos-dev-runner.sh` as the cargo runner; `tauri dev` uses
+   `cargo run`, so it flows through automatically. Do not bypass it.
+   Diagnose capture headlessly with `cargo run --example tap_probe`
+   (prints a SILENCE/OK verdict). Reset prompts:
+   `tccutil reset SystemAudioCaptureRequests com.lilnotes.dev` (release:
+   `com.lilnotes`).
 
 7. **Post-build dylib fixup.** `scripts/fix-bundle.sh` copies
    sherpa-rs/onnxruntime dylibs into the `.app` bundle and fixes rpath.

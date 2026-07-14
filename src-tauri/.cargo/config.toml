@@ -1,0 +1,7 @@
+# Dev-run hook: wrap the compiled binary in a signed .app bundle before
+# launching, so macOS TCC gives `tauri dev` the same stable System Audio
+# Recording identity the release bundle gets. See the script header for the
+# full story. Test/example binaries pass through untouched.
+# (Config-relative path: resolved against src-tauri/, the parent of .cargo/.)
+[target.aarch64-apple-darwin]
+runner = "../scripts/macos-dev-runner.sh"
