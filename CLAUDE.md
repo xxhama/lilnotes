@@ -8,7 +8,7 @@ locally running Ollama model. No cloud, no telemetry, no Python at runtime.
 frontend), SQLite with SQLCipher encryption, whisper.cpp (Metal), sherpa-onnx
 diarization, llama.cpp sidecar + Ollama for summaries.
 
-**Target:** Apple Silicon, macOS 26 (Tahoe)+. Bundle ID: `com.lilnotes`.
+**Target:** Apple Silicon, macOS 15 (Sequoia)+. Bundle ID: `com.lilnotes`.
 
 ## Build / run / test commands
 
@@ -156,7 +156,8 @@ handlers. Single `Mutex<Connection>`. Migrations via `PRAGMA user_version`.
 8. **`useTauriEvent` hook.** Use `src/lib/useTauriEvent.ts`, not raw
    `listen()`. The hook handles a React StrictMode double-mount race.
 
-9. **macOS 26+ only.** `tauri.conf.json` sets `minimumSystemVersion: "26.0"`.
+9. **macOS 15+ only.** `tauri.conf.json` sets `minimumSystemVersion: "15.0"`.
+   Development happens on macOS 26 (Tahoe); older releases are less tested.
 
 10. **AEC architecture.** WebRTC APM is used (not Apple's AEC) because
     Apple's voice processing can't reference other apps' audio. The
