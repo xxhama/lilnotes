@@ -9,7 +9,10 @@ import { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, Download, ExternalLink, HelpCircle, X, XCircle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import {
   cancelModelDownload,
   deleteAllVoiceprints,
@@ -22,6 +25,7 @@ import {
   probeSystemAudioPermission,
   requestMicPermission,
   updateSettings,
+  type AecAggressiveness,
   type AppSettings,
   type AsrModelInfo,
   type DownloadProgress,
@@ -63,26 +67,9 @@ function StatusBadge({ status }: { status: PermissionStatus | SysAudioState | nu
   );
 }
 
-/** Simple styled toggle (no extra Radix dep needed yet). */
+/** Themed toggle backed by the shadcn Switch primitive (checked/onCheckedChange). */
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      role="switch"
-      aria-checked={checked}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "inline-flex h-6 w-10 shrink-0 items-center rounded-full transition-colors",
-        checked ? "bg-primary" : "bg-input",
-      )}
-    >
-      <span
-        className={cn(
-          "size-4.5 rounded-full bg-primary-foreground shadow transition-transform",
-          checked ? "translate-x-[1.125rem]" : "translate-x-[0.1875rem]",
-        )}
-      />
-    </button>
-  );
+  return <Switch checked={checked} onCheckedChange={onChange} />;
 }
 
 export default function SettingsView() {
@@ -331,7 +318,7 @@ export default function SettingsView() {
               </Button>
             )}
           </div>
-          <textarea
+          <Textarea
             value={settings?.summaryTemplate ?? templatePlaceholder}
             onChange={(e) =>
               settings && setSettings({ ...settings, summaryTemplate: e.target.value })
@@ -346,7 +333,7 @@ export default function SettingsView() {
             }}
             rows={8}
             spellCheck={false}
-            className="w-full resize-y rounded-md border bg-background p-2 font-mono text-xs leading-relaxed outline-none focus:border-ring"
+            className="w-full resize-y rounded-md bg-background px-2 py-2 font-mono text-xs leading-relaxed"
             data-selectable
           />
         </div>
@@ -366,7 +353,7 @@ export default function SettingsView() {
             </p>
             <label className="flex items-center justify-between gap-3 text-xs">
               <span>Auto-suggest (pre-fill)</span>
-              <input
+              <Input
                 type="number"
                 step="0.01"
                 min="0"
@@ -379,12 +366,12 @@ export default function SettingsView() {
                     personaAutoThreshold: parseFloat(e.target.value) || 0,
                   })
                 }
-                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+                className="h-7 w-20 rounded-md bg-background px-2 text-right"
               />
             </label>
             <label className="flex items-center justify-between gap-3 text-xs">
               <span>Tentative suggestion</span>
-              <input
+              <Input
                 type="number"
                 step="0.01"
                 min="0"
@@ -397,12 +384,12 @@ export default function SettingsView() {
                     personaSuggestThreshold: parseFloat(e.target.value) || 0,
                   })
                 }
-                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+                className="h-7 w-20 rounded-md bg-background px-2 text-right"
               />
             </label>
             <label className="flex items-center justify-between gap-3 text-xs">
               <span>Live auto-identify</span>
-              <input
+              <Input
                 type="number"
                 step="0.01"
                 min="0"
@@ -415,12 +402,12 @@ export default function SettingsView() {
                     personaLiveThreshold: parseFloat(e.target.value) || 0,
                   })
                 }
-                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+                className="h-7 w-20 rounded-md bg-background px-2 text-right"
               />
             </label>
             <label className="flex items-center justify-between gap-3 text-xs">
               <span>Voiceprints per persona (cap)</span>
-              <input
+              <Input
                 type="number"
                 step="1"
                 min="0"
@@ -432,7 +419,7 @@ export default function SettingsView() {
                     voiceprintGalleryCap: parseInt(e.target.value, 10) || 0,
                   })
                 }
-                className="h-7 w-20 rounded-md border bg-background px-2 text-right outline-none focus:border-ring"
+                className="h-7 w-20 rounded-md bg-background px-2 text-right"
               />
             </label>
           </div>
@@ -489,6 +476,39 @@ export default function SettingsView() {
                 onChange={(v) => saveSettings({ ...settings, aecEnabled: v })}
               />
             )}
+          </div>
+
+          <div className={cn("space-y-3 p-4", !settings?.aecEnabled && "opacity-60")}>
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Echo suppression</div>
+              <p className="text-xs text-muted-foreground">
+                Stronger removes more speaker echo from your mic (the loud-speakers / quiet-room
+                case). May slightly dull your own voice at Maximum.
+              </p>
+            </div>
+            <RadioGroup
+              value={settings?.aecAggressiveness}
+              onValueChange={(v) =>
+                settings && saveSettings({ ...settings, aecAggressiveness: v as AecAggressiveness })
+              }
+              disabled={!settings?.aecEnabled}
+              className="grid grid-cols-3 gap-2"
+            >
+              {(["balanced", "strong", "maximum"] as const).map((lvl) => (
+                <label
+                  key={lvl}
+                  className={cn(
+                    "flex items-center justify-center gap-2 rounded-md border border-input bg-card px-3 py-2 text-sm capitalize shadow-xs transition-[color,box-shadow]",
+                    settings?.aecAggressiveness === lvl &&
+                      "border-ring text-foreground ring-1 ring-ring/40",
+                    !settings?.aecEnabled && "cursor-not-allowed",
+                  )}
+                >
+                  <RadioGroupItem value={lvl} disabled={!settings?.aecEnabled} />
+                  {lvl}
+                </label>
+              ))}
+            </RadioGroup>
           </div>
 
           <div className="flex items-center justify-between gap-4 p-4">

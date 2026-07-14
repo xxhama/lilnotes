@@ -13,6 +13,7 @@
 pub mod ollama;
 pub mod sidecar;
 
+use chrono::Local;
 use serde::Serialize;
 
 use crate::asr::Segment;
@@ -34,7 +35,10 @@ impl SummaryBackend {
 }
 
 /// Built-in speaker-aware summary template. Users can override it in
-/// Settings; `{transcript}` and `{title}` are substituted at run time.
+/// Settings; `{transcript}`, `{title}`, and `{today}` are substituted at run
+/// time. The default template no longer uses `{today}` (priority and due dates
+/// are decided by the extraction flow, not the summary), but it's kept for
+/// custom templates that want a calendar anchor.
 pub const DEFAULT_TEMPLATE: &str = r#"You are an expert meeting-notes assistant. Below is the transcript of a meeting ("{title}"), with timestamps and speaker names.
 
 Write a concise summary in Markdown with exactly these sections:
@@ -45,8 +49,11 @@ Write a concise summary in Markdown with exactly these sections:
 ## Key decisions
 Bullet list of decisions that were actually made (not merely discussed). If none, write "None".
 
-## Action items
-Bullet list grouped by owner (use the speaker names from the transcript). Include deadlines if mentioned. If none, write "None".
+## My action items
+Concrete things the note-taker ("Me") will DO — not decisions or topics. Only include an item here if "Me" clearly agreed to do it; if ownership is unclear or it belongs to someone else, put it under "Action items (others)". Keep each item on a single bullet line, phrased naturally. One action per bullet — if a single commitment covers two distinct actions (often joined by "and", "then", or a comma), split them into separate bullets rather than one compound bullet. If none, write "None".
+
+## Action items (others)
+Concrete things others will DO — not decisions or topics — grouped by owner. Keep each item on a single bullet line, phrased naturally, one action per bullet (split "and"/comma compounds into separate bullets), and end with ` — **Owner**` (use the speaker names from the transcript). If none, write "None".
 
 ## Open questions
 Bullet list of unresolved questions or topics deferred for later. If none, write "None".
@@ -192,6 +199,21 @@ pub fn build_prompt(template: &str, title: &str, transcript: &str) -> String {
     template
         .replace("{title}", title)
         .replace("{transcript}", transcript)
+        .replace("{today}", &Local::now().format("%Y-%m-%d").to_string())
+}
+
+/// Prompt for generating a short meeting title from the just-generated
+/// summary. `{summary}` is substituted with the summary content. Kept short
+/// so the second LLM call (after the summary streams in) is fast.
+pub const DEFAULT_TITLE_TEMPLATE: &str = r#"You are naming a meeting. Based on the summary below, write a concise, descriptive title in 3 to 8 words. Do not include surrounding quotes, trailing punctuation, or generic prefixes like "Meeting about". Output only the title on a single line.
+
+Summary:
+
+{summary}"#;
+
+/// Fill the title-template `{summary}` placeholder.
+pub fn build_title_prompt(summary: &str) -> String {
+    DEFAULT_TITLE_TEMPLATE.replace("{summary}", summary)
 }
 
 /// Payload of the `summary:token` event.
@@ -264,5 +286,18 @@ mod tests {
     fn template_substitution() {
         let p = build_prompt("T={title} X={transcript}", "Standup", "hello");
         assert_eq!(p, "T=Standup X=hello");
+    }
+
+    #[test]
+    fn today_substitution() {
+        // A template with {today} gets a YYYY-MM-DD-shaped date.
+        let p = build_prompt("{today}", "Standup", "hello");
+        assert!(
+            chrono::NaiveDate::parse_from_str(&p, "%Y-%m-%d").is_ok(),
+            "expected a YYYY-MM-DD date, got {p}"
+        );
+        // A template without {today} is unchanged (no-op replace).
+        let p2 = build_prompt("T={title} X={transcript}", "Standup", "hello");
+        assert_eq!(p2, "T=Standup X=hello");
     }
 }

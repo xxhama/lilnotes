@@ -5,6 +5,14 @@ import { ExternalLink, Loader2, RefreshCw, Sparkles } from "lucide-react";
 import ThinkingDisplay from "@/components/ThinkingDisplay";
 
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   getSettings,
   listNativeModels,
@@ -23,6 +31,9 @@ import { useTauriEvent } from "@/lib/useTauriEvent";
 interface Props {
   meetingId: number;
   hasTranscript: boolean;
+  /** Called with a short AI-generated title when summarization produces one
+   * (only when the meeting still had the default placeholder title). */
+  onTitleGenerated?: (title: string) => void;
 }
 
 /** Minimal markdown rendering: headings + bullets; everything else as text. */
@@ -67,7 +78,7 @@ export function Markdown({ text, className = "text-sm" }: { text: string; classN
  * saved summary, generates new ones token-by-token. Dispatches to the
  * built-in (llama.cpp) or Ollama backend based on settings.
  */
-export default function SummaryPanel({ meetingId, hasTranscript }: Props) {
+export default function SummaryPanel({ meetingId, hasTranscript, onTitleGenerated }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [nativeModels, setNativeModels] = useState<NativeLlmModelInfo[]>([]);
   const [ollamaReachable, setOllamaReachable] = useState<boolean | null>(null);
@@ -147,6 +158,7 @@ export default function SummaryPanel({ meetingId, hasTranscript }: Props) {
         content: result.content,
         createdAtMs: Date.now(),
       });
+      if (result.title) onTitleGenerated?.(result.title);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -154,7 +166,7 @@ export default function SummaryPanel({ meetingId, hasTranscript }: Props) {
       setThinkingText(null);
       setBusy(false);
     }
-  }, [meetingId, model]);
+  }, [meetingId, model, onTitleGenerated]);
 
   const isOllama = settings?.summaryBackend === "ollama";
 
@@ -221,18 +233,18 @@ export default function SummaryPanel({ meetingId, hasTranscript }: Props) {
         <span className="text-xs font-medium text-muted-foreground">Summary</span>
         <div className="flex items-center gap-2">
           {hasModels && (
-            <select
-              value={model ?? ""}
-              onChange={(e) => setModel(e.target.value)}
-              disabled={busy}
-              className="h-7 max-w-40 rounded-md border bg-card px-1.5 text-xs outline-none focus:border-ring"
-            >
-              {pickerModels.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+            <Select value={model ?? undefined} onValueChange={(v) => setModel(v)} disabled={busy}>
+              <SelectTrigger size="sm" className="max-w-40 bg-card text-xs">
+                <SelectValue placeholder="Model" />
+              </SelectTrigger>
+              <SelectContent position="popper">
+                {pickerModels.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           )}
           <Button size="sm" onClick={generate} disabled={busy || !hasTranscript || !hasModels}>
             {busy ? <Loader2 className="animate-spin" /> : <Sparkles />}
@@ -257,40 +269,42 @@ export default function SummaryPanel({ meetingId, hasTranscript }: Props) {
         </div>
       )}
 
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-4">
-        {!hasModels && (
-          <p className="text-xs text-muted-foreground">
-            {isOllama
-              ? "No Ollama models installed yet — pull one in Settings → Summaries."
-              : "No built-in model downloaded — download one in Settings → Summaries."}
-          </p>
-        )}
-        {error && <p className="pb-2 text-xs text-destructive">{error}</p>}
-
-        {showText ? (
-          <>
-            <Markdown text={showText} />
-            {streaming !== null && (
-              <Loader2 className="mt-2 size-3.5 animate-spin text-muted-foreground" />
-            )}
-            {saved && streaming === null && (
-              <p className="pt-3 text-[11px] text-muted-foreground/70">
-                {saved.model} · {new Date(saved.createdAtMs).toLocaleString()}
-              </p>
-            )}
-          </>
-        ) : (
-          !error &&
-          hasModels &&
-          !busy && (
+      <ScrollArea className="min-h-0 flex-1" viewportRef={scrollRef}>
+        <div className="p-4">
+          {!hasModels && (
             <p className="text-xs text-muted-foreground">
-              {hasTranscript
-                ? "Generate an on-device summary of this meeting."
-                : "Transcribe the meeting first, then summarize it."}
+              {isOllama
+                ? "No Ollama models installed yet — pull one in Settings → Summaries."
+                : "No built-in model downloaded — download one in Settings → Summaries."}
             </p>
-          )
-        )}
-      </div>
+          )}
+          {error && <p className="pb-2 text-xs text-destructive">{error}</p>}
+
+          {showText ? (
+            <>
+              <Markdown text={showText} />
+              {streaming !== null && (
+                <Loader2 className="mt-2 size-3.5 animate-spin text-muted-foreground" />
+              )}
+              {saved && streaming === null && (
+                <p className="pt-3 text-[11px] text-muted-foreground/70">
+                  {saved.model} · {new Date(saved.createdAtMs).toLocaleString()}
+                </p>
+              )}
+            </>
+          ) : (
+            !error &&
+            hasModels &&
+            !busy && (
+              <p className="text-xs text-muted-foreground">
+                {hasTranscript
+                  ? "Generate an on-device summary of this meeting."
+                  : "Transcribe the meeting first, then summarize it."}
+              </p>
+            )
+          )}
+        </div>
+      </ScrollArea>
     </div>
   );
 }

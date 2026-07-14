@@ -3,6 +3,39 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Live AEC aggressiveness preset. Stronger suppression removes more speaker
+/// echo from the mic (the loud-speaker / quiet-room case) at the cost of
+/// possibly dulling the user's own voice. Only meaningful when `aec_enabled`.
+/// Tuned in `audio::aec::new_aec_pair` — see the preset table there.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AecAggressiveness {
+    Balanced,
+    #[default]
+    Strong,
+    Maximum,
+}
+
+impl AecAggressiveness {
+    /// String key persisted in the `settings` table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AecAggressiveness::Balanced => "balanced",
+            AecAggressiveness::Strong => "strong",
+            AecAggressiveness::Maximum => "maximum",
+        }
+    }
+
+    /// Parse a persisted key, falling back to the default on anything unknown.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "balanced" => AecAggressiveness::Balanced,
+            "maximum" => AecAggressiveness::Maximum,
+            _ => AecAggressiveness::Strong,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
@@ -37,6 +70,9 @@ pub struct AppSettings {
     /// WebRTC's. On by default — disable only when using headphones (no echo
     /// to cancel) or if you prefer the raw mic.
     pub aec_enabled: bool,
+    /// AEC aggressiveness preset (Balanced/Strong/Maximum). Stronger = less
+    /// speaker echo but may slightly dull the user's own voice. Default Strong.
+    pub aec_aggressiveness: AecAggressiveness,
     /// Whether the first-launch onboarding wizard has been completed.
     pub onboarding_complete: bool,
 }
@@ -56,6 +92,7 @@ impl Default for AppSettings {
             persona_live_threshold: 0.72,
             voiceprint_gallery_cap: 150,
             aec_enabled: true,
+            aec_aggressiveness: AecAggressiveness::default(),
             onboarding_complete: false,
         }
     }

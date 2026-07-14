@@ -96,6 +96,9 @@ pub struct MeetingDetail {
     pub ended_at_ms: Option<i64>,
     pub mic_wav: Option<String>,
     pub system_wav: Option<String>,
+    /// Path to an offline echo-cleaned mic WAV, if `clean_echo` has been run.
+    /// The UI / AudioPlayer / re-transcribe prefer this over `mic_wav`.
+    pub mic_cleaned_wav: Option<String>,
     pub notes: Option<String>,
     /// Wall-clock epoch ms of the last `update_notes` write; null until notes
     /// have ever been saved. Surfaced to the UI for the "Saved at" tooltip.
@@ -108,6 +111,28 @@ pub struct MeetingDetail {
     pub speaker_count: i64,
     /// Customer (account) this meeting belongs to; null = unassigned.
     pub customer_id: Option<i64>,
+    /// Number of segments hidden from the default transcript (echo-marked or
+    /// soft-deleted). Drives the "Show N hidden" toggle in the UI.
+    pub hidden_segment_count: i64,
+    /// Whisper model id that produced this meeting's transcript (e.g.
+    /// "large-v3-turbo"). Recorded at transcription time; null for meetings
+    /// transcribed before this column existed. The Meeting Detail UI shows it
+    /// as "Transcribed with: <label>" and defaults the re-transcribe dropdown
+    /// to it. Echo-clean re-transcribes keep this model instead of jumping to
+    /// the current global setting.
+    pub asr_model: Option<String>,
+}
+
+/// A saved echo/delete mark on a segment, keyed by `(source, start_ms)` so it
+/// can be re-applied after a re-transcribe replaces the segment rows (new ids,
+/// possibly slightly shifted timestamps). Short-lived: snapshoted before a
+/// `replace_segments` and dropped right after `reapply_marks`.
+#[derive(Clone)]
+pub struct SegmentMark {
+    pub source: String,
+    pub start_ms: u64,
+    pub kind: String,
+    pub deleted: bool,
 }
 
 impl Db {
@@ -266,6 +291,84 @@ impl Db {
             )
             .map_err(|e| format!("migration to v4 failed: {e}"))?;
         }
+        if version < 5 {
+            // Echo handling: per-segment kind ('speech' | 'echo') + soft-delete
+            // flag, and a cleaned-mic path on the meeting (written by the
+            // offline echo re-processing command). Defaults make existing rows
+            // appear as normal speech / not-deleted / no cleaned mic.
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE segments ADD COLUMN kind TEXT NOT NULL DEFAULT 'speech';
+                ALTER TABLE segments ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE meetings ADD COLUMN mic_cleaned_wav TEXT;
+                PRAGMA user_version = 5;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v5 failed: {e}"))?;
+        }
+        if version < 6 {
+            // Per-meeting ASR model tracking. Records which whisper model
+            // produced each meeting's transcript, so the UI can show it and
+            // re-transcribe with the same (or a different) model without
+            // touching the global live setting. Nullable: meetings transcribed
+            // before this migration have NULL and the UI treats that as
+            // "unknown" (no "Transcribed with" label; dropdown defaults to the
+            // global active model).
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE meetings ADD COLUMN asr_model TEXT;
+                PRAGMA user_version = 6;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v6 failed: {e}"))?;
+        }
+        if version < 7 {
+            // Tasks: to-dos tied to a customer, created manually or AI-extracted
+            // from a transcript. `customer_id` is nullable to hold customer-less
+            // AI suggestions until they're accepted (a customer is assigned at
+            // accept time); manual creation always sets it. `ON DELETE CASCADE`
+            // on customer_id is a deliberate product choice — deleting a customer
+            // takes its tasks with it (unlike meetings, which are orphaned).
+            // `source_meeting_id` is `ON DELETE SET NULL` so an accepted task
+            // survives its meeting being deleted (it just loses the link);
+            // pending suggestions are dropped app-level in `delete_meeting`.
+            // The transcript-segment reference is a *timestamp anchor*
+            // (`source_start_ms`), NOT a `segments.id` FK — segment ids are
+            // unstable across re-transcribe (see `replace_segments`); resolve to
+            // a segment at display time with the same ±250ms tolerance
+            // `reapply_marks` uses.
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE tasks(
+                    id                INTEGER PRIMARY KEY,
+                    customer_id       INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+                    source_meeting_id INTEGER REFERENCES meetings(id)  ON DELETE SET NULL,
+                    source_start_ms   INTEGER,
+                    source_end_ms     INTEGER,
+                    snippet           TEXT,
+                    title             TEXT NOT NULL,
+                    description       TEXT,
+                    status            TEXT NOT NULL DEFAULT 'open',
+                    priority          TEXT NOT NULL DEFAULT 'normal',
+                    due_at            INTEGER,
+                    origin            TEXT NOT NULL DEFAULT 'manual',
+                    created_at        INTEGER NOT NULL,
+                    completed_at      INTEGER
+                );
+                CREATE INDEX idx_tasks_customer ON tasks(customer_id, status);
+                CREATE INDEX idx_tasks_meeting  ON tasks(source_meeting_id, status);
+                CREATE INDEX idx_tasks_due      ON tasks(due_at, status);
+                PRAGMA user_version = 7;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v7 failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -333,6 +436,9 @@ impl Db {
         if let Some(v) = get("aec_enabled") {
             s.aec_enabled = v == "true";
         }
+        if let Some(v) = get("aec_aggressiveness") {
+            s.aec_aggressiveness = crate::settings::AecAggressiveness::parse(&v);
+        }
         if let Some(v) = get("onboarding_complete") {
             s.onboarding_complete = v == "true";
         }
@@ -382,6 +488,10 @@ impl Db {
             s.voiceprint_gallery_cap.to_string(),
         )?;
         put("aec_enabled", s.aec_enabled.to_string())?;
+        put(
+            "aec_aggressiveness",
+            s.aec_aggressiveness.as_str().to_string(),
+        )?;
         put("onboarding_complete", s.onboarding_complete.to_string())?;
         put("summary_backend", s.summary_backend.clone())?;
         Ok(())
@@ -509,9 +619,9 @@ impl Db {
 
     pub fn get_meeting(&self, id: i64) -> Result<MeetingDetail, String> {
         let conn = self.conn.lock().unwrap();
-        let (session_id, title, started_at_ms, ended_at_ms, mic_wav, system_wav, notes, notes_updated_at_ms, customer_id) = conn
+        let (session_id, title, started_at_ms, ended_at_ms, mic_wav, system_wav, mic_cleaned_wav, notes, notes_updated_at_ms, customer_id, asr_model) = conn
             .query_row(
-                "SELECT session_id, title, started_at, ended_at, mic_wav, system_wav, notes, notes_updated_at, customer_id
+                "SELECT session_id, title, started_at, ended_at, mic_wav, system_wav, mic_cleaned_wav, notes, notes_updated_at, customer_id, asr_model
                  FROM meetings WHERE id = ?1",
                 params![id],
                 |r| {
@@ -523,8 +633,10 @@ impl Db {
                         r.get::<_, Option<String>>(4)?,
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
-                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<String>>(7)?,
                         r.get::<_, Option<i64>>(8)?,
+                        r.get::<_, Option<i64>>(9)?,
+                        r.get::<_, Option<String>>(10)?,
                     ))
                 },
             )
@@ -533,24 +645,41 @@ impl Db {
         let segments: Vec<Segment> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT source, speaker, start_ms, end_ms, text FROM segments
-                     WHERE meeting_id = ?1 ORDER BY start_ms",
+                    // Hide echo-marked + soft-deleted segments from the default
+                    // transcript + summary (user chose "hide entirely"). The
+                    // "show hidden" UI path uses `meeting_segments_all`.
+                    "SELECT id, source, speaker, start_ms, end_ms, text, kind, deleted
+                     FROM segments
+                     WHERE meeting_id = ?1 AND deleted = 0 AND kind = 'speech'
+                     ORDER BY start_ms",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map(params![id], |r| {
                     Ok(Segment {
-                        source: r.get(0)?,
-                        speaker: r.get(1)?,
-                        start_ms: r.get::<_, i64>(2)? as u64,
-                        end_ms: r.get::<_, i64>(3)? as u64,
-                        text: r.get(4)?,
+                        id: r.get(0)?,
+                        source: r.get(1)?,
+                        speaker: r.get(2)?,
+                        start_ms: r.get::<_, i64>(3)? as u64,
+                        end_ms: r.get::<_, i64>(4)? as u64,
+                        text: r.get(5)?,
+                        kind: r.get(6)?,
+                        deleted: r.get::<_, i64>(7)? == 1,
                     })
                 })
                 .map_err(|e| e.to_string())?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?
         };
+
+        let hidden_segment_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments
+                 WHERE meeting_id = ?1 AND (deleted = 1 OR kind = 'echo')",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
 
         let renames: std::collections::HashMap<String, String> = {
             let mut stmt = conn
@@ -611,6 +740,7 @@ impl Db {
             ended_at_ms,
             mic_wav,
             system_wav,
+            mic_cleaned_wav,
             notes,
             notes_updated_at_ms,
             segments,
@@ -618,6 +748,8 @@ impl Db {
             speaker_links,
             speaker_count,
             customer_id,
+            hidden_segment_count,
+            asr_model,
         })
     }
 
@@ -700,6 +832,20 @@ impl Db {
             .optional()
             .map_err(|e| e.to_string())?
             .unwrap_or((None, None));
+        // Tasks: pending AI suggestions only make sense in this meeting's
+        // context, so drop them. Accepted tasks (open/done) survive but lose
+        // their meeting link (the FK is ON DELETE SET NULL; this is explicit so
+        // the rows are updated before the meeting row goes).
+        conn.execute(
+            "DELETE FROM tasks WHERE source_meeting_id = ?1 AND status = 'suggested'",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE tasks SET source_meeting_id = NULL WHERE source_meeting_id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM meetings WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         Ok(wavs)
@@ -712,6 +858,51 @@ impl Db {
             .unwrap()
             .execute(
                 "UPDATE meetings SET mic_wav = NULL, system_wav = NULL WHERE id = ?1",
+                params![id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Record the path of an offline echo-cleaned mic WAV produced by
+    /// `clean_echo`. The original `mic.wav` is preserved so the action is
+    /// revertible via `clear_mic_cleaned_wav`.
+    pub fn set_mic_cleaned_wav(&self, id: i64, path: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET mic_cleaned_wav = ?2 WHERE id = ?1",
+                params![id, path],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Record which whisper model produced this meeting's transcript. Called
+    /// after every successful transcription (first-pass, re-transcribe, and
+    /// echo-clean re-transcribe) so the UI can show "Transcribed with" and
+    /// default the re-transcribe dropdown to it.
+    pub fn set_meeting_asr_model(&self, id: i64, model_id: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET asr_model = ?2 WHERE id = ?1",
+                params![id, model_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drop the echo-cleaned mic WAV pointer, reverting to the original
+    /// `mic.wav` for playback and re-transcription.
+    pub fn clear_mic_cleaned_wav(&self, id: i64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET mic_cleaned_wav = NULL WHERE id = ?1",
                 params![id],
             )
             .map(|_| ())
@@ -734,8 +925,8 @@ impl Db {
         {
             let mut stmt = tx
                 .prepare(
-                    "INSERT INTO segments(meeting_id, source, speaker, start_ms, end_ms, text)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO segments(meeting_id, source, speaker, start_ms, end_ms, text, kind, deleted)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .map_err(|e| e.to_string())?;
             for s in segments {
@@ -745,7 +936,9 @@ impl Db {
                     s.speaker,
                     s.start_ms as i64,
                     s.end_ms as i64,
-                    s.text
+                    s.text,
+                    s.kind,
+                    s.deleted as i64
                 ])
                 .map_err(|e| e.to_string())?;
             }
@@ -801,24 +994,133 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT source, speaker, start_ms, end_ms, text FROM segments
-                 WHERE meeting_id = ?1 ORDER BY start_ms",
+                // Default view: hide echo-marked + soft-deleted segments.
+                "SELECT id, source, speaker, start_ms, end_ms, text, kind, deleted
+                 FROM segments
+                 WHERE meeting_id = ?1 AND deleted = 0 AND kind = 'speech'
+                 ORDER BY start_ms",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![id], |r| {
                 Ok(Segment {
-                    source: r.get(0)?,
-                    speaker: r.get(1)?,
-                    start_ms: r.get::<_, i64>(2)? as u64,
-                    end_ms: r.get::<_, i64>(3)? as u64,
-                    text: r.get(4)?,
+                    id: r.get(0)?,
+                    source: r.get(1)?,
+                    speaker: r.get(2)?,
+                    start_ms: r.get::<_, i64>(3)? as u64,
+                    end_ms: r.get::<_, i64>(4)? as u64,
+                    text: r.get(5)?,
+                    kind: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? == 1,
                 })
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(rows)
+    }
+
+    /// Every segment for a meeting, including echo-marked + soft-deleted ones,
+    /// with `kind`/`deleted` populated. Used by the "show hidden" UI path and
+    /// by `clean_echo` to collect echo windows.
+    pub fn meeting_segments_all(&self, id: i64) -> Result<Vec<Segment>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source, speaker, start_ms, end_ms, text, kind, deleted
+                 FROM segments WHERE meeting_id = ?1 ORDER BY start_ms",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![id], |r| {
+                Ok(Segment {
+                    id: r.get(0)?,
+                    source: r.get(1)?,
+                    speaker: r.get(2)?,
+                    start_ms: r.get::<_, i64>(3)? as u64,
+                    end_ms: r.get::<_, i64>(4)? as u64,
+                    text: r.get(5)?,
+                    kind: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? == 1,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Mark a single segment as echo (`kind = 'echo'`) or back to speech.
+    pub fn set_segment_kind(&self, id: i64, kind: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE segments SET kind = ?2 WHERE id = ?1",
+            params![id, kind],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Soft-delete / restore a single segment.
+    pub fn set_segment_deleted(&self, id: i64, deleted: bool) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE segments SET deleted = ?2 WHERE id = ?1",
+            params![id, deleted as i64],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Snapshot all non-default marks (echo or deleted) before a
+    /// `replace_segments` so they can be re-applied afterward. Returns marks
+    /// keyed by the old segments' (source, start_ms).
+    pub fn snapshot_marks(&self, meeting_id: i64) -> Result<Vec<SegmentMark>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, start_ms, kind, deleted FROM segments
+                 WHERE meeting_id = ?1 AND (kind = 'echo' OR deleted = 1)",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| {
+                Ok(SegmentMark {
+                    source: r.get(0)?,
+                    start_ms: r.get::<_, i64>(1)? as u64,
+                    kind: r.get(2)?,
+                    deleted: r.get::<_, i64>(3)? == 1,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Re-apply snapshoted marks to the current segment rows, matching by
+    /// `(source, start_ms)` within ±250 ms (re-transcribe can shift segment
+    /// bounds a little). Marks that no longer match any row are dropped — a
+    /// re-transcribe genuinely changes the segmentation.
+    pub fn reapply_marks(&self, meeting_id: i64, marks: &[SegmentMark]) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        for m in marks {
+            conn.execute(
+                "UPDATE segments SET kind = ?3, deleted = ?4
+                 WHERE meeting_id = ?1 AND source = ?2
+                   AND start_ms BETWEEN ?5 AND ?6",
+                params![
+                    meeting_id,
+                    m.source,
+                    m.kind,
+                    m.deleted as i64,
+                    m.start_ms.saturating_sub(250) as i64,
+                    (m.start_ms + 250) as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -900,6 +1202,9 @@ pub struct CustomerDetail {
     /// (drives whether a customer rollup can be generated).
     pub meetings_with_summary_count: i64,
     pub latest_rollup: Option<CustomerRollupRow>,
+    /// Open (not done, not dismissed) tasks linked to this customer — drives the
+    /// stats strip on the customer page.
+    pub open_task_count: i64,
 }
 
 #[derive(Serialize, Clone)]
@@ -916,6 +1221,53 @@ pub struct CustomerSearchResult {
     pub title: String,
     pub started_at_ms: i64,
     pub hits: Vec<CustomerSearchHit>,
+}
+
+/// A to-do tied to a customer (and optionally a meeting). `status` is one of
+/// `suggested | open | done | dismissed`; `priority` is `low | normal | high`;
+/// `origin` is `manual | ai`. `customer_id` is null only for AI suggestions
+/// extracted from a customer-less meeting, until they're accepted.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub id: i64,
+    pub customer_id: Option<i64>,
+    pub source_meeting_id: Option<i64>,
+    pub source_start_ms: Option<i64>,
+    pub source_end_ms: Option<i64>,
+    pub snippet: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub priority: String,
+    pub due_at: Option<i64>,
+    pub origin: String,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+/// A parsed AI suggestion awaiting insertion as a `suggested` task. This is an
+/// input DTO for `insert_suggestions`, not a persisted entity — the row that
+/// gets stored is a normal `tasks` row with `status='suggested'`, `origin='ai'`.
+#[derive(Clone)]
+pub struct TaskSuggestion {
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: String,
+    pub due_at: Option<i64>,
+    pub source_start_ms: Option<i64>,
+    pub source_end_ms: Option<i64>,
+    pub snippet: Option<String>,
+}
+
+/// Coerce an incoming priority string to the canonical enum, defaulting to
+/// `normal` for anything unrecognized (defensive against AI output / bad input).
+fn normalize_priority(p: &str) -> &'static str {
+    match p.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "high" => "high",
+        _ => "normal",
+    }
 }
 
 impl Db {
@@ -963,6 +1315,13 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(rows)
+    }
+
+    /// The most recent summary for a meeting, or `None` if there isn't one.
+    /// Used by task extraction, which sources its candidate tasks from the
+    /// latest summary's action-items blocks.
+    pub fn get_latest_summary(&self, meeting_id: i64) -> Result<Option<SummaryRow>, String> {
+        Ok(self.list_summaries(meeting_id)?.into_iter().next())
     }
 }
 
@@ -1478,6 +1837,15 @@ impl Db {
             .map_err(|e| e.to_string())?
         };
         let latest_rollup = self.list_customer_summaries(id)?.into_iter().next();
+        let open_task_count = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE customer_id = ?1 AND status = 'open'",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?
+        };
 
         Ok(CustomerDetail {
             id,
@@ -1494,6 +1862,7 @@ impl Db {
             meetings,
             meetings_with_summary_count,
             latest_rollup,
+            open_task_count,
         })
     }
 
@@ -1542,6 +1911,373 @@ impl Db {
         tx.execute("DELETE FROM customers WHERE id = ?1", params![source_id])
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks
+    // -----------------------------------------------------------------------
+
+    /// Map a `tasks` row to `Task`. Column order must match the SELECTs below.
+    fn row_to_task(r: &rusqlite::Row) -> rusqlite::Result<Task> {
+        Ok(Task {
+            id: r.get(0)?,
+            customer_id: r.get(1)?,
+            source_meeting_id: r.get(2)?,
+            source_start_ms: r.get(3)?,
+            source_end_ms: r.get(4)?,
+            snippet: r.get(5)?,
+            title: r.get(6)?,
+            description: r.get(7)?,
+            status: r.get(8)?,
+            priority: r.get(9)?,
+            due_at: r.get(10)?,
+            origin: r.get(11)?,
+            created_at_ms: r.get(12)?,
+            completed_at_ms: r.get(13)?,
+        })
+    }
+
+    const TASK_COLUMNS: &str = "id, customer_id, source_meeting_id, source_start_ms, \
+        source_end_ms, snippet, title, description, status, priority, due_at, origin, \
+        created_at, completed_at";
+
+    /// All tasks for a customer (open first, then done; dismissed excluded).
+    /// Open tasks sort by due date ascending with nulls last, then by created.
+    /// Done tasks sort by completion time descending.
+    pub fn list_tasks_for_customer(&self, customer_id: i64) -> Result<Vec<Task>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {cols} FROM tasks
+                     WHERE customer_id = ?1 AND status IN ('open','done')
+                     ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END,
+                              (due_at IS NULL),
+                              due_at ASC,
+                              CASE status WHEN 'done' THEN -completed_at END,
+                              created_at ASC",
+                cols = Self::TASK_COLUMNS
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![customer_id], Self::row_to_task)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// All tasks sourced from a meeting, for the meeting page's Tasks tab.
+    /// Includes `suggested` (pending AI suggestions, rendered with
+    /// Accept/Dismiss by Phase 4), `open`, and `done`; dismissed excluded.
+    /// Suggestions come first, then open (by due date, nulls last), then done
+    /// (by completion time descending).
+    pub fn list_tasks_for_meeting(&self, meeting_id: i64) -> Result<Vec<Task>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {cols} FROM tasks
+                     WHERE source_meeting_id = ?1
+                       AND status IN ('suggested','open','done')
+                     ORDER BY CASE status WHEN 'suggested' THEN 0
+                                           WHEN 'open' THEN 1
+                                           ELSE 2 END,
+                              (due_at IS NULL),
+                              due_at ASC,
+                              CASE status WHEN 'done' THEN -completed_at END,
+                              created_at ASC",
+                cols = Self::TASK_COLUMNS
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![meeting_id], Self::row_to_task)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// All tasks across every customer, for the global Tasks / daily-planning
+    /// view. Suggestions are always excluded — only `open` and `done` are
+    /// returned. Open tasks come first, ordered by the chosen sort key; done
+    /// tasks follow, ordered by completion time (most recent first).
+    ///
+    /// Filtering by customer / priority / origin and the "show completed" toggle
+    /// are handled client-side over this result — the working set is small
+    /// (local meeting app) and client-side filtering keeps the UI instant
+    /// without a round-trip per filter change. The sort key *is* applied here
+    /// because its null-handling / priority ranking is cleaner in SQL.
+    pub fn list_all_tasks(&self, sort: Option<&str>) -> Result<Vec<Task>, String> {
+        let conn = self.conn.lock().unwrap();
+        let order_open = match sort {
+            Some("priority") => {
+                "CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 \
+                ELSE 2 END, (due_at IS NULL), due_at ASC, created_at ASC"
+            }
+            Some("created") => "created_at DESC",
+            _ => "(due_at IS NULL), due_at ASC, created_at ASC",
+        };
+        let cols = Self::TASK_COLUMNS;
+        let mut out: Vec<Task> = Vec::new();
+        // Two passes (open then done) so each status gets its own unambiguous
+        // ordering — a single ORDER BY can't cleanly sort open by the chosen
+        // key while keeping done strictly by completion time.
+        let sqls = [
+            format!("SELECT {cols} FROM tasks WHERE status = 'open' ORDER BY {order_open}"),
+            format!(
+                "SELECT {cols} FROM tasks WHERE status = 'done' ORDER BY completed_at DESC, created_at ASC"
+            ),
+        ];
+        for sql in sqls {
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![], Self::row_to_task)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
+    /// Create a manual task. `customer_id` is required for manual creation
+    /// (AI suggestions that may lack a customer use `insert_task_suggestion`).
+    /// Returns the new row id.
+    pub fn create_task(
+        &self,
+        customer_id: i64,
+        title: &str,
+        description: Option<&str>,
+        priority: &str,
+        due_at: Option<i64>,
+        source_meeting_id: Option<i64>,
+    ) -> Result<i64, String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("task title cannot be empty".into());
+        }
+        let priority = normalize_priority(priority);
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks(customer_id, source_meeting_id, title, description, status, \
+             priority, due_at, origin, created_at)
+             VALUES(?1, ?2, ?3, ?4, 'open', ?5, ?6, 'manual', ?7)",
+            params![
+                customer_id,
+                source_meeting_id,
+                title,
+                description,
+                priority,
+                due_at,
+                now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update a task's editable fields (title, description, priority, due date).
+    pub fn update_task(
+        &self,
+        id: i64,
+        title: &str,
+        description: Option<&str>,
+        priority: &str,
+        due_at: Option<i64>,
+    ) -> Result<(), String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("task title cannot be empty".into());
+        }
+        let priority = normalize_priority(priority);
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET title = ?2, description = ?3, priority = ?4, due_at = ?5
+                 WHERE id = ?1",
+                params![id, title, description, priority, due_at],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("task not found".into());
+        }
+        Ok(())
+    }
+
+    /// Set a task's status. `done` stamps `completed_at`; `open` clears it.
+    /// (Accept/dismiss of AI suggestions use their own methods.)
+    pub fn set_task_status(&self, id: i64, status: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let changed = match status {
+            "done" => conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?2 WHERE id = ?1",
+                params![id, now],
+            ),
+            "open" => conn.execute(
+                "UPDATE tasks SET status = 'open', completed_at = NULL WHERE id = ?1",
+                params![id],
+            ),
+            other => return Err(format!("invalid task status: {other}")),
+        }
+        .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("task not found".into());
+        }
+        Ok(())
+    }
+
+    pub fn delete_task(&self, id: i64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM tasks WHERE id = ?1", params![id])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Insert parsed AI suggestions for a meeting as `suggested` tasks
+    /// (`origin='ai'`). Dedupe is exact-normalized by
+    /// `(meeting_id, lowercase-trimmed title)`: anything already
+    /// suggested/open/done for this meeting with the same normalized title is
+    /// skipped, so re-extraction is idempotent for tasks you've already got. A
+    /// previously **dismissed** suggestion is an exception — re-extracting its
+    /// title *revives* it (back to `suggested` with fresh priority/due/snippet),
+    /// so dismiss means "hide for now," not "never again." Returns the number of
+    /// rows inserted or revived.
+    pub fn insert_suggestions(
+        &self,
+        meeting_id: i64,
+        customer_id: Option<i64>,
+        suggestions: &[TaskSuggestion],
+    ) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut inserted = 0;
+        for s in suggestions {
+            let title = s.title.trim();
+            if title.is_empty() {
+                continue;
+            }
+            // 1) Active dedupe: a suggested/open/done task with the same title
+            //    already exists → skip (don't re-suggest a task you already have).
+            let active_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM tasks
+                     WHERE source_meeting_id = ?1
+                       AND lower(trim(title)) = lower(trim(?2))
+                       AND status != 'dismissed'
+                     LIMIT 1",
+                    params![meeting_id, title],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if active_exists {
+                continue;
+            }
+            let priority = normalize_priority(&s.priority);
+            // 2) Revive: a dismissed task with the same title → bring it back to
+            //    `suggested` with fresh data (no duplicate row). `COALESCE`
+            //    refreshes to the meeting's current customer when it has one and
+            //    preserves a previously-set customer when it doesn't.
+            let dismissed_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM tasks
+                     WHERE source_meeting_id = ?1
+                       AND lower(trim(title)) = lower(trim(?2))
+                       AND status = 'dismissed'
+                     LIMIT 1",
+                    params![meeting_id, title],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(id) = dismissed_id {
+                conn.execute(
+                    "UPDATE tasks
+                     SET status = 'suggested',
+                         customer_id = COALESCE(?2, customer_id),
+                         source_start_ms = ?3, source_end_ms = ?4, snippet = ?5,
+                         description = ?6, priority = ?7, due_at = ?8, created_at = ?9
+                     WHERE id = ?1 AND status = 'dismissed'",
+                    params![
+                        id,
+                        customer_id,
+                        s.source_start_ms,
+                        s.source_end_ms,
+                        s.snippet,
+                        s.description,
+                        priority,
+                        s.due_at,
+                        now
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                inserted += 1;
+                continue;
+            }
+            // 3) Insert a fresh suggestion.
+            conn.execute(
+                "INSERT INTO tasks(customer_id, source_meeting_id, source_start_ms, \
+                 source_end_ms, snippet, title, description, status, priority, due_at, origin, \
+                 created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'suggested', ?8, ?9, 'ai', ?10)",
+                params![
+                    customer_id,
+                    meeting_id,
+                    s.source_start_ms,
+                    s.source_end_ms,
+                    s.snippet,
+                    title,
+                    s.description,
+                    priority,
+                    s.due_at,
+                    now
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            inserted += 1;
+        }
+        Ok(inserted)
+    }
+
+    /// Accept a suggestion: promote it to a real `open` task and assign it a
+    /// customer (required — the command errors if `customer_id` is absent).
+    /// Only acts on rows currently in `suggested`.
+    pub fn accept_task_suggestion(&self, id: i64, customer_id: i64) -> Result<(), String> {
+        let changed = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'open', customer_id = ?2, completed_at = NULL
+                 WHERE id = ?1 AND status = 'suggested'",
+                params![id, customer_id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("task not found or not a suggestion".into());
+        }
+        Ok(())
+    }
+
+    /// Dismiss a suggestion: mark it `dismissed` (hidden from the Tasks list).
+    /// Re-extraction *revives* it as a suggestion if its title still appears in
+    /// the summary (dismiss = "hide for now," not "never again"). Only acts on
+    /// rows currently in `suggested`.
+    pub fn dismiss_task_suggestion(&self, id: i64) -> Result<(), String> {
+        let changed = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'dismissed' WHERE id = ?1 AND status = 'suggested'",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("task not found or not a suggestion".into());
+        }
+        Ok(())
     }
 
     /// Scoped search across a customer's meetings: title, notes, transcript
@@ -1897,7 +2633,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 7);
         for table in ["personas", "voiceprints", "speaker_persona_links"] {
             let n: i64 = conn
                 .query_row(
@@ -2060,7 +2796,7 @@ mod tests {
         // After delete: link's persona_id is NULL, rename cleared.
         let detail = db.get_meeting(meeting_id).unwrap();
         assert!(
-            detail.renames.get("SPEAKER_00").is_none(),
+            !detail.renames.contains_key("SPEAKER_00"),
             "delete_persona should clear the display rename"
         );
         let link = detail.speaker_links.get("SPEAKER_00").unwrap();
@@ -2084,11 +2820,11 @@ mod tests {
             .unwrap();
         let detail = db.get_meeting(meeting_id).unwrap();
         assert!(
-            detail.speaker_links.get("SPEAKER_01").is_none(),
+            !detail.speaker_links.contains_key("SPEAKER_01"),
             "link should be gone"
         );
         assert!(
-            detail.renames.get("SPEAKER_01").is_none(),
+            !detail.renames.contains_key("SPEAKER_01"),
             "display rename should be cleared"
         );
     }
@@ -2132,6 +2868,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2139,6 +2876,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     text: "a".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2146,6 +2884,7 @@ mod tests {
                     start_ms: 2000,
                     end_ms: 3000,
                     text: "b".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2153,6 +2892,7 @@ mod tests {
                     start_ms: 3000,
                     end_ms: 4000,
                     text: "c".into(),
+                    ..Default::default()
                 },
             ],
         )
@@ -2200,6 +2940,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     text: "a".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2207,6 +2948,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     text: "b".into(),
+                    ..Default::default()
                 },
             ],
         )
@@ -2236,6 +2978,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "mic".into(),
@@ -2243,6 +2986,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     text: "world".into(),
+                    ..Default::default()
                 },
             ],
         )
@@ -2258,9 +3002,460 @@ mod tests {
                 start_ms: 0,
                 end_ms: 1000,
                 text: "no speaker".into(),
+                ..Default::default()
             }],
         )
         .unwrap();
         assert_eq!(db.count_speaker_identities(null_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn mark_preservation_survives_replace_segments() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("marks", "t", 0).unwrap();
+        db.finalize_meeting(meeting_id, 0, "m.wav", "s.wav")
+            .unwrap();
+
+        // Two mic segments + one system. Mark the first mic as echo and
+        // soft-delete the second; the system segment stays default.
+        db.replace_segments(
+            meeting_id,
+            &[
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "echo-of-remote".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    text: "stutter".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    start_ms: 2000,
+                    end_ms: 3000,
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        let all = db.meeting_segments_all(meeting_id).unwrap();
+        let echo_id = all.iter().find(|s| s.start_ms == 0).unwrap().id;
+        let del_id = all.iter().find(|s| s.start_ms == 1000).unwrap().id;
+        db.set_segment_kind(echo_id, "echo").unwrap();
+        db.set_segment_deleted(del_id, true).unwrap();
+
+        // Default view hides both; hidden count = 2.
+        assert_eq!(db.meeting_segments(meeting_id).unwrap().len(), 1);
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert_eq!(detail.hidden_segment_count, 2);
+
+        // Simulate a re-transcribe: snapshot marks, replace with fresh rows
+        // (timestamps shifted by a few ms — within the ±250ms tolerance), then
+        // re-apply. The first mic shifted +10ms should still match the echo mark.
+        let marks = db.snapshot_marks(meeting_id).unwrap();
+        assert_eq!(marks.len(), 2);
+        db.replace_segments(
+            meeting_id,
+            &[
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 10,
+                    end_ms: 1010,
+                    text: "echo-of-remote v2".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 1010,
+                    end_ms: 2010,
+                    text: "stutter v2".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    start_ms: 2000,
+                    end_ms: 3000,
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        db.reapply_marks(meeting_id, &marks).unwrap();
+
+        // Both marks survived on the fresh rows.
+        let all = db.meeting_segments_all(meeting_id).unwrap();
+        let echo = all
+            .iter()
+            .find(|s| s.source == "mic" && s.start_ms == 10)
+            .unwrap();
+        assert_eq!(echo.kind, "echo");
+        assert!(!echo.deleted);
+        let del = all
+            .iter()
+            .find(|s| s.source == "mic" && s.start_ms == 1010)
+            .unwrap();
+        assert!(del.deleted);
+        assert_eq!(del.kind, "speech");
+        // Default view still hides both; the system segment shows.
+        assert_eq!(db.meeting_segments(meeting_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_create_list_complete_delete() {
+        let db = tmp_db();
+        let cid = db.create_customer("Acme", None).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let t1 = db
+            .create_task(
+                cid,
+                "Send quote",
+                Some("v2 pricing"),
+                "high",
+                Some(now + 86_400_000),
+                None,
+            )
+            .unwrap();
+        let _t2 = db
+            .create_task(cid, "Follow up", None, "normal", None, None)
+            .unwrap();
+
+        let tasks = db.list_tasks_for_customer(cid).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].title, "Send quote"); // has a due date → sorts first
+        assert_eq!(tasks[0].status, "open");
+        assert_eq!(tasks[0].priority, "high");
+        assert_eq!(tasks[0].origin, "manual");
+        assert!(tasks[0].completed_at_ms.is_none());
+
+        // Open-task count surfaces on the customer detail.
+        assert_eq!(db.get_customer(cid).unwrap().open_task_count, 2);
+
+        // Completing stamps completed_at and moves it after open tasks.
+        db.set_task_status(t1, "done").unwrap();
+        let after = db.list_tasks_for_customer(cid).unwrap();
+        let done = after.iter().find(|t| t.id == t1).unwrap();
+        assert_eq!(done.status, "done");
+        assert!(done.completed_at_ms.is_some());
+        assert_eq!(db.get_customer(cid).unwrap().open_task_count, 1);
+
+        // Reopen clears completed_at.
+        db.set_task_status(t1, "open").unwrap();
+        assert!(db
+            .list_tasks_for_customer(cid)
+            .unwrap()
+            .iter()
+            .find(|t| t.id == t1)
+            .unwrap()
+            .completed_at_ms
+            .is_none());
+
+        // Empty title rejected; bad priority normalised.
+        assert!(db.create_task(cid, "   ", None, "wat", None, None).is_err());
+        let t3 = db
+            .create_task(cid, "Review", None, "bogus", None, None)
+            .unwrap();
+        assert_eq!(
+            db.list_tasks_for_customer(cid)
+                .unwrap()
+                .iter()
+                .find(|t| t.id == t3)
+                .unwrap()
+                .priority,
+            "normal"
+        );
+
+        // Delete removes it.
+        db.delete_task(t1).unwrap();
+        assert!(db
+            .list_tasks_for_customer(cid)
+            .unwrap()
+            .iter()
+            .all(|t| t.id != t1));
+    }
+
+    #[test]
+    fn list_all_tasks_orders_and_excludes_suggestions() {
+        let db = tmp_db();
+        let cid = db.create_customer("Acme", None).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let day = 86_400_000;
+
+        // Three open tasks with distinct due dates / priorities / created times.
+        // `create_task` stamps created_at at call time, so insert the oldest
+        // first to get a stable created-order signal.
+        let _no_due = db
+            .create_task(cid, "No due", None, "normal", None, None)
+            .unwrap();
+        // Tiny sleep so created_at differs between rows (ms resolution).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _due_soon = db
+            .create_task(cid, "Due soon", None, "high", Some(now + day), None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _due_later = db
+            .create_task(cid, "Due later", None, "low", Some(now + 3 * day), None)
+            .unwrap();
+
+        // A pending AI suggestion — must be excluded from the global view.
+        let mid = db.insert_meeting_started("s1", "t", 0).unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks(customer_id, source_meeting_id, title, status, origin, created_at)
+             VALUES(?1, ?2, ?3, 'suggested', 'ai', ?4)",
+            params![cid, mid, "Suggested", now],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Default sort (due): open with a due date come before null-due, by
+        // due_at ascending. Suggestions excluded entirely.
+        let due_sorted = db.list_all_tasks(None).unwrap();
+        assert!(due_sorted.iter().all(|t| t.status != "suggested"));
+        assert_eq!(due_sorted[0].title, "Due soon");
+        assert_eq!(due_sorted[1].title, "Due later");
+        assert_eq!(due_sorted[2].title, "No due");
+
+        // Priority sort: high → normal → low (then due / created).
+        let pri_sorted = db.list_all_tasks(Some("priority")).unwrap();
+        let titles: Vec<&str> = pri_sorted.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["Due soon", "No due", "Due later"]);
+
+        // Created sort: newest first.
+        let cre_sorted = db.list_all_tasks(Some("created")).unwrap();
+        assert_eq!(cre_sorted[0].title, "Due later");
+        assert_eq!(cre_sorted[1].title, "Due soon");
+        assert_eq!(cre_sorted[2].title, "No due");
+
+        // Complete one — done tasks follow open tasks, most-recently-completed
+        // first.
+        let due_soon_id = due_sorted[0].id;
+        db.set_task_status(due_soon_id, "done").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let after = db.list_all_tasks(None).unwrap();
+        // Open tasks first.
+        assert_eq!(after[0].status, "open");
+        assert_eq!(after.last().unwrap().status, "done");
+        assert_eq!(after.last().unwrap().title, "Due soon");
+    }
+
+    #[test]
+    fn list_tasks_for_meeting_scopes_and_orders() {
+        let db = tmp_db();
+        let cid = db.create_customer("Acme", None).unwrap();
+        let mid = db.insert_meeting_started("s1", "t", 0).unwrap();
+        let other = db.insert_meeting_started("s2", "other", 0).unwrap();
+
+        // An accepted open + a done task for `mid`, plus an unrelated task for
+        // `other` (must be excluded by the scoping).
+        let open_id = db
+            .create_task(cid, "Open from meeting", None, "normal", None, Some(mid))
+            .unwrap();
+        let done_id = db
+            .create_task(cid, "Done from meeting", None, "normal", None, Some(mid))
+            .unwrap();
+        db.set_task_status(done_id, "done").unwrap();
+        db.create_task(
+            cid,
+            "Belongs to other meeting",
+            None,
+            "normal",
+            None,
+            Some(other),
+        )
+        .unwrap();
+
+        // A pending AI suggestion + a dismissed suggestion for `mid`.
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks(customer_id, source_meeting_id, title, status, origin, created_at)
+             VALUES(?1, ?2, ?3, 'suggested', 'ai', ?4)",
+            params![cid, mid, "Suggested", now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(customer_id, source_meeting_id, title, status, origin, created_at)
+             VALUES(?1, ?2, ?3, 'dismissed', 'ai', ?4)",
+            params![cid, mid, "Dismissed", now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks = db.list_tasks_for_meeting(mid).unwrap();
+        // Scoped to `mid`; dismissed excluded; unrelated meeting's task absent.
+        assert!(tasks.iter().all(|t| t.source_meeting_id == Some(mid)));
+        assert!(tasks.iter().all(|t| t.status != "dismissed"));
+        assert!(!tasks.iter().any(|t| t.title == "Belongs to other meeting"));
+        // Suggested first, then open, then done.
+        assert_eq!(tasks[0].title, "Suggested");
+        assert_eq!(tasks[1].id, open_id);
+        assert_eq!(tasks[1].status, "open");
+        assert_eq!(tasks[2].id, done_id);
+        assert_eq!(tasks[2].status, "done");
+    }
+
+    #[test]
+    fn insert_suggestions_dedupes_and_accept_dismiss() {
+        let db = tmp_db();
+        let cid = db.create_customer("Acme", None).unwrap();
+        let mid = db.insert_meeting_started("s1", "t", 0).unwrap();
+
+        let mk = |title: &str| TaskSuggestion {
+            title: title.to_string(),
+            description: None,
+            priority: "normal".to_string(),
+            due_at: None,
+            source_start_ms: None,
+            source_end_ms: None,
+            snippet: None,
+        };
+
+        // First extraction: two suggestions inserted.
+        let n = db
+            .insert_suggestions(mid, Some(cid), &[mk("Send quote"), mk("Follow up")])
+            .unwrap();
+        assert_eq!(n, 2);
+        let tasks = db.list_tasks_for_meeting(mid).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.status == "suggested"));
+
+        // Re-extract with the same titles (case/edge-whitespace varied) + one
+        // new one: the two existing are skipped (idempotent — dedupe is
+        // lowercase + edge-trim, the v1 exact-normalized rule), only the new
+        // one is added.
+        let n = db
+            .insert_suggestions(
+                mid,
+                Some(cid),
+                &[mk("  SEND Quote  "), mk("Follow up"), mk("Schedule demo")],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let tasks = db.list_tasks_for_meeting(mid).unwrap();
+        assert_eq!(tasks.len(), 3);
+
+        // Dismiss one; re-extracting its title revives it as a suggestion
+        // (dismiss = "hide for now," not "never again") — no duplicate row.
+        let to_dismiss = tasks.iter().find(|t| t.title == "Follow up").unwrap().id;
+        db.dismiss_task_suggestion(to_dismiss).unwrap();
+        let n = db
+            .insert_suggestions(mid, Some(cid), &[mk("Follow up")])
+            .unwrap();
+        assert_eq!(n, 1);
+        let revived = db
+            .list_tasks_for_meeting(mid)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "Follow up")
+            .unwrap();
+        assert_eq!(revived.status, "suggested");
+        // Revived in place: still a single row for this title (no duplicate).
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE source_meeting_id = ?1 AND lower(trim(title)) = 'follow up'",
+                params![mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(count, 1);
+
+        // Accept a suggestion → becomes an open task with the assigned customer.
+        let to_accept = tasks.iter().find(|t| t.title == "Send quote").unwrap().id;
+        db.accept_task_suggestion(to_accept, cid).unwrap();
+        let after_accept = db.list_tasks_for_meeting(mid).unwrap();
+        let accepted = after_accept.iter().find(|t| t.id == to_accept).unwrap();
+        assert_eq!(accepted.status, "open");
+        assert_eq!(accepted.customer_id, Some(cid));
+
+        // Accepting a non-suggestion errors.
+        assert!(db.accept_task_suggestion(to_accept, cid).is_err());
+        // Dismissing a non-suggestion errors.
+        assert!(db.dismiss_task_suggestion(to_accept).is_err());
+    }
+
+    #[test]
+    fn customer_delete_cascades_tasks() {
+        let db = tmp_db();
+        let cid = db.create_customer("Acme", None).unwrap();
+        db.create_task(cid, "Do thing", None, "normal", None, None)
+            .unwrap();
+        assert!(!db.list_tasks_for_customer(cid).unwrap().is_empty());
+
+        db.delete_customer(cid).unwrap();
+        // Customer gone → its tasks cascade-deleted.
+        let conn = db.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE customer_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn meeting_delete_drops_suggestions_keeps_accepted() {
+        let db = tmp_db();
+        let cid = db.create_customer("Acme", None).unwrap();
+        let mid = db.insert_meeting_started("s1", "t", 0).unwrap();
+        // An accepted (open) task linked to the meeting + customer.
+        db.create_task(cid, "Open task", None, "normal", None, Some(mid))
+            .unwrap();
+        // A pending AI suggestion (status='suggested') linked to the meeting.
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks(customer_id, source_meeting_id, title, status, origin, created_at)
+             VALUES(?1, ?2, ?3, 'suggested', 'ai', ?4)",
+            params![
+                cid,
+                mid,
+                "Suggested task",
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.delete_meeting(mid).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        // Suggestion dropped.
+        let sug: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE title = 'Suggested task'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sug, 0);
+        // Accepted task survives, unlinked from the meeting.
+        let (open, link): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(source_meeting_id) FROM tasks WHERE title = 'Open task'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(open, 1);
+        assert_eq!(link, 0);
     }
 }

@@ -180,6 +180,7 @@ impl ChannelBuffer {
                     Source::Mic => Some("Me".into()),
                     Source::System => identified.clone(), // persona name or None
                 },
+                ..Default::default()
             });
         }
         // Keep only the tail of the running prompt.

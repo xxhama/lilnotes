@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CheckCircle2,
   ChevronLeft,
@@ -78,6 +78,12 @@ export default function OnboardingWizard({ onComplete }: Props) {
   const [initializing, setInitializing] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
 
+  // Guards the auto-probe effect against React StrictMode's dev double-mount
+  // (probing state alone can't: setProbing(true) isn't committed between the
+  // two invokes, so a state guard would fire the probe twice and race two
+  // AudioHardwareCreateProcessTap calls). Mirrors Recording.tsx startInFlightRef.
+  const probeFiredRef = useRef(false);
+
   const refreshModels = useCallback(async () => {
     setAsrModels(await listAsrModels().catch(() => []));
     setNativeModels(await listNativeModels().catch(() => []));
@@ -150,6 +156,21 @@ export default function OnboardingWizard({ onComplete }: Props) {
       setProbing(false);
     }
   }, []);
+
+  // Auto-probe system audio on the permissions step, sequenced after mic is
+  // granted. The probe IS the TCC request — it surfaces the "System Audio
+  // Recording" prompt during onboarding (instead of mid-first-record). The
+  // ref guards against React StrictMode's dev double-mount (probing state
+  // alone can't: setProbing(true) isn't committed between the two invokes).
+  useEffect(() => {
+    if (step !== "permissions") return;
+    if (micPerm !== "granted") return;
+    if (sysAudio !== "unknown") return;
+    if (probing) return;
+    if (probeFiredRef.current) return;
+    probeFiredRef.current = true;
+    void probeSystem();
+  }, [step, micPerm, sysAudio, probing, probeSystem]);
 
   const startAsrDownload = useCallback(
     (id: string) => {
@@ -354,33 +375,38 @@ export default function OnboardingWizard({ onComplete }: Props) {
                   >
                     <ExternalLink /> Open System Settings
                   </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setSysAudio("granted")}>
-                    Skip
+                  <Button size="sm" onClick={probeSystem} disabled={probing}>
+                    {probing ? (
+                      <>
+                        <Loader2 className="animate-spin" /> Testing…
+                      </>
+                    ) : (
+                      "Test again"
+                    )}
                   </Button>
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  macOS won&apos;t re-prompt after a denial. Enable LilNotes in System Settings,
+                  then test again.
+                </p>
               </div>
             ) : (
-              <div className="flex gap-2">
-                <Button size="sm" onClick={probeSystem} disabled={probing}>
-                  {probing ? (
-                    <>
-                      <Loader2 className="animate-spin" /> Testing…
-                    </>
-                  ) : (
-                    "Test access"
-                  )}
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => setSysAudio("granted")}>
-                  Skip
-                </Button>
-              </div>
+              <Button size="sm" onClick={probeSystem} disabled={probing}>
+                {probing ? (
+                  <>
+                    <Loader2 className="animate-spin" /> Testing…
+                  </>
+                ) : (
+                  "Test access"
+                )}
+              </Button>
             )}
           </div>
 
           <NavButtons
             onBack={() => setStep("security")}
             onNext={() => setStep("models")}
-            nextDisabled={micPerm !== "granted"}
+            nextDisabled={micPerm !== "granted" || sysAudio !== "granted"}
           />
         </div>
       )}

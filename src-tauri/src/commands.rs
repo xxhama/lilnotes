@@ -5,15 +5,16 @@
 //! to strings.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::asr::{chunker, AsrEngine, Segment};
-use crate::audio::{CaptureEngine, StartedRecording};
+use crate::audio::{offline_aec, CaptureEngine, StartedRecording};
 use crate::db::{
     CustomerDetail, CustomerRollupRow, CustomerSearchResult, CustomerSummary, LazyDb,
-    MeetingDetail, MeetingSummary, Persona,
+    MeetingDetail, MeetingSummary, Persona, Task,
 };
 use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
@@ -21,8 +22,15 @@ use crate::permissions::{self, PermissionStatus};
 use crate::personas;
 use crate::settings::AppSettings;
 use crate::summary::{self, ollama, sidecar::SidecarLlmClient, SummaryBackend};
+use crate::tasks;
 use crate::transcript;
 use crate::voiceprint::VoiceprintEngine;
+
+/// Prefix of the placeholder title stamped at recording start
+/// (`create_meeting_at_start`). Used to detect meetings that still have the
+/// default title and may be auto-renamed when a summary is generated — a
+/// manually-renamed title never starts with this, so it's preserved.
+const DEFAULT_TITLE_PREFIX: &str = "Meeting — ";
 
 /// Join handle of the live transcription worker for the active session.
 #[derive(Default)]
@@ -100,9 +108,11 @@ fn create_meeting_at_start(
     db: &State<'_, Arc<LazyDb>>,
     started: &StartedRecording,
 ) -> Result<i64, String> {
-    let title = chrono::Local::now()
-        .format("Meeting — %b %-d, %Y %-I:%M %p")
-        .to_string();
+    let title = format!(
+        "{}{}",
+        DEFAULT_TITLE_PREFIX,
+        chrono::Local::now().format("%b %-d, %Y %-I:%M %p")
+    );
     db.insert_meeting_started(&started.session_id, &title, started.started_at_ms as i64)
 }
 
@@ -143,20 +153,40 @@ fn session_dir(app: &AppHandle, settings: &AppSettings) -> Result<std::path::Pat
     Ok(base.join("recordings").join(stamp))
 }
 
-/// Load the configured whisper model if present on disk.
+/// Load `model_id` if present on disk. The model-id-override path used by
+/// re-transcription (per-meeting model) and the echo-clean re-transcribe. The
+/// settings-bound [`ensure_asr_model`] delegates here with the global model.
+fn ensure_asr_model_id(app: &AppHandle, asr: &AsrEngine, model_id: &str) -> Result<(), String> {
+    let path = models::whisper_model_path(app, model_id)?;
+    if !path.exists() {
+        return Err(format!(
+            "transcription model \"{model_id}\" is not downloaded yet — get it in Settings"
+        ));
+    }
+    asr.ensure_loaded(model_id, &path.to_string_lossy())
+}
+
+/// Load the configured (global) whisper model if present on disk. Live and
+/// first-pass transcription use this so they follow the Settings picker.
 fn ensure_asr_model(
     app: &AppHandle,
     asr: &AsrEngine,
     settings: &AppSettings,
 ) -> Result<(), String> {
-    let path = models::whisper_model_path(app, &settings.asr_model)?;
-    if !path.exists() {
-        return Err(format!(
-            "transcription model \"{}\" is not downloaded yet — get it in Settings",
-            settings.asr_model
-        ));
-    }
-    asr.ensure_loaded(&settings.asr_model, &path.to_string_lossy())
+    ensure_asr_model_id(app, asr, &settings.asr_model)
+}
+
+/// Resolve which model a meeting should be transcribed with: the model it was
+/// originally transcribed with (`meetings.asr_model`), falling back to the
+/// current global setting for meetings transcribed before that column existed.
+/// Echo-clean re-transcribes use this so they keep the meeting's recorded
+/// model instead of jumping to whatever the global picker is on now.
+fn meeting_asr_model(db: &crate::db::LazyDb, meeting_id: i64) -> Result<String, String> {
+    let meeting = db.get_meeting(meeting_id)?;
+    Ok(meeting
+        .asr_model
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| db.get_settings().asr_model))
 }
 
 #[tauri::command]
@@ -209,7 +239,13 @@ pub async fn start_recording(
         match load {
             Ok(live_vp) => {
                 let (tx, rx) = crossbeam_channel::bounded(1024);
-                let started = engine.start(app.clone(), dir, Some(tx), cfg.aec_enabled)?;
+                let started = engine.start(
+                    app.clone(),
+                    dir,
+                    Some(tx),
+                    cfg.aec_enabled,
+                    cfg.aec_aggressiveness,
+                )?;
                 let handle = chunker::spawn_live_worker(
                     app.clone(),
                     asr.inner().clone(),
@@ -230,7 +266,13 @@ pub async fn start_recording(
         }
     }
 
-    let started = engine.start(app.clone(), dir, None, cfg.aec_enabled)?;
+    let started = engine.start(
+        app.clone(),
+        dir,
+        None,
+        cfg.aec_enabled,
+        cfg.aec_aggressiveness,
+    )?;
     let meeting_id = create_meeting_at_start(&db, &started)?;
     Ok(StartRecordingResponse {
         started,
@@ -331,7 +373,14 @@ pub async fn transcribe_meeting(
             &mic,
             &system,
         )?;
+        // Preserve echo/delete marks across the re-transcribe: replace_segments
+        // DELETEs all rows, so snapshot the marks first and re-apply them to the
+        // fresh rows by (source, start_ms ± 250ms).
+        let marks = db.snapshot_marks(meeting_id)?;
         db.replace_segments(meeting_id, &segments)?;
+        db.reapply_marks(meeting_id, &marks)?;
+        // Record which model produced this meeting's transcript (first pass).
+        db.set_meeting_asr_model(meeting_id, &cfg.asr_model)?;
         Ok(segments)
     })
     .await
@@ -349,6 +398,16 @@ pub struct DiarizedTranscript {
     pub speaker_count: usize,
     /// True if the WAVs were removed per the delete-audio setting.
     pub audio_deleted: bool,
+}
+
+/// Payload of the `offline_aec:progress` event — drives the "Clean echo"
+/// progress bar in Meeting Detail.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflineAecProgress {
+    pub meeting_id: i64,
+    /// 0..=1 fraction of the offline AEC pass completed.
+    pub pct: f32,
 }
 
 /// Diarize a meeting's system channel, persist the labeled segments, and
@@ -370,7 +429,10 @@ pub async fn diarize_meeting(
     tauri::async_runtime::spawn_blocking(move || {
         let (mic_wav, system_wav) = db.meeting_wavs(meeting_id)?;
         let system_wav = system_wav.ok_or("this meeting's audio files have been deleted")?;
-        let mut segments = db.meeting_segments(meeting_id)?;
+        // Load ALL segments (including echo-marked + soft-deleted) so the
+        // replace below preserves their kind/deleted flags — diarization only
+        // relabels system speakers; mic/echo/deleted rows pass through.
+        let mut segments = db.meeting_segments_all(meeting_id)?;
         if segments.is_empty() {
             return Err("transcribe the meeting before identifying speakers".into());
         }
@@ -379,7 +441,12 @@ pub async fn diarize_meeting(
         let speaker_count = transcript::assign_speakers(&mut segments, &turns);
         segments.sort_by_key(|s| s.start_ms);
 
+        // Belt-and-suspenders: the rows already carry their marks (loaded via
+        // _all), but snapshot/reapply keeps them safe if timestamp shifting
+        // ever changes row identity.
+        let marks = db.snapshot_marks(meeting_id)?;
         db.replace_segments(meeting_id, &segments)?;
+        db.reapply_marks(meeting_id, &marks)?;
         let mut labels: Vec<String> = segments
             .iter()
             .filter_map(|s| s.speaker.clone())
@@ -419,7 +486,9 @@ pub async fn diarize_meeting(
         }
 
         Ok(DiarizedTranscript {
-            segments,
+            // Return the visible set (echo/deleted hidden) — the frontend
+            // renders from `get_meeting`, which applies the same filter.
+            segments: db.meeting_segments(meeting_id)?,
             speaker_count,
             audio_deleted,
         })
@@ -443,6 +512,429 @@ pub fn list_meetings(
 #[tauri::command]
 pub fn get_meeting(db: State<'_, Arc<LazyDb>>, meeting_id: i64) -> Result<MeetingDetail, String> {
     db.get_meeting(meeting_id)
+}
+
+// ---------------------------------------------------------------------------
+// Segment marks: mark-as-echo + soft-delete (Tier 2)
+// ---------------------------------------------------------------------------
+
+/// Every segment for a meeting including echo-marked + soft-deleted ones, for
+/// the "show hidden" transcript toggle.
+#[tauri::command]
+pub fn list_hidden_segments(
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+) -> Result<Vec<Segment>, String> {
+    db.meeting_segments_all(meeting_id)
+}
+
+/// Mark a mic segment the ASR mis-attributed to "Me" as echo. Echo segments are
+/// hidden from the transcript + summary but retained for offline echo
+/// re-processing (Tier 3 uses them as labeled echo windows).
+#[tauri::command]
+pub fn mark_segment_echo(db: State<'_, Arc<LazyDb>>, segment_id: i64) -> Result<(), String> {
+    db.set_segment_kind(segment_id, "echo")
+}
+
+/// Revert an echo mark back to normal speech.
+#[tauri::command]
+pub fn unmark_segment_echo(db: State<'_, Arc<LazyDb>>, segment_id: i64) -> Result<(), String> {
+    db.set_segment_kind(segment_id, "speech")
+}
+
+/// Soft-delete a segment (hide from transcript + summary, recoverable).
+#[tauri::command]
+pub fn delete_segment(db: State<'_, Arc<LazyDb>>, segment_id: i64) -> Result<(), String> {
+    db.set_segment_deleted(segment_id, true)
+}
+
+/// Restore a soft-deleted segment.
+#[tauri::command]
+pub fn restore_segment(db: State<'_, Arc<LazyDb>>, segment_id: i64) -> Result<(), String> {
+    db.set_segment_deleted(segment_id, false)
+}
+
+// ---------------------------------------------------------------------------
+// Offline echo re-processing (Tier 3)
+// ---------------------------------------------------------------------------
+
+/// Re-transcribe a meeting's mic (from `mic_path`) + system WAV and re-run
+/// diarization on the system channel, restoring speaker labels/personas.
+/// Shared by `clean_echo` (mic_path = the cleaned WAV), `revert_echo_clean`
+/// (mic_path = the original `mic.wav`), and `retranscribe_meeting` (mic_path =
+/// cleaned-or-original, `model_id` = the user's per-meeting pick). Echo/delete
+/// marks are snapshotted and re-applied across both `replace_segments` calls so
+/// they survive the rebuild. The meeting's `asr_model` is recorded as
+/// `model_id` so the UI keeps showing which model produced the transcript.
+#[allow(clippy::too_many_arguments)]
+fn retranscribe_and_rediarize(
+    app: &AppHandle,
+    asr: &AsrEngine,
+    diarizer: &DiarizeEngine,
+    voiceprint: &VoiceprintEngine,
+    db: &crate::db::LazyDb,
+    meeting_id: i64,
+    mic_path: &str,
+    system_wav: &str,
+    model_id: &str,
+) -> Result<DiarizedTranscript, String> {
+    ensure_asr_model_id(app, asr, model_id)?;
+    let segments = chunker::transcribe_wavs(
+        app.clone(),
+        asr,
+        format!("meeting-{meeting_id}"),
+        mic_path,
+        system_wav,
+    )?;
+    // Preserve echo/delete marks across the re-transcribe.
+    let marks = db.snapshot_marks(meeting_id)?;
+    db.replace_segments(meeting_id, &segments)?;
+    db.reapply_marks(meeting_id, &marks)?;
+    // Record which model produced this transcript.
+    db.set_meeting_asr_model(meeting_id, model_id)?;
+
+    // Re-run diarization on the (unchanged) system channel so speaker labels
+    // survive the segment rebuild. Use the existing speaker count as a hint
+    // when it was already >= 2 (more reliable than automatic estimation).
+    let num_speakers = {
+        let detail = db.get_meeting(meeting_id)?;
+        if detail.speaker_count >= 2 {
+            Some(detail.speaker_count as i32)
+        } else {
+            None
+        }
+    };
+    let turns = diarizer.diarize_wav(app, system_wav, num_speakers)?;
+    let mut segs = db.meeting_segments_all(meeting_id)?;
+    let speaker_count = transcript::assign_speakers(&mut segs, &turns);
+    segs.sort_by_key(|s| s.start_ms);
+    let marks2 = db.snapshot_marks(meeting_id)?;
+    db.replace_segments(meeting_id, &segs)?;
+    db.reapply_marks(meeting_id, &marks2)?;
+    let mut labels: Vec<String> = segs
+        .iter()
+        .filter_map(|s| s.speaker.clone())
+        .filter(|s| s.starts_with("SPEAKER_"))
+        .collect();
+    labels.sort();
+    labels.dedup();
+    db.ensure_speakers(meeting_id, &labels)?;
+
+    // Identity layer (additive, non-fatal).
+    let settings = db.get_settings();
+    if let Err(e) = personas::identify_and_persist(
+        db, voiceprint, app, meeting_id, system_wav, &turns, &settings,
+    )
+    .map(|m| {
+        let _ = app.emit_to("main", "speakers:identified", m);
+    }) {
+        eprintln!("identify_speakers failed (non-fatal): {e}");
+    }
+
+    Ok(DiarizedTranscript {
+        segments: db.meeting_segments(meeting_id)?,
+        speaker_count,
+        audio_deleted: false,
+    })
+}
+
+/// Mic segments the user marked as echo (`source == "mic" && kind == "echo"`).
+/// These are the supervised learning regions for the offline AEC filter — the
+/// mic is pure echo there (near-end silent), so the adaptation error is a clean
+/// echo residual. Shared by `clean_echo` and `clean_echo_segment`.
+fn collect_echo_windows(
+    db: &crate::db::LazyDb,
+    meeting_id: i64,
+) -> Result<Vec<offline_aec::EchoWindow>, String> {
+    Ok(db
+        .meeting_segments_all(meeting_id)?
+        .iter()
+        .filter(|s| s.source == "mic" && s.kind == "echo")
+        .map(|s| offline_aec::EchoWindow {
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+        })
+        .collect())
+}
+
+/// Mic speech segments (`source == "mic" && kind == "speech" && !deleted`) as
+/// apply ranges — the regions the whole-meeting clean should de-echo. Pure-echo
+/// regions and untouched audio are left alone (learned from, not mangled),
+/// which is the fix for the "added echo to everything" failure.
+fn speech_apply_ranges(
+    db: &crate::db::LazyDb,
+    meeting_id: i64,
+) -> Result<Vec<offline_aec::EchoWindow>, String> {
+    Ok(db
+        .meeting_segments_all(meeting_id)?
+        .iter()
+        .filter(|s| s.source == "mic" && s.kind == "speech" && !s.deleted)
+        .map(|s| offline_aec::EchoWindow {
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+        })
+        .collect())
+}
+
+/// Shared body for `clean_echo` (whole-meeting) and `clean_echo_segment`
+/// (per-segment): run offline AEC with the given learning `windows` + apply
+/// `scope`, persist `mic_cleaned_wav`, then re-transcribe + re-diarize. Emits
+/// `offline_aec:progress` events (0..=1) keyed by `meeting_id`.
+#[allow(clippy::too_many_arguments)]
+fn run_offline_clean(
+    app: &AppHandle,
+    asr: &AsrEngine,
+    diarizer: &DiarizeEngine,
+    voiceprint: &VoiceprintEngine,
+    db: &crate::db::LazyDb,
+    meeting_id: i64,
+    mic_wav: &str,
+    system_wav: &str,
+    windows: &[offline_aec::EchoWindow],
+    scope: offline_aec::ApplyScope,
+) -> Result<DiarizedTranscript, String> {
+    // Write mic_cleaned.wav next to mic.wav.
+    let out_path = std::path::Path::new(mic_wav).with_file_name("mic_cleaned.wav");
+    let out_str = out_path.to_string_lossy().into_owned();
+
+    // Run the offline filter with progress events. If no echo windows were
+    // marked, the filter falls back to unsupervised adaptation — but the apply
+    // scope bounds the blast radius to the requested region(s), so a wrong `W`
+    // can never again corrupt the whole recording.
+    {
+        let app_prog = app.clone();
+        let id_prog = meeting_id;
+        let progress = move |p: f32| {
+            let _ = app_prog.emit_to(
+                "main",
+                "offline_aec:progress",
+                OfflineAecProgress {
+                    meeting_id: id_prog,
+                    pct: p,
+                },
+            );
+        };
+        offline_aec::clean(mic_wav, system_wav, windows, &scope, &out_str, progress)?;
+    }
+    db.set_mic_cleaned_wav(meeting_id, &out_str)?;
+
+    // Keep the meeting's recorded model (not the current global one) so an
+    // echo-clean doesn't silently swap the transcript to a different model.
+    let model_id = meeting_asr_model(db, meeting_id)?;
+    retranscribe_and_rediarize(
+        app, asr, diarizer, voiceprint, db, meeting_id, &out_str, system_wav, &model_id,
+    )
+}
+
+/// Run offline AEC on a meeting's `mic.wav` using `system.wav` as the exact
+/// echo reference, seeded by the user's echo-marked mic segments, then
+/// re-transcribe the cleaned mic and re-diarize. The apply scope is the mic
+/// **speech** segments only (learn from marked echo regions, apply to speech) —
+/// so pure-echo regions and untouched audio are not mangled. With no speech
+/// segments this is a no-op (no `mic_cleaned_wav` written, transcript
+/// unchanged). The original `mic.wav` is preserved; the cleaned path is stored
+/// in `meetings.mic_cleaned_wav` so the action is revertible via
+/// `revert_echo_clean`. Emits `offline_aec:progress` events (0..=1).
+#[tauri::command]
+pub async fn clean_echo(
+    app: AppHandle,
+    asr: State<'_, Arc<AsrEngine>>,
+    diarizer: State<'_, Arc<DiarizeEngine>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+) -> Result<DiarizedTranscript, String> {
+    let asr = asr.inner().clone();
+    let diarizer = diarizer.inner().clone();
+    let voiceprint = voiceprint.inner().clone();
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mic_wav, system_wav) = db.meeting_wavs(meeting_id)?;
+        let (mic_wav, system_wav) = match (mic_wav, system_wav) {
+            (Some(m), Some(s)) => (m, s),
+            _ => return Err("this meeting's audio files have been deleted".into()),
+        };
+
+        let windows = collect_echo_windows(&db, meeting_id)?;
+        let apply = speech_apply_ranges(&db, meeting_id)?;
+        eprintln!(
+            "[clean_echo] meeting {meeting_id}: {} marked echo window(s), {} speech apply region(s)",
+            windows.len(),
+            apply.len()
+        );
+
+        // No speech to de-echo → true no-op (don't blast the whole track).
+        // Drop any stale cleaned WAV + pointer and return the current transcript.
+        if apply.is_empty() {
+            db.clear_mic_cleaned_wav(meeting_id)?;
+            let cleaned = std::path::Path::new(&mic_wav).with_file_name("mic_cleaned.wav");
+            let _ = std::fs::remove_file(&cleaned);
+            return Ok(DiarizedTranscript {
+                segments: db.meeting_segments(meeting_id)?,
+                speaker_count: db.get_meeting(meeting_id)?.speaker_count as usize,
+                audio_deleted: false,
+            });
+        }
+
+        run_offline_clean(
+            &app,
+            &asr,
+            &diarizer,
+            &voiceprint,
+            &db,
+            meeting_id,
+            &mic_wav,
+            &system_wav,
+            &windows,
+            offline_aec::ApplyScope::Ranges(apply),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Per-segment offline echo clean: learn the echo path from the user's marked
+/// echo regions (same as `clean_echo`), but apply the clean to a single
+/// `[start_ms, end_ms]` region only — the segment the user selected. Audio
+/// outside that region is left bit-identical, so any filter imperfection is
+/// confined to the requested segment (no "added echo to everything"). Reuses
+/// `run_offline_clean` + `retranscribe_and_rediarize`; emits the same
+/// `offline_aec:progress` events so the MeetingDetail progress bar works
+/// unchanged.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn clean_echo_segment(
+    app: AppHandle,
+    asr: State<'_, Arc<AsrEngine>>,
+    diarizer: State<'_, Arc<DiarizeEngine>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<DiarizedTranscript, String> {
+    let asr = asr.inner().clone();
+    let diarizer = diarizer.inner().clone();
+    let voiceprint = voiceprint.inner().clone();
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mic_wav, system_wav) = db.meeting_wavs(meeting_id)?;
+        let (mic_wav, system_wav) = match (mic_wav, system_wav) {
+            (Some(m), Some(s)) => (m, s),
+            _ => return Err("this meeting's audio files have been deleted".into()),
+        };
+
+        let windows = collect_echo_windows(&db, meeting_id)?;
+        let apply = vec![offline_aec::EchoWindow { start_ms, end_ms }];
+        eprintln!(
+            "[clean_echo_segment] meeting {meeting_id}: region {start_ms}..{end_ms} ms, {} marked echo window(s) for learning",
+            windows.len()
+        );
+
+        run_offline_clean(
+            &app,
+            &asr,
+            &diarizer,
+            &voiceprint,
+            &db,
+            meeting_id,
+            &mic_wav,
+            &system_wav,
+            &windows,
+            offline_aec::ApplyScope::Ranges(apply),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Revert an offline echo clean: drop the `mic_cleaned_wav` pointer and
+/// re-transcribe from the original `mic.wav`. Marks are snapshot/reapplied so
+/// echo/delete marks survive the rebuild.
+#[tauri::command]
+pub async fn revert_echo_clean(
+    app: AppHandle,
+    asr: State<'_, Arc<AsrEngine>>,
+    diarizer: State<'_, Arc<DiarizeEngine>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+) -> Result<DiarizedTranscript, String> {
+    let asr = asr.inner().clone();
+    let diarizer = diarizer.inner().clone();
+    let voiceprint = voiceprint.inner().clone();
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mic_wav, system_wav) = db.meeting_wavs(meeting_id)?;
+        let (mic_wav, system_wav) = match (mic_wav, system_wav) {
+            (Some(m), Some(s)) => (m, s),
+            _ => return Err("this meeting's audio files have been deleted".into()),
+        };
+        db.clear_mic_cleaned_wav(meeting_id)?;
+        // Best effort: remove the cleaned WAV from disk so we don't accumulate
+        // stale copies if the user re-runs a clean later.
+        let cleaned = std::path::Path::new(&mic_wav).with_file_name("mic_cleaned.wav");
+        let _ = std::fs::remove_file(&cleaned);
+        let model_id = meeting_asr_model(&db, meeting_id)?;
+        retranscribe_and_rediarize(
+            &app,
+            &asr,
+            &diarizer,
+            &voiceprint,
+            &db,
+            meeting_id,
+            &mic_wav,
+            &system_wav,
+            &model_id,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Re-transcribe an already-transcribed meeting with a different whisper model
+/// (the user's per-meeting pick from the dropdown), then re-diarize. Does NOT
+/// touch the global/live `settings.asr_model` — future recordings keep using
+/// that. The mic source is the echo-cleaned mic if one exists (so an echo clean
+/// survives a model swap), otherwise the original `mic.wav`. Echo/delete marks
+/// are snapshot/reapplied so they survive the rebuild, and the meeting's
+/// `asr_model` is recorded as `model_id` so the UI reflects the new model.
+#[tauri::command]
+pub async fn retranscribe_meeting(
+    app: AppHandle,
+    asr: State<'_, Arc<AsrEngine>>,
+    diarizer: State<'_, Arc<DiarizeEngine>>,
+    voiceprint: State<'_, Arc<VoiceprintEngine>>,
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+    model_id: String,
+) -> Result<DiarizedTranscript, String> {
+    let asr = asr.inner().clone();
+    let diarizer = diarizer.inner().clone();
+    let voiceprint = voiceprint.inner().clone();
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let detail = db.get_meeting(meeting_id)?;
+        let (mic_wav, system_wav) = match (detail.mic_wav.clone(), detail.system_wav.clone()) {
+            (Some(m), Some(s)) => (m, s),
+            _ => return Err("this meeting's audio files have been deleted".into()),
+        };
+        // Prefer the echo-cleaned mic if present so a clean survives a model swap.
+        let mic_path = detail.mic_cleaned_wav.unwrap_or(mic_wav);
+        retranscribe_and_rediarize(
+            &app,
+            &asr,
+            &diarizer,
+            &voiceprint,
+            &db,
+            meeting_id,
+            &mic_path,
+            &system_wav,
+            &model_id,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -602,6 +1094,233 @@ pub fn list_customer_summaries(
     customer_id: i64,
 ) -> Result<Vec<CustomerRollupRow>, String> {
     db.list_customer_summaries(customer_id)
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_tasks_for_customer(
+    db: State<'_, Arc<LazyDb>>,
+    customer_id: i64,
+) -> Result<Vec<Task>, String> {
+    db.list_tasks_for_customer(customer_id)
+}
+
+/// All tasks sourced from a meeting (suggested + open + done; dismissed
+/// excluded). Used by the meeting page's Tasks tab.
+#[tauri::command]
+pub fn list_tasks_for_meeting(
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+) -> Result<Vec<Task>, String> {
+    db.list_tasks_for_meeting(meeting_id)
+}
+
+/// All tasks for the global Tasks view (open + done, suggestions excluded).
+/// `sort` is `due` (default) | `priority` | `created`. Customer / priority /
+/// origin filtering is applied client-side over this result.
+#[tauri::command]
+pub fn list_all_tasks(
+    db: State<'_, Arc<LazyDb>>,
+    sort: Option<String>,
+) -> Result<Vec<Task>, String> {
+    db.list_all_tasks(sort.as_deref())
+}
+
+/// Create a manual task. `customerId` is required for manual creation; a
+/// `sourceMeetingId` may be supplied when creating from a meeting.
+#[tauri::command]
+pub fn create_task(
+    db: State<'_, Arc<LazyDb>>,
+    customer_id: i64,
+    title: String,
+    description: Option<String>,
+    priority: Option<String>,
+    due_at: Option<i64>,
+    source_meeting_id: Option<i64>,
+) -> Result<i64, String> {
+    db.create_task(
+        customer_id,
+        &title,
+        description.as_deref(),
+        priority.as_deref().unwrap_or("normal"),
+        due_at,
+        source_meeting_id,
+    )
+}
+
+#[tauri::command]
+pub fn update_task(
+    db: State<'_, Arc<LazyDb>>,
+    task_id: i64,
+    title: String,
+    description: Option<String>,
+    priority: Option<String>,
+    due_at: Option<i64>,
+) -> Result<(), String> {
+    db.update_task(
+        task_id,
+        &title,
+        description.as_deref(),
+        priority.as_deref().unwrap_or("normal"),
+        due_at,
+    )
+}
+
+/// Toggle a task's status between `open` and `done`.
+#[tauri::command]
+pub fn set_task_status(
+    db: State<'_, Arc<LazyDb>>,
+    task_id: i64,
+    status: String,
+) -> Result<(), String> {
+    db.set_task_status(task_id, &status)
+}
+
+#[tauri::command]
+pub fn delete_task(db: State<'_, Arc<LazyDb>>, task_id: i64) -> Result<(), String> {
+    db.delete_task(task_id)
+}
+
+/// Payload of `tasks:extraction:done`.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TasksExtractionDone {
+    pub meeting_id: i64,
+    pub count: usize,
+}
+
+/// Payload of `tasks:extraction:error`.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TasksExtractionError {
+    pub meeting_id: i64,
+    pub message: String,
+}
+
+/// Extract task suggestions from a meeting's **summary**. The candidate tasks
+/// come from the latest summary's `## My action items` block (the summary
+/// reads naturally — plain bullets with no `[priority]` tags or `due` clauses
+/// — so the deterministic parse yields a clean **title** per item). One
+/// best-effort LLM pass then looks at the action items + the transcript and
+/// suggests a priority, an optional due date, a transcript timestamp, and a
+/// supporting snippet per item; if that pass fails, suggestions are still
+/// inserted as title-only with default `normal` priority. Emits
+/// `tasks:extraction:done` (count) on success and `tasks:extraction:error`
+/// only on a DB insert failure. Returns `Err("generate a summary first")`
+/// when the meeting has no summary yet.
+#[tauri::command]
+pub async fn extract_meeting_tasks(
+    app: AppHandle,
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+    model: Option<String>,
+) -> Result<usize, String> {
+    run_extraction(app, db.inner().clone(), meeting_id, model).await
+}
+
+/// Shared extraction logic used by both the manual `extract_meeting_tasks`
+/// command and the auto-trigger spawned at the end of `summarize_meeting`.
+/// The summary parse produces action-item titles only; the enrichment LLM pass
+/// (items + transcript) suggests priority, due date, transcript anchor, and
+/// snippet. Best-effort and non-fatal: enrichment (LLM) failure degrades to
+/// title-only suggestions (default `normal` priority, no due date) rather
+/// than an error. Only DB failures and "no summary" surface as errors. Owns
+/// the `tasks:extraction:done`/`:error` events.
+async fn run_extraction(
+    app: AppHandle,
+    db: Arc<LazyDb>,
+    meeting_id: i64,
+    model: Option<String>,
+) -> Result<usize, String> {
+    let Some(latest) = db.get_latest_summary(meeting_id)? else {
+        return Err("generate a summary first".into());
+    };
+
+    let items = tasks::parse_action_items(&latest.content);
+    if items.is_empty() {
+        let _ = app.emit_to(
+            "main",
+            "tasks:extraction:done",
+            TasksExtractionDone {
+                meeting_id,
+                count: 0,
+            },
+        );
+        return Ok(0);
+    }
+
+    // Enrichment (best-effort): one LLM pass that looks at the action items +
+    // the transcript and suggests a priority, an optional due date, a
+    // transcript anchor, and a supporting snippet per item. Failure degrades
+    // silently to title-only suggestions (default `normal` priority) — no
+    // error event.
+    let mut enrichment: HashMap<usize, tasks::Enrichment> = HashMap::new();
+    if let Ok(meeting) = db.get_meeting(meeting_id) {
+        if !meeting.segments.is_empty() {
+            let settings = db.get_settings();
+            let transcript = summary::transcript_text(&meeting.segments, &meeting.renames);
+            let prompt = tasks::build_enrichment_prompt(&meeting.title, &transcript, &items);
+            if let Ok((raw, _model_id)) = dispatch_summary(
+                app.clone(),
+                settings,
+                prompt,
+                model,
+                Box::new(|_t, _i| {}), // non-streamed; enrichment output is short
+            )
+            .await
+            {
+                enrichment = tasks::parse_enrichment(&raw);
+            }
+        }
+    }
+
+    let suggestions = tasks::merge(&items, &enrichment);
+    let meeting = db.get_meeting(meeting_id)?;
+    let inserted = match db.insert_suggestions(meeting_id, meeting.customer_id, &suggestions) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = app.emit_to(
+                "main",
+                "tasks:extraction:error",
+                TasksExtractionError {
+                    meeting_id,
+                    message: e.clone(),
+                },
+            );
+            return Err(e);
+        }
+    };
+
+    let _ = app.emit_to(
+        "main",
+        "tasks:extraction:done",
+        TasksExtractionDone {
+            meeting_id,
+            count: inserted,
+        },
+    );
+    Ok(inserted)
+}
+
+/// Accept a suggestion: promote it to an `open` task assigned to `customer_id`
+/// (required). Errors if the task isn't a current suggestion.
+#[tauri::command]
+pub fn accept_task_suggestion(
+    db: State<'_, Arc<LazyDb>>,
+    task_id: i64,
+    customer_id: i64,
+) -> Result<(), String> {
+    db.accept_task_suggestion(task_id, customer_id)
+}
+
+/// Dismiss a suggestion so re-extraction won't re-suggest it. Errors if the
+/// task isn't a current suggestion.
+#[tauri::command]
+pub fn dismiss_task_suggestion(db: State<'_, Arc<LazyDb>>, task_id: i64) -> Result<(), String> {
+    db.dismiss_task_suggestion(task_id)
 }
 
 /// Reconstruct diarization turns from persisted system-channel segments.
@@ -1031,6 +1750,11 @@ pub struct SummaryResult {
     pub summary_id: i64,
     pub model: String,
     pub content: String,
+    /// Short AI-generated title produced from the summary, when the meeting's
+    /// title was still the default placeholder at summary time. `None`/null
+    /// means the title was left untouched (manually renamed, or generation
+    /// failed / produced nothing usable).
+    pub title: Option<String>,
 }
 
 /// Generate a summary for a meeting, streaming tokens via `summary:token`
@@ -1059,11 +1783,14 @@ pub async fn summarize_meeting(
     let prompt = summary::build_prompt(&template, &meeting.title, &transcript);
 
     let app_for_tokens = app.clone();
+    let app_for_title = app.clone();
+    let app_for_extract = app.clone();
+    let settings_for_title = settings.clone();
     let (content, model_id) = dispatch_summary(
         app,
         settings,
         prompt,
-        model,
+        model.clone(),
         Box::new(move |token, is_thinking| {
             let _ = app_for_tokens.emit_to(
                 "main",
@@ -1079,11 +1806,91 @@ pub async fn summarize_meeting(
     .await?;
 
     let summary_id = db.insert_summary(meeting_id, &model_id, &template, &content)?;
+
+    // Best-effort: if the title is still the recording-start placeholder,
+    // ask the model for a short title derived from the summary we just
+    // generated and persist it. Non-fatal — a failure or empty result
+    // leaves the existing title untouched and the summary still succeeds.
+    let generated_title = if meeting.title.starts_with(DEFAULT_TITLE_PREFIX) {
+        generate_meeting_title(app_for_title, settings_for_title, &content, model)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(t) = &generated_title {
+        let _ = db.update_title(meeting_id, t);
+    }
+
+    // Auto-trigger task extraction from the summary we just persisted.
+    // Fire-and-forget: run in the background so the summary result returns
+    // immediately and tasks populate on the Tasks tab via
+    // `tasks:extraction:done` when ready. Non-fatal — a failure inside
+    // `run_extraction` emits its own `tasks:extraction:error` and never
+    // affects the summary.
+    let db_arc = db.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = run_extraction(app_for_extract, db_arc, meeting_id, None).await;
+    });
+
     Ok(SummaryResult {
         summary_id,
         model: model_id,
         content,
+        title: generated_title,
     })
+}
+
+/// Ask the model for a short meeting title derived from `summary`. Uses the
+/// same dispatch/model as the summary itself, with a no-op token callback
+/// (the title is short and not streamed — it appears at the end). Returns
+/// `Ok(None)` when there's nothing to title from.
+async fn generate_meeting_title(
+    app: AppHandle,
+    settings: AppSettings,
+    summary: &str,
+    model: Option<String>,
+) -> Result<Option<String>, String> {
+    if summary.trim().is_empty() {
+        return Ok(None);
+    }
+    let prompt = summary::build_title_prompt(summary);
+    let (raw, _model_id) =
+        dispatch_summary(app, settings, prompt, model, Box::new(|_t, _i| {})).await?;
+    Ok(clean_title(&raw))
+}
+
+/// Normalize a model-produced title: trim, strip one layer of matching
+/// surrounding quotes, drop a trailing period, collapse internal whitespace,
+/// cap the length. Returns `None` if nothing usable remains.
+fn clean_title(raw: &str) -> Option<String> {
+    let mut s = raw.trim().to_string();
+    // Strip one layer of matching surrounding quotes (" or ').
+    if s.len() >= 2 {
+        let first = s.chars().next().unwrap();
+        let last = s.chars().last().unwrap();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            s = s[1..s.len() - 1].trim().to_string();
+        }
+    }
+    // Drop a single trailing period.
+    if s.ends_with('.') {
+        s.pop();
+        s = s.trim().to_string();
+    }
+    // Collapse internal whitespace runs to single spaces.
+    s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Cap length (keep whole words).
+    const MAX: usize = 100;
+    if s.chars().count() > MAX {
+        s = s.chars().take(MAX).collect();
+    }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Shared LLM dispatch for per-meeting summaries and customer rollups. Picks

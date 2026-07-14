@@ -65,6 +65,7 @@ mod tests {
             end_ms,
             text: "x".into(),
             speaker: None,
+            ..Default::default()
         }
     }
 
