@@ -60,4 +60,15 @@ jobs:
       - name: Build llama-server sidecar
         run: bash ${{ github.workspace }}/scripts/build-llama-server.sh
       - run: cargo clippy -- -D warnings
+      # A full-match target/ restore marks the sherpa-rs-sys build script
+      # fresh, so it never re-copies its dylibs into target/debug — but
+      # rust-cache prunes them from the saved cache, and the test binaries'
+      # @rpath only searches target/debug{,/deps} at runtime. Re-materialize
+      # them from the cached download dir so `cargo test` binaries can load.
+      # No-op on a fresh build (the build script copies them itself; -n keeps
+      # the fresh copies).
+      - name: Restore sherpa dylibs into target/debug
+        run: |
+          mkdir -p target/debug
+          find ~/Library/Caches/sherpa-rs -name '*.dylib' -exec cp -n {} target/debug/ \; || true
       - run: cargo test
