@@ -2022,22 +2022,48 @@ impl Db {
     }
 }
 
+/// First byte range `[start, end)` in `haystack` whose lowercased chars equal
+/// `needle_lower` (already lowercased). Returns `None` if no match. The range
+/// is in `haystack`'s bytes (not the lowercased copy), so it is safe to slice.
+fn ci_find_range(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
+    let nl: Vec<char> = needle_lower.chars().collect();
+    // Lowercased haystack, each char tagged with its original byte offset in
+    // `haystack` (one source char can lowercased-expand to several, e.g. 'İ').
+    let hl: Vec<(usize, char)> = haystack
+        .char_indices()
+        .flat_map(|(i, c)| c.to_lowercase().map(move |lc| (i, lc)).collect::<Vec<_>>())
+        .collect();
+    let n = nl.len();
+    if n == 0 || n > hl.len() {
+        return None;
+    }
+    for start in 0..=(hl.len() - n) {
+        if (0..n).all(|k| hl[start + k].1 == nl[k]) {
+            let byte_start = hl[start].0;
+            let byte_end = if start + n < hl.len() {
+                hl[start + n].0
+            } else {
+                haystack.len()
+            };
+            return Some((byte_start, byte_end));
+        }
+    }
+    None
+}
+
 /// Extract a short snippet around the first case-insensitive occurrence of
-/// `needle` in `haystack`, with `pad` chars of context on each side.
+/// `needle` in `haystack`, with `pad` bytes of context on each side. All slice
+/// boundaries are clamped to UTF-8 char boundaries, so this never panics on
+/// non-ASCII content.
 fn snippet_around(haystack: &str, needle: &str, pad: usize) -> String {
-    let hl = haystack.to_lowercase();
     let nl = needle.to_lowercase();
-    let (start, end) = match hl.find(&nl) {
-        Some(pos) => {
-            let s = pos.saturating_sub(pad);
-            let e = (pos + needle.len() + pad).min(haystack.len());
+    let (start, end) = match ci_find_range(haystack, &nl) {
+        Some((ms, me)) => {
+            let s = haystack.floor_char_boundary(ms.saturating_sub(pad));
+            let e = haystack.ceil_char_boundary((me + pad).min(haystack.len()));
             (s, e)
         }
-        None => {
-            // Fallback: first 80 chars.
-            let e = haystack.len().min(80);
-            (0, e)
-        }
+        None => (0, haystack.floor_char_boundary(haystack.len().min(80))),
     };
     let mut s = String::new();
     if start > 0 {
@@ -2664,5 +2690,26 @@ mod tests {
         assert_eq!(del.kind, "speech");
         // Default view still hides both; the system segment shows.
         assert_eq!(db.meeting_segments(meeting_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn snippet_around_handles_non_ascii_without_panic() {
+        // Multi-byte chars around/inside the match — the old code panicked here
+        // because pad (bytes) landed mid-character. "meeting" is preceded by an
+        // em-dash (3 bytes); "emoji" is preceded by a 4-byte 🎉.
+        let s = "café résumé — meeting notes with an em-dash and 🎉 emoji";
+        assert!(snippet_around(s, "meeting", 10)
+            .to_lowercase()
+            .contains("meeting"));
+        assert!(snippet_around(s, "em-dash", 20).contains("em-dash"));
+        assert!(snippet_around(s, "emoji", 5).contains("emoji"));
+        // Guaranteed match-branch repro of the old panic: 5 emojis (4 bytes
+        // each) push the match to byte 20; pad=6 makes start=14, which is
+        // mid-character inside the 3rd emoji. Old code panicked slicing here.
+        let stacked = "🎉🎉🎉🎉🎉hello";
+        assert!(snippet_around(stacked, "hello", 6).contains("hello"));
+        // No match: fallback path must not panic when byte 80 is mid-char.
+        let long: String = "xé".repeat(60); // every other char is 2 bytes
+        let _ = snippet_around(&long, "zzz", 40);
     }
 }
