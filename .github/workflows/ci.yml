@@ -36,5 +36,21 @@ jobs:
         with:
           workspaces: src-tauri
       - run: cargo fmt --check
+      # The lilnotes build script (tauri_build) validates that the
+      # `binaries/llama-server-<triple>` sidecar resource declared in
+      # tauri.conf.json (bundle.externalBin) exists — even for clippy/test,
+      # not just `tauri build`. Build it before the cargo commands that
+      # compile the crate. Cached so the multi-minute llama.cpp CMake build
+      # only runs on cache miss; the key includes the pinned llama.cpp ref
+      # (b9957) via the build script hash, so a ref bump busts the cache.
+      - name: Cache llama.cpp build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .llama.cpp
+            src-tauri/binaries
+          key: llama-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-llama-server.sh') }}
+      - name: Build llama-server sidecar
+        run: bash ${{ github.workspace }}/scripts/build-llama-server.sh
       - run: cargo clippy -- -D warnings
       - run: cargo test
