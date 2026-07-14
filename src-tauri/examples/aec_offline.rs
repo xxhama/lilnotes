@@ -17,6 +17,7 @@ use std::env;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 
 use lilnotes_lib::audio::aec;
+use lilnotes_lib::AecAggressiveness;
 
 const RATE: u32 = 16_000;
 
@@ -86,7 +87,8 @@ fn main() {
         system.len() as f64 / RATE as f64,
     );
 
-    let (mut aec, mut render) = aec::new_aec_pair(RATE).expect("APM init");
+    let (mut aec, mut render) =
+        aec::new_aec_pair(RATE, AecAggressiveness::Strong).expect("APM init");
 
     let frame = aec::FRAME_SAMPLES;
     // Feed render (system = reference) and capture (mic = forward) in

@@ -18,6 +18,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { createCustomer, deleteCustomer, listCustomers, type CustomerSummary } from "@/lib/ipc";
 import type { Route } from "@/App";
@@ -96,12 +97,12 @@ export default function CustomersView({ onNavigate }: Props) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <input
+          <Input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && add()}
             placeholder="Add a customer…"
-            className="h-9 flex-1 rounded-md border bg-card px-3 text-sm outline-none focus:border-ring"
+            className="h-9 flex-1 rounded-md bg-card px-3 text-sm"
           />
           <Button size="sm" onClick={add} disabled={!draft.trim()}>
             <Plus /> Add

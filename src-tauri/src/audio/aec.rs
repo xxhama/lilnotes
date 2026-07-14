@@ -22,10 +22,12 @@
 
 use std::sync::Arc;
 
+use crate::settings::AecAggressiveness;
 use webrtc_audio_processing::config::{
     AdaptiveDigital, EchoCanceller, FixedDigital, GainController, GainController2, HighPassFilter,
-    NoiseSuppression,
+    NoiseSuppression, NoiseSuppressionLevel,
 };
+use webrtc_audio_processing::experimental::EchoCanceller3Config;
 use webrtc_audio_processing::{Config, Processor, Stats};
 
 /// Samples per 10 ms frame at 16 kHz.
@@ -91,21 +93,84 @@ pub struct AecRenderFeeder {
     render_asm: FrameAssembler,
 }
 
-/// Builds a capture/render pair sharing one APM, configured for AEC3 Full
-/// (auto delay estimation) + high-pass filter + noise suppression at
-/// `sample_rate_hz` (16000). AGC2 (adaptive-digital) is enabled on the capture
-/// path so quieter speech is boosted to a consistent level — the gain is
-/// applied after AEC and NS, with a limiter preventing clipping. A noise floor
-/// (`max_output_noise_level_dbfs`) stops silence from being amplified.
-pub fn new_aec_pair(sample_rate_hz: u32) -> Result<(AecProcessor, AecRenderFeeder), String> {
-    let processor =
-        Arc::new(Processor::new(sample_rate_hz).map_err(|e| format!("APM init failed: {e}"))?);
+/// Builds a capture/render pair sharing one APM, configured for AEC3 + high-pass
+/// filter + noise suppression at `sample_rate_hz` (16000). AGC2 (adaptive-
+/// digital) is enabled on the capture path so quieter speech is boosted to a
+/// consistent level — the gain is applied after AEC and NS, with a limiter
+/// preventing clipping. A noise floor (`max_output_noise_level_dbfs`) stops
+/// silence from being amplified.
+///
+/// `aggressiveness` tunes how hard AEC3 + NS suppress speaker echo. The AEC3
+/// linear filter subtracts the echo path it learns from the render (system)
+/// reference; the *suppressor* + *noise suppression* mop up residual echo the
+/// filter missed — which is what leaks through in the loud-speaker / quiet-room
+/// case. Stronger presets lower the suppressor's echo-ratio thresholds (so
+/// suppression kicks in earlier/harder), shorten the weak-suppression initial
+/// state, and raise the NS level. Tradeoff: too aggressive can dull the user's
+/// own voice. Mapping:
+///
+/// | Knob                                         | Balanced | Strong | Maximum |
+/// | -------------------------------------------- | -------- | ------ | ------- |
+/// | NoiseSuppression level                       | Moderate | High   | VeryHigh|
+/// | suppressor.normal_tuning.mask_lf.enr_transp. | 0.30     | 0.15   | 0.07    |
+/// | suppressor.normal_tuning.mask_lf.enr_suppress| 0.40     | 0.20   | 0.10    |
+/// | suppressor.normal_tuning.mask_hf.enr_transp. | 0.07     | 0.04   | 0.02    |
+/// | suppressor.normal_tuning.mask_hf.enr_suppress| 0.10     | 0.05   | 0.03    |
+/// | filter.initial_state_seconds                 | 2.5      | 1.0    | 0.5     |
+///
+/// AEC3 runs with auto delay estimation (`stream_delay_ms: None`) — the mic and
+/// system capture threads have no shared clock, so we let APM's internal
+/// estimator align render and capture.
+pub fn new_aec_pair(
+    sample_rate_hz: u32,
+    aggressiveness: AecAggressiveness,
+) -> Result<(AecProcessor, AecRenderFeeder), String> {
+    // Build the AEC3 config from the single-channel default and tune the
+    // suppressor masks + initial-state duration per preset. Balanced uses the
+    // upstream defaults unchanged.
+    let mut aec3 = EchoCanceller3Config::default();
+    match aggressiveness {
+        AecAggressiveness::Balanced => {}
+        AecAggressiveness::Strong => {
+            let m = &mut aec3.suppressor.normal_tuning;
+            m.mask_lf.enr_transparent = 0.15;
+            m.mask_lf.enr_suppress = 0.20;
+            m.mask_hf.enr_transparent = 0.04;
+            m.mask_hf.enr_suppress = 0.05;
+            aec3.filter.initial_state_seconds = 1.0;
+        }
+        AecAggressiveness::Maximum => {
+            let m = &mut aec3.suppressor.normal_tuning;
+            m.mask_lf.enr_transparent = 0.07;
+            m.mask_lf.enr_suppress = 0.10;
+            m.mask_hf.enr_transparent = 0.02;
+            m.mask_hf.enr_suppress = 0.03;
+            aec3.filter.initial_state_seconds = 0.5;
+        }
+    }
+    // Clamp the hand-tuned values back into AEC3's valid ranges. We accept
+    // whatever clamping `validate` does — our values are well inside range.
+    let _ = aec3.validate();
+
+    let processor = Arc::new(
+        Processor::with_aec3_config(sample_rate_hz, aec3)
+            .map_err(|e| format!("APM init failed: {e}"))?,
+    );
+    let ns_level = match aggressiveness {
+        AecAggressiveness::Balanced => NoiseSuppressionLevel::Moderate,
+        AecAggressiveness::Strong => NoiseSuppressionLevel::High,
+        AecAggressiveness::Maximum => NoiseSuppressionLevel::VeryHigh,
+    };
+    // AEC3 is configured via the constructor; `echo_canceller: Some(default)`
+    // here just enables it (default == Full / AEC3, auto delay). NS level, HPF
+    // and AGC2 are set through the regular config.
     let config = Config {
-        echo_canceller: Some(EchoCanceller::Full {
-            stream_delay_ms: None,
-        }),
+        echo_canceller: Some(EchoCanceller::default()),
         high_pass_filter: Some(HighPassFilter::default()),
-        noise_suppression: Some(NoiseSuppression::default()),
+        noise_suppression: Some(NoiseSuppression {
+            level: ns_level,
+            ..Default::default()
+        }),
         gain_controller: Some(GainController::GainController2(GainController2 {
             // We capture at a fixed digital level (no analog gain slider to
             // drive), so the input-volume controller is off; the adaptive
@@ -238,7 +303,7 @@ mod tests {
     #[test]
     fn frame_assembler_flush_pads_tail() {
         let mut asm = FrameAssembler::new();
-        asm.push(&vec![0.7; 50]);
+        asm.push(&[0.7; 50]);
         let frame = asm.flush().expect("tail padded to 160");
         assert_eq!(frame.len(), 160);
         assert!(frame[..50].iter().all(|&s| s == 0.7));
@@ -249,7 +314,8 @@ mod tests {
     #[test]
     fn new_aec_pair_shares_processor() {
         // Just verify construction works at 16 kHz — the C++ APM must init.
-        let (mut aec, mut render) = new_aec_pair(16000).expect("APM init");
+        let (mut aec, mut render) =
+            new_aec_pair(16000, AecAggressiveness::Strong).expect("APM init");
 
         // Feed a render frame (system) then a capture frame (mic). A clean
         // (zero) render + zero capture should produce ~zero output and no

@@ -7,6 +7,7 @@
 
 pub mod aec;
 pub mod mic;
+pub mod offline_aec;
 pub mod pipeline;
 pub mod resampler;
 pub mod system_tap;
@@ -96,6 +97,7 @@ impl CaptureEngine {
         dir: PathBuf,
         live_tx: Option<Sender<LiveChunk>>,
         aec_enabled: bool,
+        aec_aggressiveness: crate::settings::AecAggressiveness,
     ) -> Result<StartedRecording, String> {
         let mut guard = self.active.lock().unwrap();
         if guard.is_some() {
@@ -119,8 +121,11 @@ impl CaptureEngine {
         // goes to the mic pipeline; the AecRenderFeeder (render) goes to the
         // system pipeline. Both share one inner Processor via Arc.
         let (aec_capture, aec_render) = if aec_enabled {
-            eprintln!("[aec] enabled — software AEC active (raw mic, WebRTC APM)");
-            let (cap, ren) = aec::new_aec_pair(resampler::TARGET_RATE)
+            eprintln!(
+                "[aec] enabled — software AEC active (raw mic, WebRTC APM, {:?})",
+                aec_aggressiveness
+            );
+            let (cap, ren) = aec::new_aec_pair(resampler::TARGET_RATE, aec_aggressiveness)
                 .map_err(|e| format!("AEC init failed: {e}"))?;
             (Some(cap), Some(ren))
         } else {

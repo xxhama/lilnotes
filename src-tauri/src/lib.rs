@@ -25,6 +25,8 @@ mod models;
 mod permissions;
 mod personas;
 mod settings;
+// Re-exported so the offline AEC example (separate crate) can construct a pair.
+pub use settings::AecAggressiveness;
 mod shutdown;
 mod summary;
 mod transcript;
@@ -126,6 +128,15 @@ pub fn run() {
             commands::diarize_meeting,
             commands::list_meetings,
             commands::get_meeting,
+            commands::list_hidden_segments,
+            commands::mark_segment_echo,
+            commands::unmark_segment_echo,
+            commands::delete_segment,
+            commands::restore_segment,
+            commands::clean_echo,
+            commands::clean_echo_segment,
+            commands::revert_echo_clean,
+            commands::retranscribe_meeting,
             commands::update_meeting_title,
             commands::update_meeting_notes,
             commands::rename_speaker,

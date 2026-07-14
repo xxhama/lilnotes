@@ -35,9 +35,12 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import AudioPlayer from "@/components/AudioPlayer";
-import CustomerPicker from "@/components/CustomerPicker";
 import NotesEditor from "@/components/NotesEditor";
+import TranscriptToolbar from "@/components/TranscriptToolbar";
+import PickerCombobox from "@/components/PickerCombobox";
 import SummaryPanel from "@/components/SummaryPanel";
 import TranscriptPane from "@/components/TranscriptPane";
 import { cn } from "@/lib/utils";
@@ -46,26 +49,47 @@ import {
   createCustomer,
   createPersona,
   deleteMeeting,
+  deleteSegment,
   diarizeMeeting,
   getMeeting,
   listCustomers,
+  listHiddenSegments,
   listPersonas,
+  markSegmentEcho,
+  cleanEcho,
+  cleanEchoSegment,
+  onOfflineAecProgress,
   onSpeakersIdentified,
   onVoiceprintsEnrolled,
+  listAsrModels,
   renameSpeaker,
+  retranscribeMeeting,
+  restoreSegment,
+  revertEchoClean,
   setMeetingCustomer,
   transcribeMeeting,
+  unmarkSegmentEcho,
   unlinkSpeakerPersona,
   updateMeetingNotes,
   updateMeetingTitle,
+  type AsrModelInfo,
   type CustomerSummary,
   type MeetingDetail as Meeting,
   type Persona,
+  type TranscriptSegment,
 } from "@/lib/ipc";
 import type { Route } from "@/App";
 
 interface Props {
   meetingId: string;
+  /** When true (set by the Record-page stop flow), auto-start speaker
+   * identification on load if the meeting still needs it. Falsy when opened
+   * from Home/CustomerDetail, so older meetings keep the manual button. */
+  autoDiarize?: boolean;
+  /** Customer id this meeting was opened from (set by CustomerDetail). When
+   * present, the header back button returns to that customer (scrolled to its
+   * Meetings section) instead of the Meetings list. */
+  fromCustomerId?: string;
   onNavigate: (route: Route) => void;
 }
 
@@ -103,11 +127,18 @@ function fmtSavedAt(ms: number): string {
  * Meeting detail: editable title, persisted transcript with renamable
  * speakers. Summary panel arrives in M6; export in M7.
  */
-export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
+export default function MeetingDetailView({
+  meetingId,
+  autoDiarize,
+  fromCustomerId,
+  onNavigate,
+}: Props) {
   const id = Number(meetingId);
   const [meeting, setMeeting] = useState<Meeting | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<"transcribing" | "diarizing" | null>(null);
+  const [busy, setBusy] = useState<"transcribing" | "diarizing" | "cleaning" | null>(null);
+  /** Offline AEC progress fraction (0..1) while `busy === "cleaning"`. */
+  const [aecPct, setAecPct] = useState<number | null>(null);
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
   /** "auto" or a declared remote-speaker count for re-identification. */
   const [numSpeakers, setNumSpeakers] = useState<string>("auto");
@@ -116,6 +147,10 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   const [assigning, setAssigning] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [tab, setTab] = useState<"review" | "transcript">("review");
+  /** When true, the transcript tab shows echo-marked + soft-deleted segments
+   * (fetched via `listHiddenSegments`) with Unmark/Restore actions. */
+  const [showHidden, setShowHidden] = useState(false);
+  const [hiddenSegments, setHiddenSegments] = useState<TranscriptSegment[] | null>(null);
   /** Seek request (ms from recording start) sent to the audio player when the
    * user clicks a transcript timestamp. A new value (even equal to the prior
    * one) re-triggers the seek; use a counter+ms pair so repeated clicks on the
@@ -132,6 +167,14 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   /** Delete-confirmation dialog (opened from the header overflow menu). */
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  /** Available whisper models (drives the re-transcribe dropdown). Downloaded
+   * models only are listed; the active flag marks the global live model. */
+  const [asrModels, setAsrModels] = useState<AsrModelInfo[]>([]);
+  /** Selected model id for the re-transcribe dropdown. Defaults to the meeting's
+   * recorded model, else the global active model, else the first downloaded. */
+  const [retranscribeModel, setRetranscribeModel] = useState<string>("");
+  /** Re-transcribe confirmation dialog. */
+  const [confirmRetranscribeOpen, setConfirmRetranscribeOpen] = useState(false);
   // Latest notes buffer + timers, kept in refs so the editor config (created
   // once) always persists the newest content without re-subscribing.
   const notesRef = useRef<string>("");
@@ -148,6 +191,79 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   }, [id]);
 
   useEffect(reload, [reload]);
+
+  // Load the whisper model registry once (drives the re-transcribe dropdown).
+  useEffect(() => {
+    listAsrModels()
+      .then(setAsrModels)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  // Default the re-transcribe dropdown to the meeting's recorded model, else
+  // the global active model, else the first downloaded model. Re-derives when
+  // the meeting changes or the model list loads so switching meetings resets it.
+  useEffect(() => {
+    if (asrModels.length === 0) return;
+    const defaultId =
+      meeting?.asrModel ??
+      asrModels.find((m) => m.active)?.id ??
+      asrModels.find((m) => m.downloaded)?.id ??
+      "";
+    setRetranscribeModel(defaultId);
+  }, [meeting?.asrModel, asrModels]);
+
+  // Eagerly fetch the full segment set (incl. echo / deleted) and keep it
+  // cached so toggling "show hidden" is instant — no empty flash while the
+  // fetch is in flight. Keyed on the meeting object so every reload (after a
+  // mutation, retranscribe, diarize, clean, rename, …) re-fetches the cache;
+  // when there are no hidden segments, drop it.
+  const refreshHidden = useCallback(() => {
+    listHiddenSegments(id)
+      .then(setHiddenSegments)
+      .catch((e) => setError(String(e)));
+  }, [id]);
+  useEffect(() => {
+    if (!meeting) return;
+    if (meeting.hiddenSegmentCount > 0) refreshHidden();
+    else setHiddenSegments(null);
+  }, [meeting, refreshHidden]);
+
+  /** Apply a per-segment mutation to every id in a group, then reload so the
+   *  transcript + hidden count reflect the new state. Mutations are sequential
+   *  (small N — a grouped run); reload fires after they all commit. The
+   *  meeting-keyed effect above re-fetches the hidden cache once reload lands. */
+  const mutateSegments = useCallback(
+    (ids: number[], fn: (segmentId: number) => Promise<void>) => {
+      (async () => {
+        for (const sid of ids) {
+          try {
+            await fn(sid);
+          } catch (e) {
+            setError(String(e));
+          }
+        }
+        reload();
+      })();
+    },
+    [reload],
+  );
+
+  const onMarkEcho = useCallback(
+    (ids: number[]) => mutateSegments(ids, markSegmentEcho),
+    [mutateSegments],
+  );
+  const onDeleteSegment = useCallback(
+    (ids: number[]) => mutateSegments(ids, deleteSegment),
+    [mutateSegments],
+  );
+  const onUnmarkEcho = useCallback(
+    (ids: number[]) => mutateSegments(ids, unmarkSegmentEcho),
+    [mutateSegments],
+  );
+  const onRestoreSegment = useCallback(
+    (ids: number[]) => mutateSegments(ids, restoreSegment),
+    [mutateSegments],
+  );
 
   // Seed the "Saved at" timestamp from the persisted value once the meeting for
   // the current id arrives (and again after any reload, e.g. diarization). The
@@ -169,6 +285,7 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
     saveGen.current = 0;
     setSeek(null);
     setCurrentMs(null);
+    setShowHidden(false);
     if (saveTimer.current) {
       clearTimeout(saveTimer.current);
       saveTimer.current = null;
@@ -328,6 +445,22 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
     }
   }, [id, reload, speakerCount]);
 
+  // Re-transcribe with the per-meeting selected model (does transcribe +
+  // diarize server-side in one call). Does not change the global/live model.
+  const runRetranscribe = useCallback(async () => {
+    if (!retranscribeModel) return;
+    setBusy("transcribing");
+    setError(null);
+    try {
+      await retranscribeMeeting(id, retranscribeModel);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+      reload();
+    }
+  }, [id, retranscribeModel, reload]);
+
   const runDiarization = useCallback(async () => {
     setBusy("diarizing");
     setError(null);
@@ -340,6 +473,99 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
       reload();
     }
   }, [id, reload, speakerCount]);
+
+  /** Run offline AEC on the mic using system.wav as the reference (seeded by
+   *  echo-marked mic segments), then re-transcribe + re-diarize. The original
+   *  mic.wav is preserved; `meeting.micCleanedWav` points at the cleaned copy. */
+  const runCleanEcho = useCallback(async () => {
+    setBusy("cleaning");
+    setAecPct(0);
+    setError(null);
+    try {
+      await cleanEcho(id);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+      setAecPct(null);
+      reload();
+    }
+  }, [id, reload]);
+
+  /** Drop the cleaned mic, re-transcribe from the original mic.wav. */
+  const runRevertEchoClean = useCallback(async () => {
+    setBusy("cleaning");
+    setAecPct(null);
+    setError(null);
+    try {
+      await revertEchoClean(id);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+      setAecPct(null);
+      reload();
+    }
+  }, [id, reload]);
+
+  /** Per-segment offline echo clean: cancel echo in one mic group's
+   *  `[startMs, endMs]` only (learns from marked echo regions; leaves the rest
+   *  of the mic bit-identical), then re-transcribe + re-diarize. Reuses the
+   *  same `busy:"cleaning"` + `aecPct` + progress subscription as the
+   *  whole-meeting clean. */
+  const onCleanEchoRange = useCallback(
+    async (startMs: number, endMs: number) => {
+      if (busy) return;
+      setBusy("cleaning");
+      setAecPct(0);
+      setError(null);
+      try {
+        await cleanEchoSegment(id, startMs, endMs);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusy(null);
+        setAecPct(null);
+        reload();
+      }
+    },
+    [busy, id, reload],
+  );
+
+  // Subscribe to offline AEC progress events for this meeting while a clean is
+  // running. The Rust side emits 0..=1 fractions under spawn_blocking.
+  useEffect(() => {
+    if (busy !== "cleaning") return;
+    let active = true;
+    const unlisten = onOfflineAecProgress((e) => {
+      if (active && e.meetingId === id) setAecPct(e.pct);
+    });
+    return () => {
+      active = false;
+      void unlisten.then((fn) => fn());
+    };
+  }, [busy, id]);
+
+  // Auto-start speaker identification on load when arriving from a just-ended
+  // recording (autoDiarize). Gated on needsDiarization so it only fires when
+  // there's an unlabeled system segment, and ref-guarded per meeting id so it
+  // runs at most once (survives StrictMode double-invoke + the async busy flip).
+  // When autoDiarize is falsy (opened from Home/CustomerDetail), older meetings
+  // keep the manual "Identify speakers" button + Remote-speakers count picker.
+  const autoDiarizedFor = useRef<number | null>(null);
+  useEffect(() => {
+    if (!autoDiarize || !meeting) return;
+    if (autoDiarizedFor.current === meeting.id) return;
+    if (busy !== null) return;
+    const hasAudio = Boolean(meeting.micWav && meeting.systemWav);
+    const needsDiarization =
+      meeting.segments.length > 0 &&
+      hasAudio &&
+      meeting.segments.some((s) => s.source === "system" && !s.speaker);
+    if (!needsDiarization) return;
+    autoDiarizedFor.current = meeting.id;
+    runDiarization();
+  }, [autoDiarize, meeting, busy, runDiarization]);
 
   const onRename = useCallback(
     async (raw: string, name: string) => {
@@ -397,18 +623,49 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
   const hasAudio = Boolean(meeting.micWav && meeting.systemWav);
   const needsDiarization =
     hasTranscript && hasAudio && meeting.segments.some((s) => s.source === "system" && !s.speaker);
+  const currentCustomer = customers.find((c) => c.id === meeting.customerId) ?? null;
+  // Downloaded models populate the re-transcribe dropdown (active = global live).
+  const downloadedModels = asrModels.filter((m) => m.downloaded);
+  // The reset value for the toolbar's Model select — the meeting's recorded
+  // model, else the global live model, else the first downloaded. Drives the
+  // Settings popover's dirty dot and matches the retranscribeModel default.
+  const defaultModelId =
+    meeting.asrModel ??
+    asrModels.find((m) => m.active)?.id ??
+    asrModels.find((m) => m.downloaded)?.id ??
+    "";
+  // Human-readable label for the model that produced this transcript, if known.
+  const transcribedWithLabel =
+    meeting.asrModel != null
+      ? (asrModels.find((m) => m.id === meeting.asrModel)?.label ?? meeting.asrModel)
+      : null;
 
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
       <div className="space-y-2 border-b p-6 pt-4 pb-4">
         <div className="flex items-center justify-between">
-          <button
-            onClick={() => onNavigate({ name: "home" })}
-            className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeft className="size-3.5" /> Meetings
-          </button>
+          {fromCustomerId ? (
+            <button
+              onClick={() =>
+                onNavigate({
+                  name: "customer",
+                  customerId: fromCustomerId,
+                  focusMeetings: true,
+                })
+              }
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft className="size-3.5" /> {currentCustomer?.name ?? "Customer"}
+            </button>
+          ) : (
+            <button
+              onClick={() => onNavigate({ name: "home" })}
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft className="size-3.5" /> Meetings
+            </button>
+          )}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -429,7 +686,7 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
         </div>
 
         {titleDraft !== null ? (
-          <input
+          <Input
             autoFocus
             value={titleDraft}
             onChange={(e) => setTitleDraft(e.target.value)}
@@ -438,16 +695,27 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
               if (e.key === "Enter") commitTitle();
               if (e.key === "Escape") setTitleDraft(null);
             }}
-            className="w-full rounded-md border bg-background px-2 py-1 text-lg font-semibold tracking-tight outline-none focus:border-ring"
+            className="w-full rounded-md bg-background px-2 py-1 text-lg font-semibold tracking-tight"
           />
         ) : (
-          <h1
-            className="cursor-text text-lg font-semibold tracking-tight hover:opacity-80"
-            title="Click to rename"
-            onClick={() => setTitleDraft(meeting.title)}
-          >
-            {meeting.title}
-          </h1>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <h1
+                tabIndex={0}
+                className="cursor-text text-lg font-semibold tracking-tight hover:opacity-80"
+                onClick={() => setTitleDraft(meeting.title)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setTitleDraft(meeting.title);
+                  }
+                }}
+              >
+                {meeting.title}
+              </h1>
+            </TooltipTrigger>
+            <TooltipContent>Click to rename</TooltipContent>
+          </Tooltip>
         )}
 
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -459,6 +727,12 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
               {meeting.speakerCount}
             </span>
           )}
+          {transcribedWithLabel && (
+            <span className="inline-flex items-center gap-1">
+              <FileText className="size-3" />
+              Transcribed with: {transcribedWithLabel}
+            </span>
+          )}
           {!hasAudio && (
             <span className="rounded-full bg-secondary px-2 py-0.5">audio deleted</span>
           )}
@@ -466,40 +740,40 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
 
         <div className="flex items-center gap-2 pt-1 text-xs text-muted-foreground">
           <span>Customer</span>
-          <div className="relative">
-            <button
-              disabled={assigning}
-              onClick={() => setPickerOpen((o) => !o)}
-              className="inline-flex h-7 max-w-56 items-center gap-1 rounded-md border bg-card px-1.5 text-xs outline-none hover:bg-accent focus:border-ring disabled:opacity-50"
-            >
-              <span className="truncate">
-                {customers.find((c) => c.id === meeting.customerId)?.name ?? "Unassigned"}
-              </span>
-              <ChevronDown className="size-3 shrink-0 opacity-60" />
-            </button>
-            {pickerOpen && (
-              <>
-                {/* click-outside backdrop */}
-                <button
-                  aria-hidden
-                  tabIndex={-1}
-                  onClick={() => setPickerOpen(false)}
-                  className="fixed inset-0 z-40 cursor-default"
-                />
-                <CustomerPicker
-                  current={customers.find((c) => c.id === meeting.customerId) ?? null}
-                  customers={customers}
-                  onAssign={(cid) => assignCustomer(cid)}
-                  onCreateCustomer={createCustomerInline}
-                  onDismiss={() => setPickerOpen(false)}
-                />
-              </>
-            )}
-          </div>
+          <PickerCombobox
+            open={pickerOpen}
+            onOpenChange={setPickerOpen}
+            trigger={
+              <button
+                disabled={assigning}
+                className="flex w-fit max-w-56 items-center justify-between gap-2 rounded-md border border-input bg-card px-3 py-2 text-xs whitespace-nowrap shadow-xs transition-[color,box-shadow] outline-none dark:bg-input/30 dark:hover:bg-input/50 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 data-[placeholder]:text-muted-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 [&_svg:not([class*='text-'])]:text-muted-foreground"
+              >
+                <span
+                  className="truncate data-[placeholder]:text-muted-foreground"
+                  data-placeholder={currentCustomer ? undefined : ""}
+                >
+                  {currentCustomer?.name ?? "Unassigned"}
+                </span>
+                <ChevronDown className="size-4 opacity-50" />
+              </button>
+            }
+            items={customers
+              .filter((c) => c.id !== meeting.customerId)
+              .map((c) => ({ id: c.id, label: c.name, sublabel: `${c.meetingCount} mtgs` }))}
+            currentId={meeting.customerId ?? null}
+            currentLabel={currentCustomer?.name}
+            currentSublabel={currentCustomer ? `${currentCustomer.meetingCount} mtgs` : undefined}
+            onPick={assignCustomer}
+            onCreate={createCustomerInline}
+            onUnassign={meeting.customerId != null ? () => assignCustomer(null) : undefined}
+            unassignLabel="Unassign customer"
+            createNoun="customer"
+            placeholder="Search customers…"
+          />
           {assigning && <Loader2 className="size-3 animate-spin" />}
         </div>
 
-        <div className="flex gap-2 pt-1">
+        <div className="flex items-center gap-2 pt-1">
           {!hasTranscript && hasAudio && (
             <Button size="sm" onClick={runTranscription} disabled={busy !== null}>
               {busy ? <Loader2 className="animate-spin" /> : <FileText />}
@@ -510,31 +784,17 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
                   : "Transcribe"}
             </Button>
           )}
-          {hasTranscript && hasAudio && busy === null && (
-            <div className="flex items-center gap-2">
-              <Button size="sm" variant="outline" onClick={runDiarization}>
-                <Users /> {needsDiarization ? "Identify speakers" : "Re-identify speakers"}
-              </Button>
-              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                Remote speakers:
-                <select
-                  value={numSpeakers}
-                  onChange={(e) => setNumSpeakers(e.target.value)}
-                  className="h-7 rounded-md border bg-card px-1.5 text-xs outline-none focus:border-ring"
-                >
-                  <option value="auto">Auto</option>
-                  {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
-                    <option key={n} value={n}>
-                      {n}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          )}
-          {busy === "diarizing" && hasTranscript && (
+          {/* Cross-tab awareness: a transcript action running while the user is
+           * on the Review tab. The Transcript tab shows rich progress in its own
+           * toolbar; this compact pill just says "something is running". */}
+          {hasTranscript && busy !== null && tab !== "transcript" && (
             <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin" /> Identifying speakers…
+              <Loader2 className="size-3.5 animate-spin" />
+              {busy === "diarizing"
+                ? "Identifying speakers…"
+                : busy === "transcribing"
+                  ? "Re-transcribing…"
+                  : "Cleaning echo…"}
             </span>
           )}
         </div>
@@ -568,39 +828,41 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             <div className="flex items-center justify-between border-b px-4 h-11">
               <span className="text-xs font-medium text-muted-foreground">Notes</span>
-              <span
-                key={notesStatus}
-                title={
-                  notesStatus === "saved"
-                    ? savedAtMs != null
-                      ? `Saved at ${fmtSavedAt(savedAtMs)}`
-                      : "Saved"
-                    : undefined
-                }
-                className={
-                  "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium animate-in fade-in duration-200 " +
-                  (notesStatus === "saved"
-                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                    : "bg-muted text-muted-foreground")
-                }
-              >
-                {notesStatus === "modified" ? (
-                  <>
-                    <Pencil className="size-3" />
-                    Modified
-                  </>
-                ) : notesStatus === "saving" ? (
-                  <>
-                    <Loader2 className="size-3 animate-spin" />
-                    Saving…
-                  </>
-                ) : (
-                  <>
-                    <Check className="size-3" />
-                    Saved
-                  </>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    key={notesStatus}
+                    className={
+                      "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium animate-in fade-in duration-200 " +
+                      (notesStatus === "saved"
+                        ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                        : "bg-muted text-muted-foreground")
+                    }
+                  >
+                    {notesStatus === "modified" ? (
+                      <>
+                        <Pencil className="size-3" />
+                        Modified
+                      </>
+                    ) : notesStatus === "saving" ? (
+                      <>
+                        <Loader2 className="size-3 animate-spin" />
+                        Saving…
+                      </>
+                    ) : (
+                      <>
+                        <Check className="size-3" />
+                        Saved
+                      </>
+                    )}
+                  </span>
+                </TooltipTrigger>
+                {notesStatus === "saved" && (
+                  <TooltipContent>
+                    {savedAtMs != null ? `Saved at ${fmtSavedAt(savedAtMs)}` : "Saved"}
+                  </TooltipContent>
                 )}
-              </span>
+              </Tooltip>
             </div>
             <div className="min-h-0 flex-1">
               <NotesEditor
@@ -612,24 +874,50 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
             </div>
           </div>
           <aside className="w-96 shrink-0 border-l bg-card/40">
-            <SummaryPanel meetingId={id} hasTranscript={hasTranscript} />
+            <SummaryPanel
+              meetingId={id}
+              hasTranscript={hasTranscript}
+              onTitleGenerated={(title) => {
+                // The backend already persisted the AI title; just reflect it in
+                // local state so the <h1> updates without a full reload. Skip if
+                // the user is mid-rename so their draft isn't clobbered.
+                if (titleDraft === null) setMeeting((m) => (m ? { ...m, title } : m));
+              }}
+            />
           </aside>
         </div>
 
-        {/* Transcript tab: audio player + full-width transcript */}
+        {/* Transcript tab: toolbar + full-width transcript (audio player is
+            page-level, above the tabs) */}
         <div className={"absolute inset-0 flex flex-col " + (tab === "transcript" ? "" : "hidden")}>
           {hasTranscript ? (
             <>
-              {hasAudio && (
-                <AudioPlayer
-                  micWav={meeting.micWav!}
-                  systemWav={meeting.systemWav!}
-                  seek={seek}
-                  onTimeUpdate={setCurrentMs}
+              {/* Transcript toolbar — operations | Settings popover | view
+               * toggle. Presentational; all state/handlers live in this view. */}
+              {hasTranscript && (hasAudio || meeting.hiddenSegmentCount > 0) && (
+                <TranscriptToolbar
+                  hasAudio={hasAudio}
+                  busy={busy}
+                  aecPct={aecPct}
+                  needsDiarization={needsDiarization}
+                  hiddenSegmentCount={meeting.hiddenSegmentCount}
+                  hasCleanedMic={Boolean(meeting.micCleanedWav)}
+                  downloadedModels={downloadedModels}
+                  retranscribeModel={retranscribeModel}
+                  onRetranscribeModelChange={setRetranscribeModel}
+                  defaultModelId={defaultModelId}
+                  numSpeakers={numSpeakers}
+                  onNumSpeakersChange={setNumSpeakers}
+                  showHidden={showHidden}
+                  onToggleHidden={() => setShowHidden((v) => !v)}
+                  onRetranscribe={() => setConfirmRetranscribeOpen(true)}
+                  onReidentify={runDiarization}
+                  onCleanEcho={runCleanEcho}
+                  onRevertEchoClean={runRevertEchoClean}
                 />
               )}
               <TranscriptPane
-                segments={meeting.segments}
+                segments={showHidden ? (hiddenSegments ?? []) : meeting.segments}
                 renames={meeting.renames}
                 onRenameSpeaker={onRename}
                 speakerLinks={meeting.speakerLinks}
@@ -641,6 +929,12 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
                   hasAudio ? (ms) => setSeek((prev) => ({ ms, n: (prev?.n ?? 0) + 1 })) : undefined
                 }
                 currentMs={hasAudio ? (currentMs ?? undefined) : undefined}
+                onMarkEcho={onMarkEcho}
+                onCleanEchoRange={onCleanEchoRange}
+                onDeleteSegment={onDeleteSegment}
+                onUnmarkEcho={onUnmarkEcho}
+                onRestoreSegment={onRestoreSegment}
+                showHidden={showHidden}
                 className="min-h-0 flex-1"
               />
             </>
@@ -653,6 +947,20 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
           )}
         </div>
       </div>
+
+      {/* Bottom-docked audio player — last row of the detail-pane flex column,
+          so the Body (flex-1) above it shrinks to fit and nothing scrolls
+          behind it. Visible on both Review and Transcript at every scroll
+          position. Single instance; lifted playback state (seek/currentMs)
+          and tab-switch survival are unchanged. Gated on hasAudio only. */}
+      {hasAudio && (
+        <AudioPlayer
+          micWav={meeting.micCleanedWav ?? meeting.micWav!}
+          systemWav={meeting.systemWav!}
+          seek={seek}
+          onTimeUpdate={setCurrentMs}
+        />
+      )}
 
       <AlertDialog
         open={confirmDeleteOpen}
@@ -681,6 +989,41 @@ export default function MeetingDetailView({ meetingId, onNavigate }: Props) {
             >
               {deleting ? <Loader2 className="animate-spin" /> : <Trash2 />}
               Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={confirmRetranscribeOpen}
+        onOpenChange={(open) => {
+          if (!open && busy !== "transcribing") setConfirmRetranscribeOpen(false);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Re-transcribe with{" "}
+              {asrModels.find((m) => m.id === retranscribeModel)?.label ?? retranscribeModel}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This replaces the current transcript and speaker labels using the selected model. Echo
+              and delete marks are preserved. This does not change the model used for future
+              recordings.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy === "transcribing"}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busy === "transcribing"}
+              onClick={(e) => {
+                e.preventDefault();
+                setConfirmRetranscribeOpen(false);
+                runRetranscribe();
+              }}
+            >
+              {busy === "transcribing" ? <Loader2 className="animate-spin" /> : <FileText />}
+              Re-transcribe
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -42,7 +42,10 @@ fi
 
 # Build with CMake. Static linking so the binary is self-contained (no
 # @rpath dylib dependencies). Metal is enabled by default on Apple Silicon.
-# Disable OpenSSL (we only use HTTP on localhost) and the web UI (not needed).
+# Disable OpenSSL (we only use HTTP on localhost) and the web UI (not needed):
+# LLAMA_BUILD_UI skips the npm build, LLAMA_USE_PREBUILT_UI skips the HF Bucket
+# download — both must be off, or the server build pulls a partial UI asset bundle
+# and fails on missing assets (e.g. loading.html).
 echo "build-llama-server: cmake configure…"
 cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -50,6 +53,7 @@ cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
   -DBUILD_SHARED_LIBS=OFF \
   -DLLAMA_OPENSSL=OFF \
   -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF \
   -DLLAMA_BUILD_TESTS=OFF \
   -DLLAMA_BUILD_EXAMPLES=OFF
 
