@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, ExitRequestApi, Manager, RunEvent};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::asr::Segment;
+use crate::asr::{AsrEngine, Segment};
 use crate::audio::CaptureEngine;
 use crate::commands::AsrSession;
 use crate::db::LazyDb;
@@ -135,6 +135,14 @@ fn cleanup_on_exit(app: &AppHandle) {
         if let Err(e) = sidecar.unload(app) {
             eprintln!("[shutdown] error killing sidecar: {e}");
         }
+    }
+
+    // 1b. Drop the whisper model (context + state, ~700 MB incl. the Metal
+    //     backend). The idle-unload watcher would free it eventually, but
+    //     exit should release GPU memory promptly. In-process state, so no
+    //     orphaned child to worry about — just drop the LoadedModel.
+    if let Some(asr) = app.try_state::<Arc<AsrEngine>>() {
+        asr.unload();
     }
 
     // 2. Stop recording if still active (defensive — covers system-forced

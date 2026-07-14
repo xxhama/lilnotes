@@ -4,9 +4,10 @@
  * speaker links). Reached from the sidebar nav.
  */
 import { useCallback, useEffect, useState } from "react";
-import { Trash2, Users } from "lucide-react";
+import { Plus, Trash2, Users } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   createPersona,
   deleteAllVoiceprints,
@@ -99,15 +100,15 @@ export default function PersonasView() {
       </div>
 
       <div className="flex gap-2">
-        <input
+        <Input
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && add()}
           placeholder="New persona name…"
-          className="h-9 flex-1 rounded-md border bg-background px-2 text-sm outline-none focus:border-ring"
+          className="h-9 flex-1 rounded-md bg-background px-2 text-sm"
         />
         <Button size="sm" onClick={add} disabled={!draft.trim()}>
-          Add
+          <Plus /> Add
         </Button>
       </div>
 
@@ -123,7 +124,7 @@ export default function PersonasView() {
           <div key={p.id} className="flex items-center justify-between gap-3 p-3">
             <div className="min-w-0 flex-1">
               {editingId === p.id ? (
-                <input
+                <Input
                   autoFocus
                   value={editDraft}
                   onChange={(e) => setEditDraft(e.target.value)}
@@ -132,7 +133,7 @@ export default function PersonasView() {
                     if (e.key === "Enter") commitRename(p.id);
                     if (e.key === "Escape") setEditingId(null);
                   }}
-                  className="w-full rounded-md border bg-background px-2 py-0.5 text-sm outline-none focus:border-ring"
+                  className="w-full rounded-md bg-background px-2 py-0.5 text-sm"
                 />
               ) : (
                 <button

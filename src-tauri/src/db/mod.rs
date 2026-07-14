@@ -96,6 +96,9 @@ pub struct MeetingDetail {
     pub ended_at_ms: Option<i64>,
     pub mic_wav: Option<String>,
     pub system_wav: Option<String>,
+    /// Path to an offline echo-cleaned mic WAV, if `clean_echo` has been run.
+    /// The UI / AudioPlayer / re-transcribe prefer this over `mic_wav`.
+    pub mic_cleaned_wav: Option<String>,
     pub notes: Option<String>,
     /// Wall-clock epoch ms of the last `update_notes` write; null until notes
     /// have ever been saved. Surfaced to the UI for the "Saved at" tooltip.
@@ -108,6 +111,28 @@ pub struct MeetingDetail {
     pub speaker_count: i64,
     /// Customer (account) this meeting belongs to; null = unassigned.
     pub customer_id: Option<i64>,
+    /// Number of segments hidden from the default transcript (echo-marked or
+    /// soft-deleted). Drives the "Show N hidden" toggle in the UI.
+    pub hidden_segment_count: i64,
+    /// Whisper model id that produced this meeting's transcript (e.g.
+    /// "large-v3-turbo"). Recorded at transcription time; null for meetings
+    /// transcribed before this column existed. The Meeting Detail UI shows it
+    /// as "Transcribed with: <label>" and defaults the re-transcribe dropdown
+    /// to it. Echo-clean re-transcribes keep this model instead of jumping to
+    /// the current global setting.
+    pub asr_model: Option<String>,
+}
+
+/// A saved echo/delete mark on a segment, keyed by `(source, start_ms)` so it
+/// can be re-applied after a re-transcribe replaces the segment rows (new ids,
+/// possibly slightly shifted timestamps). Short-lived: snapshoted before a
+/// `replace_segments` and dropped right after `reapply_marks`.
+#[derive(Clone)]
+pub struct SegmentMark {
+    pub source: String,
+    pub start_ms: u64,
+    pub kind: String,
+    pub deleted: bool,
 }
 
 impl Db {
@@ -266,6 +291,84 @@ impl Db {
             )
             .map_err(|e| format!("migration to v4 failed: {e}"))?;
         }
+        if version < 5 {
+            // Echo handling: per-segment kind ('speech' | 'echo') + soft-delete
+            // flag, and a cleaned-mic path on the meeting (written by the
+            // offline echo re-processing command). Defaults make existing rows
+            // appear as normal speech / not-deleted / no cleaned mic.
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE segments ADD COLUMN kind TEXT NOT NULL DEFAULT 'speech';
+                ALTER TABLE segments ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE meetings ADD COLUMN mic_cleaned_wav TEXT;
+                PRAGMA user_version = 5;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v5 failed: {e}"))?;
+        }
+        if version < 6 {
+            // Per-meeting ASR model tracking. Records which whisper model
+            // produced each meeting's transcript, so the UI can show it and
+            // re-transcribe with the same (or a different) model without
+            // touching the global live setting. Nullable: meetings transcribed
+            // before this migration have NULL and the UI treats that as
+            // "unknown" (no "Transcribed with" label; dropdown defaults to the
+            // global active model).
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE meetings ADD COLUMN asr_model TEXT;
+                PRAGMA user_version = 6;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v6 failed: {e}"))?;
+        }
+        if version < 7 {
+            // Tasks: to-dos tied to a customer, created manually or AI-extracted
+            // from a transcript. `customer_id` is nullable to hold customer-less
+            // AI suggestions until they're accepted (a customer is assigned at
+            // accept time); manual creation always sets it. `ON DELETE CASCADE`
+            // on customer_id is a deliberate product choice — deleting a customer
+            // takes its tasks with it (unlike meetings, which are orphaned).
+            // `source_meeting_id` is `ON DELETE SET NULL` so an accepted task
+            // survives its meeting being deleted (it just loses the link);
+            // pending suggestions are dropped app-level in `delete_meeting`.
+            // The transcript-segment reference is a *timestamp anchor*
+            // (`source_start_ms`), NOT a `segments.id` FK — segment ids are
+            // unstable across re-transcribe (see `replace_segments`); resolve to
+            // a segment at display time with the same ±250ms tolerance
+            // `reapply_marks` uses.
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE tasks(
+                    id                INTEGER PRIMARY KEY,
+                    customer_id       INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+                    source_meeting_id INTEGER REFERENCES meetings(id)  ON DELETE SET NULL,
+                    source_start_ms   INTEGER,
+                    source_end_ms     INTEGER,
+                    snippet           TEXT,
+                    title             TEXT NOT NULL,
+                    description       TEXT,
+                    status            TEXT NOT NULL DEFAULT 'open',
+                    priority          TEXT NOT NULL DEFAULT 'normal',
+                    due_at            INTEGER,
+                    origin            TEXT NOT NULL DEFAULT 'manual',
+                    created_at        INTEGER NOT NULL,
+                    completed_at      INTEGER
+                );
+                CREATE INDEX idx_tasks_customer ON tasks(customer_id, status);
+                CREATE INDEX idx_tasks_meeting  ON tasks(source_meeting_id, status);
+                CREATE INDEX idx_tasks_due      ON tasks(due_at, status);
+                PRAGMA user_version = 7;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v7 failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -333,6 +436,9 @@ impl Db {
         if let Some(v) = get("aec_enabled") {
             s.aec_enabled = v == "true";
         }
+        if let Some(v) = get("aec_aggressiveness") {
+            s.aec_aggressiveness = crate::settings::AecAggressiveness::parse(&v);
+        }
         if let Some(v) = get("onboarding_complete") {
             s.onboarding_complete = v == "true";
         }
@@ -382,6 +488,10 @@ impl Db {
             s.voiceprint_gallery_cap.to_string(),
         )?;
         put("aec_enabled", s.aec_enabled.to_string())?;
+        put(
+            "aec_aggressiveness",
+            s.aec_aggressiveness.as_str().to_string(),
+        )?;
         put("onboarding_complete", s.onboarding_complete.to_string())?;
         put("summary_backend", s.summary_backend.clone())?;
         Ok(())
@@ -509,9 +619,9 @@ impl Db {
 
     pub fn get_meeting(&self, id: i64) -> Result<MeetingDetail, String> {
         let conn = self.conn.lock().unwrap();
-        let (session_id, title, started_at_ms, ended_at_ms, mic_wav, system_wav, notes, notes_updated_at_ms, customer_id) = conn
+        let (session_id, title, started_at_ms, ended_at_ms, mic_wav, system_wav, mic_cleaned_wav, notes, notes_updated_at_ms, customer_id, asr_model) = conn
             .query_row(
-                "SELECT session_id, title, started_at, ended_at, mic_wav, system_wav, notes, notes_updated_at, customer_id
+                "SELECT session_id, title, started_at, ended_at, mic_wav, system_wav, mic_cleaned_wav, notes, notes_updated_at, customer_id, asr_model
                  FROM meetings WHERE id = ?1",
                 params![id],
                 |r| {
@@ -523,8 +633,10 @@ impl Db {
                         r.get::<_, Option<String>>(4)?,
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
-                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<String>>(7)?,
                         r.get::<_, Option<i64>>(8)?,
+                        r.get::<_, Option<i64>>(9)?,
+                        r.get::<_, Option<String>>(10)?,
                     ))
                 },
             )
@@ -533,24 +645,41 @@ impl Db {
         let segments: Vec<Segment> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT source, speaker, start_ms, end_ms, text FROM segments
-                     WHERE meeting_id = ?1 ORDER BY start_ms",
+                    // Hide echo-marked + soft-deleted segments from the default
+                    // transcript + summary (user chose "hide entirely"). The
+                    // "show hidden" UI path uses `meeting_segments_all`.
+                    "SELECT id, source, speaker, start_ms, end_ms, text, kind, deleted
+                     FROM segments
+                     WHERE meeting_id = ?1 AND deleted = 0 AND kind = 'speech'
+                     ORDER BY start_ms",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map(params![id], |r| {
                     Ok(Segment {
-                        source: r.get(0)?,
-                        speaker: r.get(1)?,
-                        start_ms: r.get::<_, i64>(2)? as u64,
-                        end_ms: r.get::<_, i64>(3)? as u64,
-                        text: r.get(4)?,
+                        id: r.get(0)?,
+                        source: r.get(1)?,
+                        speaker: r.get(2)?,
+                        start_ms: r.get::<_, i64>(3)? as u64,
+                        end_ms: r.get::<_, i64>(4)? as u64,
+                        text: r.get(5)?,
+                        kind: r.get(6)?,
+                        deleted: r.get::<_, i64>(7)? == 1,
                     })
                 })
                 .map_err(|e| e.to_string())?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?
         };
+
+        let hidden_segment_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments
+                 WHERE meeting_id = ?1 AND (deleted = 1 OR kind = 'echo')",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
 
         let renames: std::collections::HashMap<String, String> = {
             let mut stmt = conn
@@ -611,6 +740,7 @@ impl Db {
             ended_at_ms,
             mic_wav,
             system_wav,
+            mic_cleaned_wav,
             notes,
             notes_updated_at_ms,
             segments,
@@ -618,6 +748,8 @@ impl Db {
             speaker_links,
             speaker_count,
             customer_id,
+            hidden_segment_count,
+            asr_model,
         })
     }
 
@@ -718,6 +850,51 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Record the path of an offline echo-cleaned mic WAV produced by
+    /// `clean_echo`. The original `mic.wav` is preserved so the action is
+    /// revertible via `clear_mic_cleaned_wav`.
+    pub fn set_mic_cleaned_wav(&self, id: i64, path: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET mic_cleaned_wav = ?2 WHERE id = ?1",
+                params![id, path],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Record which whisper model produced this meeting's transcript. Called
+    /// after every successful transcription (first-pass, re-transcribe, and
+    /// echo-clean re-transcribe) so the UI can show "Transcribed with" and
+    /// default the re-transcribe dropdown to it.
+    pub fn set_meeting_asr_model(&self, id: i64, model_id: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET asr_model = ?2 WHERE id = ?1",
+                params![id, model_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drop the echo-cleaned mic WAV pointer, reverting to the original
+    /// `mic.wav` for playback and re-transcription.
+    pub fn clear_mic_cleaned_wav(&self, id: i64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET mic_cleaned_wav = NULL WHERE id = ?1",
+                params![id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     // -----------------------------------------------------------------------
     // Segments + speakers
     // -----------------------------------------------------------------------
@@ -734,8 +911,8 @@ impl Db {
         {
             let mut stmt = tx
                 .prepare(
-                    "INSERT INTO segments(meeting_id, source, speaker, start_ms, end_ms, text)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO segments(meeting_id, source, speaker, start_ms, end_ms, text, kind, deleted)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .map_err(|e| e.to_string())?;
             for s in segments {
@@ -745,7 +922,9 @@ impl Db {
                     s.speaker,
                     s.start_ms as i64,
                     s.end_ms as i64,
-                    s.text
+                    s.text,
+                    s.kind,
+                    s.deleted as i64
                 ])
                 .map_err(|e| e.to_string())?;
             }
@@ -801,24 +980,133 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT source, speaker, start_ms, end_ms, text FROM segments
-                 WHERE meeting_id = ?1 ORDER BY start_ms",
+                // Default view: hide echo-marked + soft-deleted segments.
+                "SELECT id, source, speaker, start_ms, end_ms, text, kind, deleted
+                 FROM segments
+                 WHERE meeting_id = ?1 AND deleted = 0 AND kind = 'speech'
+                 ORDER BY start_ms",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![id], |r| {
                 Ok(Segment {
-                    source: r.get(0)?,
-                    speaker: r.get(1)?,
-                    start_ms: r.get::<_, i64>(2)? as u64,
-                    end_ms: r.get::<_, i64>(3)? as u64,
-                    text: r.get(4)?,
+                    id: r.get(0)?,
+                    source: r.get(1)?,
+                    speaker: r.get(2)?,
+                    start_ms: r.get::<_, i64>(3)? as u64,
+                    end_ms: r.get::<_, i64>(4)? as u64,
+                    text: r.get(5)?,
+                    kind: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? == 1,
                 })
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(rows)
+    }
+
+    /// Every segment for a meeting, including echo-marked + soft-deleted ones,
+    /// with `kind`/`deleted` populated. Used by the "show hidden" UI path and
+    /// by `clean_echo` to collect echo windows.
+    pub fn meeting_segments_all(&self, id: i64) -> Result<Vec<Segment>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source, speaker, start_ms, end_ms, text, kind, deleted
+                 FROM segments WHERE meeting_id = ?1 ORDER BY start_ms",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![id], |r| {
+                Ok(Segment {
+                    id: r.get(0)?,
+                    source: r.get(1)?,
+                    speaker: r.get(2)?,
+                    start_ms: r.get::<_, i64>(3)? as u64,
+                    end_ms: r.get::<_, i64>(4)? as u64,
+                    text: r.get(5)?,
+                    kind: r.get(6)?,
+                    deleted: r.get::<_, i64>(7)? == 1,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Mark a single segment as echo (`kind = 'echo'`) or back to speech.
+    pub fn set_segment_kind(&self, id: i64, kind: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE segments SET kind = ?2 WHERE id = ?1",
+            params![id, kind],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Soft-delete / restore a single segment.
+    pub fn set_segment_deleted(&self, id: i64, deleted: bool) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE segments SET deleted = ?2 WHERE id = ?1",
+            params![id, deleted as i64],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Snapshot all non-default marks (echo or deleted) before a
+    /// `replace_segments` so they can be re-applied afterward. Returns marks
+    /// keyed by the old segments' (source, start_ms).
+    pub fn snapshot_marks(&self, meeting_id: i64) -> Result<Vec<SegmentMark>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, start_ms, kind, deleted FROM segments
+                 WHERE meeting_id = ?1 AND (kind = 'echo' OR deleted = 1)",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| {
+                Ok(SegmentMark {
+                    source: r.get(0)?,
+                    start_ms: r.get::<_, i64>(1)? as u64,
+                    kind: r.get(2)?,
+                    deleted: r.get::<_, i64>(3)? == 1,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Re-apply snapshoted marks to the current segment rows, matching by
+    /// `(source, start_ms)` within ±250 ms (re-transcribe can shift segment
+    /// bounds a little). Marks that no longer match any row are dropped — a
+    /// re-transcribe genuinely changes the segmentation.
+    pub fn reapply_marks(&self, meeting_id: i64, marks: &[SegmentMark]) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        for m in marks {
+            conn.execute(
+                "UPDATE segments SET kind = ?3, deleted = ?4
+                 WHERE meeting_id = ?1 AND source = ?2
+                   AND start_ms BETWEEN ?5 AND ?6",
+                params![
+                    meeting_id,
+                    m.source,
+                    m.kind,
+                    m.deleted as i64,
+                    m.start_ms.saturating_sub(250) as i64,
+                    (m.start_ms + 250) as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -1734,22 +2022,48 @@ impl Db {
     }
 }
 
+/// First byte range `[start, end)` in `haystack` whose lowercased chars equal
+/// `needle_lower` (already lowercased). Returns `None` if no match. The range
+/// is in `haystack`'s bytes (not the lowercased copy), so it is safe to slice.
+fn ci_find_range(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
+    let nl: Vec<char> = needle_lower.chars().collect();
+    // Lowercased haystack, each char tagged with its original byte offset in
+    // `haystack` (one source char can lowercased-expand to several, e.g. 'İ').
+    let hl: Vec<(usize, char)> = haystack
+        .char_indices()
+        .flat_map(|(i, c)| c.to_lowercase().map(move |lc| (i, lc)).collect::<Vec<_>>())
+        .collect();
+    let n = nl.len();
+    if n == 0 || n > hl.len() {
+        return None;
+    }
+    for start in 0..=(hl.len() - n) {
+        if (0..n).all(|k| hl[start + k].1 == nl[k]) {
+            let byte_start = hl[start].0;
+            let byte_end = if start + n < hl.len() {
+                hl[start + n].0
+            } else {
+                haystack.len()
+            };
+            return Some((byte_start, byte_end));
+        }
+    }
+    None
+}
+
 /// Extract a short snippet around the first case-insensitive occurrence of
-/// `needle` in `haystack`, with `pad` chars of context on each side.
+/// `needle` in `haystack`, with `pad` bytes of context on each side. All slice
+/// boundaries are clamped to UTF-8 char boundaries, so this never panics on
+/// non-ASCII content.
 fn snippet_around(haystack: &str, needle: &str, pad: usize) -> String {
-    let hl = haystack.to_lowercase();
     let nl = needle.to_lowercase();
-    let (start, end) = match hl.find(&nl) {
-        Some(pos) => {
-            let s = pos.saturating_sub(pad);
-            let e = (pos + needle.len() + pad).min(haystack.len());
+    let (start, end) = match ci_find_range(haystack, &nl) {
+        Some((ms, me)) => {
+            let s = haystack.floor_char_boundary(ms.saturating_sub(pad));
+            let e = haystack.ceil_char_boundary((me + pad).min(haystack.len()));
             (s, e)
         }
-        None => {
-            // Fallback: first 80 chars.
-            let e = haystack.len().min(80);
-            (0, e)
-        }
+        None => (0, haystack.floor_char_boundary(haystack.len().min(80))),
     };
     let mut s = String::new();
     if start > 0 {
@@ -1897,7 +2211,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 7);
         for table in ["personas", "voiceprints", "speaker_persona_links"] {
             let n: i64 = conn
                 .query_row(
@@ -2060,7 +2374,7 @@ mod tests {
         // After delete: link's persona_id is NULL, rename cleared.
         let detail = db.get_meeting(meeting_id).unwrap();
         assert!(
-            detail.renames.get("SPEAKER_00").is_none(),
+            !detail.renames.contains_key("SPEAKER_00"),
             "delete_persona should clear the display rename"
         );
         let link = detail.speaker_links.get("SPEAKER_00").unwrap();
@@ -2084,11 +2398,11 @@ mod tests {
             .unwrap();
         let detail = db.get_meeting(meeting_id).unwrap();
         assert!(
-            detail.speaker_links.get("SPEAKER_01").is_none(),
+            !detail.speaker_links.contains_key("SPEAKER_01"),
             "link should be gone"
         );
         assert!(
-            detail.renames.get("SPEAKER_01").is_none(),
+            !detail.renames.contains_key("SPEAKER_01"),
             "display rename should be cleared"
         );
     }
@@ -2132,6 +2446,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2139,6 +2454,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     text: "a".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2146,6 +2462,7 @@ mod tests {
                     start_ms: 2000,
                     end_ms: 3000,
                     text: "b".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2153,6 +2470,7 @@ mod tests {
                     start_ms: 3000,
                     end_ms: 4000,
                     text: "c".into(),
+                    ..Default::default()
                 },
             ],
         )
@@ -2200,6 +2518,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     text: "a".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "system".into(),
@@ -2207,6 +2526,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     text: "b".into(),
+                    ..Default::default()
                 },
             ],
         )
@@ -2236,6 +2556,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 1000,
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 Segment {
                     source: "mic".into(),
@@ -2243,6 +2564,7 @@ mod tests {
                     start_ms: 1000,
                     end_ms: 2000,
                     text: "world".into(),
+                    ..Default::default()
                 },
             ],
         )
@@ -2258,9 +2580,136 @@ mod tests {
                 start_ms: 0,
                 end_ms: 1000,
                 text: "no speaker".into(),
+                ..Default::default()
             }],
         )
         .unwrap();
         assert_eq!(db.count_speaker_identities(null_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn mark_preservation_survives_replace_segments() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("marks", "t", 0).unwrap();
+        db.finalize_meeting(meeting_id, 0, "m.wav", "s.wav")
+            .unwrap();
+
+        // Two mic segments + one system. Mark the first mic as echo and
+        // soft-delete the second; the system segment stays default.
+        db.replace_segments(
+            meeting_id,
+            &[
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "echo-of-remote".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 1000,
+                    end_ms: 2000,
+                    text: "stutter".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    start_ms: 2000,
+                    end_ms: 3000,
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        let all = db.meeting_segments_all(meeting_id).unwrap();
+        let echo_id = all.iter().find(|s| s.start_ms == 0).unwrap().id;
+        let del_id = all.iter().find(|s| s.start_ms == 1000).unwrap().id;
+        db.set_segment_kind(echo_id, "echo").unwrap();
+        db.set_segment_deleted(del_id, true).unwrap();
+
+        // Default view hides both; hidden count = 2.
+        assert_eq!(db.meeting_segments(meeting_id).unwrap().len(), 1);
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert_eq!(detail.hidden_segment_count, 2);
+
+        // Simulate a re-transcribe: snapshot marks, replace with fresh rows
+        // (timestamps shifted by a few ms — within the ±250ms tolerance), then
+        // re-apply. The first mic shifted +10ms should still match the echo mark.
+        let marks = db.snapshot_marks(meeting_id).unwrap();
+        assert_eq!(marks.len(), 2);
+        db.replace_segments(
+            meeting_id,
+            &[
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 10,
+                    end_ms: 1010,
+                    text: "echo-of-remote v2".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "mic".into(),
+                    speaker: Some("Me".into()),
+                    start_ms: 1010,
+                    end_ms: 2010,
+                    text: "stutter v2".into(),
+                    ..Default::default()
+                },
+                Segment {
+                    source: "system".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    start_ms: 2000,
+                    end_ms: 3000,
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        db.reapply_marks(meeting_id, &marks).unwrap();
+
+        // Both marks survived on the fresh rows.
+        let all = db.meeting_segments_all(meeting_id).unwrap();
+        let echo = all
+            .iter()
+            .find(|s| s.source == "mic" && s.start_ms == 10)
+            .unwrap();
+        assert_eq!(echo.kind, "echo");
+        assert!(!echo.deleted);
+        let del = all
+            .iter()
+            .find(|s| s.source == "mic" && s.start_ms == 1010)
+            .unwrap();
+        assert!(del.deleted);
+        assert_eq!(del.kind, "speech");
+        // Default view still hides both; the system segment shows.
+        assert_eq!(db.meeting_segments(meeting_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn snippet_around_handles_non_ascii_without_panic() {
+        // Multi-byte chars around/inside the match — the old code panicked here
+        // because pad (bytes) landed mid-character. "meeting" is preceded by an
+        // em-dash (3 bytes); "emoji" is preceded by a 4-byte 🎉.
+        let s = "café résumé — meeting notes with an em-dash and 🎉 emoji";
+        assert!(snippet_around(s, "meeting", 10)
+            .to_lowercase()
+            .contains("meeting"));
+        assert!(snippet_around(s, "em-dash", 20).contains("em-dash"));
+        assert!(snippet_around(s, "emoji", 5).contains("emoji"));
+        // Guaranteed match-branch repro of the old panic: 5 emojis (4 bytes
+        // each) push the match to byte 20; pad=6 makes start=14, which is
+        // mid-character inside the 3rd emoji. Old code panicked slicing here.
+        let stacked = "🎉🎉🎉🎉🎉hello";
+        assert!(snippet_around(stacked, "hello", 6).contains("hello"));
+        // No match: fallback path must not panic when byte 80 is mid-char.
+        let long: String = "xé".repeat(60); // every other char is 2 bytes
+        let _ = snippet_around(&long, "zzz", 40);
     }
 }

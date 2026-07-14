@@ -3,6 +3,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink, Loader2, RefreshCw, Sparkles } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import ThinkingDisplay from "@/components/ThinkingDisplay";
 import { Markdown } from "@/components/SummaryPanel";
 import {
@@ -181,18 +189,18 @@ export default function CustomerSummaryPanel({ customerId, meetingCountWithSumma
         <span className="text-xs font-medium text-muted-foreground">Recent topics</span>
         <div className="flex items-center gap-2">
           {hasModels && (
-            <select
-              value={model ?? ""}
-              onChange={(e) => setModel(e.target.value)}
-              disabled={busy}
-              className="h-7 max-w-40 rounded-md border bg-card px-1.5 text-xs outline-none focus:border-ring"
-            >
-              {pickerModels.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+            <Select value={model ?? undefined} onValueChange={(v) => setModel(v)} disabled={busy}>
+              <SelectTrigger size="sm" className="max-w-40 bg-card text-xs">
+                <SelectValue placeholder="Model" />
+              </SelectTrigger>
+              <SelectContent position="popper">
+                {pickerModels.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           )}
           <Button size="sm" onClick={generate} disabled={busy || !hasModels || !canGenerate}>
             {busy ? <Loader2 className="animate-spin" /> : <Sparkles />}
@@ -215,39 +223,41 @@ export default function CustomerSummaryPanel({ customerId, meetingCountWithSumma
         </div>
       )}
 
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-4">
-        {error && <p className="pb-2 text-xs text-destructive">{error}</p>}
+      <ScrollArea className="min-h-0 flex-1" viewportRef={scrollRef}>
+        <div className="p-4">
+          {error && <p className="pb-2 text-xs text-destructive">{error}</p>}
 
-        {!canGenerate && !busy && (
-          <p className="text-xs text-muted-foreground">
-            Generate summaries on at least two of this customer's meetings first, then a rollup can
-            be synthesized here.
-          </p>
-        )}
-
-        {showText ? (
-          <>
-            <Markdown text={showText} />
-            {streaming !== null && (
-              <Loader2 className="mt-2 size-3.5 animate-spin text-muted-foreground" />
-            )}
-            {saved && streaming === null && (
-              <p className="pt-3 text-[11px] text-muted-foreground/70">
-                {saved.model} · rolled up {saved.meetingCount} meetings ·{" "}
-                {new Date(saved.createdAtMs).toLocaleString()}
-              </p>
-            )}
-          </>
-        ) : (
-          !error &&
-          canGenerate &&
-          !busy && (
+          {!canGenerate && !busy && (
             <p className="text-xs text-muted-foreground">
-              Generate a bird's-eye rollup of this customer's recent meeting summaries.
+              Generate summaries on at least two of this customer's meetings first, then a rollup
+              can be synthesized here.
             </p>
-          )
-        )}
-      </div>
+          )}
+
+          {showText ? (
+            <>
+              <Markdown text={showText} />
+              {streaming !== null && (
+                <Loader2 className="mt-2 size-3.5 animate-spin text-muted-foreground" />
+              )}
+              {saved && streaming === null && (
+                <p className="pt-3 text-[11px] text-muted-foreground/70">
+                  {saved.model} · rolled up {saved.meetingCount} meetings ·{" "}
+                  {new Date(saved.createdAtMs).toLocaleString()}
+                </p>
+              )}
+            </>
+          ) : (
+            !error &&
+            canGenerate &&
+            !busy && (
+              <p className="text-xs text-muted-foreground">
+                Generate a bird's-eye rollup of this customer's recent meeting summaries.
+              </p>
+            )
+          )}
+        </div>
+      </ScrollArea>
     </div>
   );
 }

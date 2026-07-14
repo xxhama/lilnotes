@@ -39,8 +39,16 @@ chrono = "0.4"                # session ids / timestamps
 # --- acoustic echo cancellation (AEC) ---
 # WebRTC AudioProcessing (AEC3 + NS). `bundled` compiles Google's C++ APM from
 # source (~1-2 min added to the first build). Pin to ~2.1: minor versions can
-# break the config API.
-webrtc-audio-processing = { version = "~2.1", features = ["bundled"] }
+# break the config API. `experimental-aec3-config` exposes the fine-grained
+# AEC3 suppressor/filter/delay knobs we tune per aggressiveness preset.
+webrtc-audio-processing = { version = "~2.1", features = ["bundled", "experimental-aec3-config"] }
+# Offline AEC (Tier 3): partitioned-block frequency-domain adaptive filter
+# (PB-FDAF / NLMS) using system.wav as the exact echo reference. realfft gives
+# a simple real-input FFT for the frequency-domain filter arithmetic.
+realfft = "1"
+# Complex type used by realfft's spectra (pinned to 0.3 to match realfft 1.x's
+# dependency, so the `Complex32` values flow through without a type mismatch).
+num-complex = "0.3"
 
 # --- diarization (M4) ---
 sherpa-rs = "0.6"  # sherpa-onnx: pyannote segmentation + CAM++ embeddings

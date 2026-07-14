@@ -5,7 +5,7 @@ import reactRefresh from "eslint-plugin-react-refresh";
 
 export default tseslint.config(
   {
-    ignores: ["dist/", "node_modules/", "src-tauri/", "*.config.js", "*.config.ts"],
+    ignores: ["dist/", "node_modules/", "src-tauri/", ".llama.cpp/", "*.config.js", "*.config.ts"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
