@@ -10,6 +10,7 @@ import {
   Calendar,
   Clock,
   Loader2,
+  ListTodo,
   Merge,
   Search,
   Trash2,
@@ -18,6 +19,7 @@ import {
 
 import CustomerAvatar from "@/components/CustomerAvatar";
 import CustomerSummaryPanel from "@/components/CustomerSummaryPanel";
+import CustomerTasksSection from "@/components/CustomerTasksSection";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -35,6 +37,17 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
   deleteCustomer,
@@ -52,6 +65,9 @@ import type { Route } from "@/App";
 
 interface Props {
   customerId: string;
+  /** Scroll to the Meetings section on mount (set by MeetingDetail's back
+   * button when returning from a meeting opened from this customer). */
+  focusMeetings?: boolean;
   onNavigate: (route: Route) => void;
 }
 
@@ -90,7 +106,7 @@ const FIELD_LABELS: Record<string, string> = {
 };
 
 /** Customer detail: birds-eye view of one account. */
-export default function CustomerDetailView({ customerId, onNavigate }: Props) {
+export default function CustomerDetailView({ customerId, focusMeetings, onNavigate }: Props) {
   const id = Number(customerId);
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -115,6 +131,11 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
+  // Auto-scroll target when returning from a meeting opened from this customer
+  // (focusMeetings set by MeetingDetail's back button).
+  const meetingsRef = useRef<HTMLDivElement>(null);
+  const didFocus = useRef(false);
+
   const reload = useCallback(() => {
     getCustomer(id)
       .then((c) => {
@@ -128,6 +149,17 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  // One-shot: when arriving with focusMeetings (returning from a meeting
+  // opened from this customer), scroll the Meetings section into view once
+  // the customer data has loaded. The didFocus guard prevents later reloads
+  // (rename/notes save) from re-jumping the scroll position.
+  useEffect(() => {
+    if (!focusMeetings || didFocus.current || !customer) return;
+    didFocus.current = true;
+    // Defer one frame so the Radix ScrollArea viewport has laid out.
+    requestAnimationFrame(() => meetingsRef.current?.scrollIntoView({ block: "start" }));
+  }, [focusMeetings, customer]);
 
   // Reset notes buffer on customer change (navigating between customers).
   useEffect(() => {
@@ -235,6 +267,7 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
     { icon: Calendar, label: "First contact", value: fmtDate(customer.firstMeetingAtMs) },
     { icon: Users, label: "Roster", value: String(customer.personaRoster.length) },
     { icon: Clock, label: "Total time", value: fmtDuration(customer.totalDurationMs) },
+    { icon: ListTodo, label: "Open tasks", value: String(customer.openTaskCount) },
   ];
 
   return (
@@ -268,7 +301,7 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
         <div className="flex items-center gap-3">
           <CustomerAvatar name={customer.name} className="size-12 text-lg" />
           {titleDraft !== null ? (
-            <input
+            <Input
               autoFocus
               value={titleDraft}
               onChange={(e) => setTitleDraft(e.target.value)}
@@ -277,16 +310,27 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
                 if (e.key === "Enter") commitTitle();
                 if (e.key === "Escape") setTitleDraft(null);
               }}
-              className="flex-1 rounded-md border bg-background px-2 py-1 text-lg font-semibold tracking-tight outline-none focus:border-ring"
+              className="flex-1 rounded-md bg-background px-2 py-1 text-lg font-semibold tracking-tight"
             />
           ) : (
-            <h1
-              className="flex-1 cursor-text text-lg font-semibold tracking-tight hover:opacity-80"
-              title="Click to rename"
-              onClick={() => setTitleDraft(customer.name)}
-            >
-              {customer.name}
-            </h1>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <h1
+                  tabIndex={0}
+                  className="flex-1 cursor-text text-lg font-semibold tracking-tight hover:opacity-80"
+                  onClick={() => setTitleDraft(customer.name)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setTitleDraft(customer.name);
+                    }
+                  }}
+                >
+                  {customer.name}
+                </h1>
+              </TooltipTrigger>
+              <TooltipContent>Click to rename</TooltipContent>
+            </Tooltip>
           )}
         </div>
         <p className="text-xs text-muted-foreground">
@@ -294,7 +338,7 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
         </p>
 
         {/* Quick stats strip */}
-        <div className="grid grid-cols-2 gap-2 pt-2 sm:grid-cols-3 lg:grid-cols-5">
+        <div className="grid grid-cols-2 gap-2 pt-2 sm:grid-cols-3 lg:grid-cols-6">
           {stats.map(({ icon: Icon, label, value }) => (
             <div key={label} className="rounded-lg border bg-card p-2.5">
               <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -309,151 +353,173 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
 
       {/* Body: left = roster + meetings + search; right = rollup panel */}
       <div className="flex min-h-0 flex-1">
-        <div className="min-w-0 flex-1 overflow-y-auto p-6 space-y-6">
-          {error && <p className="text-sm text-destructive">{error}</p>}
+        <ScrollArea className="min-w-0 flex-1">
+          <div className="p-6 space-y-6">
+            {error && <p className="text-sm text-destructive">{error}</p>}
 
-          {/* Notes */}
-          <section className="space-y-1.5">
-            <h2 className="text-xs font-medium text-muted-foreground">Notes</h2>
-            <textarea
-              value={notesDraft}
-              onChange={(e) => {
-                setNotesDraft(e.target.value);
-                scheduleNotesSave(e.target.value);
-              }}
-              placeholder="Account notes…"
-              className="min-h-24 w-full resize-y rounded-lg border bg-card p-3 text-sm outline-none focus:border-ring"
-            />
-            <p className="text-[11px] text-muted-foreground/70">
-              {notesStatus === "saving"
-                ? "Saving…"
-                : notesStatus === "modified"
-                  ? "Modified"
-                  : "Saved"}
-            </p>
-          </section>
-
-          {/* Persona roster (derived) */}
-          <section className="space-y-1.5">
-            <h2 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-              <Users className="size-3.5" /> Persona roster
-            </h2>
-            {customer.personaRoster.length === 0 ? (
-              <p className="rounded-lg border bg-card p-3 text-xs text-muted-foreground">
-                No confirmed personas in this customer's meetings yet.
-              </p>
-            ) : (
-              <div className="divide-y rounded-lg border bg-card">
-                {customer.personaRoster.map((p) => (
-                  <div key={p.personaId} className="flex items-center justify-between gap-3 p-2.5">
-                    <span className="truncate text-sm font-medium">{p.displayName}</span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {p.meetingCount} {p.meetingCount === 1 ? "meeting" : "meetings"}
-                      {" · "}
-                      last {fmtDate(p.lastSeenMs)}
-                    </span>
+            {/* Scoped search */}
+            <section className="space-y-1.5">
+              <h2 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                <Search className="size-3.5" /> Search within {customer.name}
+              </h2>
+              <div className="relative">
+                <Search className="absolute top-2.5 left-3 size-4 text-muted-foreground" />
+                <Input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search transcripts, titles, summaries, notes, personas…"
+                  className="h-9 w-full rounded-lg bg-card pr-3 pl-9 text-sm"
+                />
+                {searching && (
+                  <Loader2 className="absolute top-2.5 right-3 size-4 animate-spin text-muted-foreground" />
+                )}
+              </div>
+              {results !== null &&
+                (results.length === 0 ? (
+                  <p className="py-4 text-center text-xs text-muted-foreground">
+                    No matches across {customer.name}'s meetings for "{search}".
+                  </p>
+                ) : (
+                  <div className="divide-y rounded-lg border bg-card">
+                    {results.map((r) => (
+                      <button
+                        key={r.meetingId}
+                        onClick={() =>
+                          onNavigate({
+                            name: "meeting",
+                            meetingId: String(r.meetingId),
+                            fromCustomerId: String(id),
+                          })
+                        }
+                        className="block w-full p-3 text-left transition-colors hover:bg-accent/50"
+                      >
+                        <div className="truncate text-sm font-medium">{r.title}</div>
+                        <div className="text-[11px] text-muted-foreground">
+                          {fmtDateTime(r.startedAtMs)}
+                        </div>
+                        <div className="mt-1 flex flex-wrap gap-1.5">
+                          {r.hits.map((h, i) => (
+                            <Tooltip key={i}>
+                              <TooltipTrigger asChild>
+                                <span
+                                  tabIndex={0}
+                                  className="inline-flex items-center gap-1 rounded-md bg-secondary px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                                >
+                                  <span className="font-medium text-foreground/70">
+                                    {FIELD_LABELS[h.field] ?? h.field}
+                                  </span>
+                                  <span className="max-w-72 truncate">{h.snippet}</span>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>{h.snippet}</TooltipContent>
+                            </Tooltip>
+                          ))}
+                        </div>
+                      </button>
+                    ))}
                   </div>
                 ))}
-              </div>
-            )}
-          </section>
+            </section>
 
-          {/* Scoped search */}
-          <section className="space-y-1.5">
-            <h2 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-              <Search className="size-3.5" /> Search within {customer.name}
-            </h2>
-            <div className="relative">
-              <Search className="absolute top-2.5 left-3 size-4 text-muted-foreground" />
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search transcripts, titles, summaries, notes, personas…"
-                className="h-9 w-full rounded-lg border bg-card pr-3 pl-9 text-sm outline-none focus:border-ring focus:ring-2 focus:ring-ring/30"
-              />
-              {searching && (
-                <Loader2 className="absolute top-2.5 right-3 size-4 animate-spin text-muted-foreground" />
-              )}
-            </div>
-            {results !== null &&
-              (results.length === 0 ? (
-                <p className="py-4 text-center text-xs text-muted-foreground">
-                  No matches across {customer.name}'s meetings for "{search}".
+            {/* Meeting list */}
+            <section ref={meetingsRef} className="space-y-1.5 scroll-mt-4">
+              <h2 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                <Building2 className="size-3.5" /> Meetings ({customer.meetings.length})
+              </h2>
+              {customer.meetings.length === 0 ? (
+                <p className="rounded-lg border bg-card p-3 text-xs text-muted-foreground">
+                  No meetings assigned to this customer yet. Assign one from a meeting's "Customer"
+                  selector.
                 </p>
               ) : (
                 <div className="divide-y rounded-lg border bg-card">
-                  {results.map((r) => (
+                  {customer.meetings.map((m) => (
                     <button
-                      key={r.meetingId}
+                      key={m.id}
                       onClick={() =>
-                        onNavigate({ name: "meeting", meetingId: String(r.meetingId) })
+                        onNavigate({
+                          name: "meeting",
+                          meetingId: String(m.id),
+                          fromCustomerId: String(id),
+                        })
                       }
-                      className="block w-full p-3 text-left transition-colors hover:bg-accent/50"
+                      className="group flex w-full items-center gap-3 p-3 text-left transition-colors hover:bg-accent/50"
                     >
-                      <div className="truncate text-sm font-medium">{r.title}</div>
-                      <div className="text-[11px] text-muted-foreground">
-                        {fmtDateTime(r.startedAtMs)}
-                      </div>
-                      <div className="mt-1 flex flex-wrap gap-1.5">
-                        {r.hits.map((h, i) => (
-                          <span
-                            key={i}
-                            className="inline-flex items-center gap-1 rounded-md bg-secondary px-1.5 py-0.5 text-[11px] text-muted-foreground"
-                            title={h.snippet}
-                          >
-                            <span className="font-medium text-foreground/70">
-                              {FIELD_LABELS[h.field] ?? h.field}
+                      <div className="min-w-0 flex-1 space-y-0.5">
+                        <div className="truncate text-sm font-medium">{m.title}</div>
+                        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                          <span>{fmtDate(m.startedAtMs)}</span>
+                          {m.durationMs != null && <span>{fmtDuration(m.durationMs)}</span>}
+                          {m.speakerCount > 0 && (
+                            <span className="inline-flex items-center gap-1">
+                              <Users className="size-3" />
+                              {m.speakerCount}
                             </span>
-                            <span className="max-w-72 truncate">{h.snippet}</span>
-                          </span>
-                        ))}
+                          )}
+                        </div>
+                        {m.preview && (
+                          <p className="truncate text-xs text-muted-foreground/70">{m.preview}</p>
+                        )}
                       </div>
                     </button>
                   ))}
                 </div>
-              ))}
-          </section>
+              )}
+            </section>
 
-          {/* Meeting list */}
-          <section className="space-y-1.5">
-            <h2 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-              <Building2 className="size-3.5" /> Meetings ({customer.meetings.length})
-            </h2>
-            {customer.meetings.length === 0 ? (
-              <p className="rounded-lg border bg-card p-3 text-xs text-muted-foreground">
-                No meetings assigned to this customer yet. Assign one from a meeting's "Customer"
-                selector.
-              </p>
-            ) : (
-              <div className="divide-y rounded-lg border bg-card">
-                {customer.meetings.map((m) => (
-                  <button
-                    key={m.id}
-                    onClick={() => onNavigate({ name: "meeting", meetingId: String(m.id) })}
-                    className="group flex w-full items-center gap-3 p-3 text-left transition-colors hover:bg-accent/50"
-                  >
-                    <div className="min-w-0 flex-1 space-y-0.5">
-                      <div className="truncate text-sm font-medium">{m.title}</div>
-                      <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                        <span>{fmtDate(m.startedAtMs)}</span>
-                        {m.durationMs != null && <span>{fmtDuration(m.durationMs)}</span>}
-                        {m.speakerCount > 0 && (
-                          <span className="inline-flex items-center gap-1">
-                            <Users className="size-3" />
-                            {m.speakerCount}
-                          </span>
-                        )}
-                      </div>
-                      {m.preview && (
-                        <p className="truncate text-xs text-muted-foreground/70">{m.preview}</p>
-                      )}
+            {/* Tasks (scoped to this customer) */}
+            <CustomerTasksSection customerId={id} onNavigate={onNavigate} />
+
+            {/* Persona roster (derived) */}
+            <section className="space-y-1.5">
+              <h2 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                <Users className="size-3.5" /> Persona roster
+              </h2>
+              {customer.personaRoster.length === 0 ? (
+                <p className="rounded-lg border bg-card p-3 text-xs text-muted-foreground">
+                  No confirmed personas in this customer's meetings yet.
+                </p>
+              ) : (
+                <div className="divide-y rounded-lg border bg-card">
+                  {customer.personaRoster.map((p) => (
+                    <div
+                      key={p.personaId}
+                      className="flex items-center justify-between gap-3 p-2.5"
+                    >
+                      <span className="truncate text-sm font-medium">{p.displayName}</span>
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {p.meetingCount} {p.meetingCount === 1 ? "meeting" : "meetings"}
+                        {" · "}
+                        last {fmtDate(p.lastSeenMs)}
+                      </span>
                     </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
-        </div>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            {/* Notes */}
+            <section className="space-y-1.5">
+              <h2 className="text-xs font-medium text-muted-foreground">Notes</h2>
+              <Textarea
+                value={notesDraft}
+                onChange={(e) => {
+                  setNotesDraft(e.target.value);
+                  scheduleNotesSave(e.target.value);
+                }}
+                placeholder="Account notes…"
+                className="min-h-24 w-full resize-y rounded-lg bg-card px-3 py-3 text-sm"
+              />
+              <p className="text-[11px] text-muted-foreground/70">
+                {notesStatus === "saving"
+                  ? "Saving…"
+                  : notesStatus === "modified"
+                    ? "Modified"
+                    : "Saved"}
+              </p>
+            </section>
+          </div>
+        </ScrollArea>
 
         {/* Rollup panel */}
         <aside className="hidden w-96 shrink-0 border-l lg:block">
@@ -475,18 +541,21 @@ export default function CustomerDetailView({ customerId, onNavigate }: Props) {
               no change — {customer.name}'s roster will reflect the union. This is irreversible.
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <select
-            value={mergePick ?? ""}
-            onChange={(e) => setMergePick(e.target.value ? Number(e.target.value) : null)}
-            className="h-9 w-full rounded-md border bg-card px-2 text-sm outline-none focus:border-ring"
+          <Select
+            value={mergePick != null ? String(mergePick) : undefined}
+            onValueChange={(v) => setMergePick(Number(v))}
           >
-            <option value="">Select a customer…</option>
-            {allCustomers.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name} ({c.meetingCount} meetings)
-              </option>
-            ))}
-          </select>
+            <SelectTrigger className="w-full bg-card text-sm">
+              <SelectValue placeholder="Select a customer…" />
+            </SelectTrigger>
+            <SelectContent position="popper" className="z-[60] max-h-72">
+              {allCustomers.map((c) => (
+                <SelectItem key={c.id} value={String(c.id)}>
+                  {c.name} ({c.meetingCount} meetings)
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={merging}>Cancel</AlertDialogCancel>
             <AlertDialogAction

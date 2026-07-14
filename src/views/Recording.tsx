@@ -9,6 +9,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, FileText, Loader2, Mic, Pencil, Square } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LevelMeter from "@/components/LevelMeter";
 import NotesEditor from "@/components/NotesEditor";
 import TranscriptPane from "@/components/TranscriptPane";
@@ -218,21 +219,19 @@ export default function RecordingView({
       if (result.transcriptionError) {
         setNotice(`Transcription problem: ${result.transcriptionError}`);
       }
-      if (result.segments.length > 0) {
-        setSegments(result.segments);
-        setPhase("diarizing");
-        try {
-          await diarizeMeeting(result.meetingId);
-        } catch (e) {
-          setNotice(`Speaker identification failed: ${e}`);
-        }
-        onNavigate({ name: "meeting", meetingId: String(result.meetingId) });
-      } else {
-        setPhase("idle");
-      }
+      // Always land on Meeting Detail after stop. If a live transcript was
+      // produced, Meeting Detail auto-starts speaker identification there
+      // (autoDiarize) — the spinner moves off the Record page. If live
+      // transcription was off, Meeting Detail shows a "Transcribe" button.
+      onNavigate({
+        name: "meeting",
+        meetingId: String(result.meetingId),
+        autoDiarize: result.segments.length > 0,
+      });
     } catch (e) {
-      setPhase("idle");
       setError(String(e));
+    } finally {
+      setPhase("idle");
     }
   }, [onNavigate, flushNotes]);
 
@@ -445,41 +444,43 @@ export default function RecordingView({
               <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
                 Notes
               </span>
-              <span
-                key={notesStatus}
-                title={
-                  notesStatus === "saved"
-                    ? savedAtMs != null
-                      ? `Saved at ${fmtSavedAt(savedAtMs)}`
-                      : "Saved"
-                    : undefined
-                }
-                className={
-                  "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium animate-in fade-in duration-200 " +
-                  (notesStatus === "saved"
-                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                    : "bg-muted text-muted-foreground")
-                }
-              >
-                {notesStatus === "modified" ? (
-                  <>
-                    <Pencil className="size-3" />
-                    Modified
-                  </>
-                ) : notesStatus === "saving" ? (
-                  <>
-                    <Loader2 className="size-3 animate-spin" />
-                    Saving…
-                  </>
-                ) : (
-                  <>
-                    <Check className="size-3" />
-                    Saved
-                  </>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    key={notesStatus}
+                    className={
+                      "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium animate-in fade-in duration-200 " +
+                      (notesStatus === "saved"
+                        ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                        : "bg-muted text-muted-foreground")
+                    }
+                  >
+                    {notesStatus === "modified" ? (
+                      <>
+                        <Pencil className="size-3" />
+                        Modified
+                      </>
+                    ) : notesStatus === "saving" ? (
+                      <>
+                        <Loader2 className="size-3 animate-spin" />
+                        Saving…
+                      </>
+                    ) : (
+                      <>
+                        <Check className="size-3" />
+                        Saved
+                      </>
+                    )}
+                  </span>
+                </TooltipTrigger>
+                {notesStatus === "saved" && (
+                  <TooltipContent>
+                    {savedAtMs != null ? `Saved at ${fmtSavedAt(savedAtMs)}` : "Saved"}
+                  </TooltipContent>
                 )}
-              </span>
+              </Tooltip>
             </div>
-            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+            <div className="min-h-0 flex-1">
               {meetingId != null && (
                 <NotesEditor
                   key={meetingId}

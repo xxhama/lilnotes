@@ -135,6 +135,9 @@ export function openPrivacySettings(section: "microphone" | "systemAudio"): Prom
 // ---------------------------------------------------------------------------
 
 export interface TranscriptSegment {
+  /** DB row id; 0 for live/ephemeral segments before they're persisted. Used
+   * to address mark-as-echo / delete mutations on persisted segments. */
+  id: number;
   /** "mic" (Me) or "system" (remote speakers). */
   source: "mic" | "system";
   startMs: number;
@@ -142,6 +145,12 @@ export interface TranscriptSegment {
   text: string;
   /** "Me" for mic; "SPEAKER_xx" after diarization; null until then. */
   speaker: string | null;
+  /** "speech" (normal) or "echo" — a mic region the user marked as echo (the
+   * ASR mis-attributed speaker echo to "Me"). Echo segments are hidden from the
+   * transcript + summary but retained for offline echo re-processing. */
+  kind?: "speech" | "echo";
+  /** Soft-delete flag — hidden from transcript + summary, recoverable. */
+  deleted?: boolean;
 }
 
 export interface SegmentEvent extends TranscriptSegment {
@@ -172,9 +181,15 @@ export interface AppSettings {
   /** Software acoustic echo cancellation using the system-audio feed as
    *  reference. Disable when using headphones. */
   aecEnabled: boolean;
+  /** AEC aggressiveness preset. Stronger = less speaker echo but may slightly
+   *  dull the user's own voice. Only meaningful when aecEnabled. */
+  aecAggressiveness: AecAggressiveness;
   /** Whether the first-launch onboarding wizard has been completed. */
   onboardingComplete: boolean;
 }
+
+/** Live AEC aggressiveness preset (serde lowercase). */
+export type AecAggressiveness = "balanced" | "strong" | "maximum";
 
 export interface AsrModelInfo {
   id: string;
@@ -217,6 +232,17 @@ export function cancelModelDownload(id: string): Promise<boolean> {
 /** Batch-transcribe a persisted meeting; emits asr:segment events as it runs. */
 export function transcribeMeeting(meetingId: number): Promise<TranscriptSegment[]> {
   return invoke<TranscriptSegment[]>("transcribe_meeting", { meetingId });
+}
+
+/** Re-transcribe an existing meeting with a different whisper model, then
+ * re-diarize. Does not change the global/live model. `modelId` must be a
+ * downloaded model (the per-meeting dropdown pick). Returns the regenerated
+ * diarized transcript. */
+export function retranscribeMeeting(
+  meetingId: number,
+  modelId: string,
+): Promise<DiarizedTranscript> {
+  return invoke<DiarizedTranscript>("retranscribe_meeting", { meetingId, modelId });
 }
 
 export function onAsrSegment(cb: (e: SegmentEvent) => void): Promise<UnlistenFn> {
@@ -289,6 +315,9 @@ export interface MeetingDetail {
   endedAtMs: number | null;
   micWav: string | null;
   systemWav: string | null;
+  /** Path to an offline echo-cleaned mic WAV, if `cleanEcho` has been run. The
+   * UI / AudioPlayer / re-transcribe prefer this over `micWav`. */
+  micCleanedWav: string | null;
   notes: string | null;
   /** Epoch ms of the last notes save; null until notes have ever been saved. */
   notesUpdatedAtMs: number | null;
@@ -300,6 +329,14 @@ export interface MeetingDetail {
   speakerCount: number;
   /** Customer (account) this meeting belongs to; null = unassigned. */
   customerId: number | null;
+  /** Segments hidden from the default transcript (echo-marked or
+   * soft-deleted). Drives the "Show N hidden" toggle. */
+  hiddenSegmentCount: number;
+  /** Whisper model id that produced this transcript (e.g. "large-v3-turbo"),
+   * recorded at transcription time. Null for meetings transcribed before this
+   * was tracked. Shown as "Transcribed with: <label>" and used as the default
+   * for the re-transcribe dropdown. */
+  asrModel: string | null;
 }
 
 export function listMeetings(search?: string): Promise<MeetingSummary[]> {
@@ -308,6 +345,78 @@ export function listMeetings(search?: string): Promise<MeetingSummary[]> {
 
 export function getMeeting(meetingId: number): Promise<MeetingDetail> {
   return invoke<MeetingDetail>("get_meeting", { meetingId });
+}
+
+/** Every segment for a meeting including echo-marked + soft-deleted ones, for
+ * the "show hidden" transcript toggle. */
+export function listHiddenSegments(meetingId: number): Promise<TranscriptSegment[]> {
+  return invoke<TranscriptSegment[]>("list_hidden_segments", { meetingId });
+}
+
+/** Mark a mic segment the ASR mis-attributed to "Me" as echo (hides it from the
+ * transcript + summary; retained for offline echo re-processing). */
+export function markSegmentEcho(segmentId: number): Promise<void> {
+  return invoke("mark_segment_echo", { segmentId });
+}
+
+/** Revert an echo mark back to normal speech. */
+export function unmarkSegmentEcho(segmentId: number): Promise<void> {
+  return invoke("unmark_segment_echo", { segmentId });
+}
+
+/** Soft-delete a segment (hide from transcript + summary, recoverable). */
+export function deleteSegment(segmentId: number): Promise<void> {
+  return invoke("delete_segment", { segmentId });
+}
+
+/** Restore a soft-deleted segment. */
+export function restoreSegment(segmentId: number): Promise<void> {
+  return invoke("restore_segment", { segmentId });
+}
+
+// ---------------------------------------------------------------------------
+// Offline echo re-processing (Tier 3)
+// ---------------------------------------------------------------------------
+
+/** Payload of the `offline_aec:progress` event — drives the "Clean echo" bar. */
+export interface OfflineAecProgress {
+  meetingId: number;
+  /** 0..=1 fraction of the offline AEC pass completed. */
+  pct: number;
+}
+
+/**
+ * Run offline AEC on a meeting's `mic.wav` using `system.wav` as the exact echo
+ * reference, seeded by the user's echo-marked mic segments, then re-transcribe
+ * the cleaned mic and re-diarize. Emits `offline_aec:progress` events as the
+ * filter runs. The original `mic.wav` is preserved; the cleaned path is stored
+ * as `meeting.micCleanedWav` so the action is revertible.
+ */
+export function cleanEcho(meetingId: number): Promise<DiarizedTranscript> {
+  return invoke<DiarizedTranscript>("clean_echo", { meetingId });
+}
+
+/** Run offline echo cancellation on a single mic segment `[startMs, endMs]`.
+ * Learns the echo path from marked echo regions and applies the clean only to
+ * the selected region — audio outside it is left untouched. Re-transcribes +
+ * re-diarizes, same as `cleanEcho`. Emits `offline_aec:progress` (same event,
+ * keyed by `meetingId`) so the existing progress bar drives this too. */
+export function cleanEchoSegment(
+  meetingId: number,
+  startMs: number,
+  endMs: number,
+): Promise<DiarizedTranscript> {
+  return invoke<DiarizedTranscript>("clean_echo_segment", { meetingId, startMs, endMs });
+}
+
+/** Revert an offline echo clean: drop `micCleanedWav` and re-transcribe from the
+ * original `mic.wav`. */
+export function revertEchoClean(meetingId: number): Promise<DiarizedTranscript> {
+  return invoke<DiarizedTranscript>("revert_echo_clean", { meetingId });
+}
+
+export function onOfflineAecProgress(cb: (e: OfflineAecProgress) => void): Promise<UnlistenFn> {
+  return listen<OfflineAecProgress>("offline_aec:progress", (ev) => cb(ev.payload));
 }
 
 export function updateMeetingTitle(meetingId: number, title: string): Promise<void> {
@@ -416,6 +525,8 @@ export interface SummaryResult {
   summaryId: number;
   model: string;
   content: string;
+  /** Short AI-generated title, or null if the title was left untouched. */
+  title: string | null;
 }
 
 export interface SummaryToken {
@@ -599,6 +710,8 @@ export interface CustomerDetail {
   meetings: MeetingSummary[];
   meetingsWithSummaryCount: number;
   latestRollup: CustomerRollupRow | null;
+  /** Open (not done, not dismissed) tasks linked to this customer. */
+  openTaskCount: number;
 }
 
 export interface CustomerSearchHit {
@@ -686,4 +799,126 @@ export function listCustomerSummaries(customerId: number): Promise<CustomerRollu
 
 export function onCustomerSummaryToken(cb: (e: CustomerSummaryToken) => void): Promise<UnlistenFn> {
   return listen<CustomerSummaryToken>("customer-summary:token", (ev) => cb(ev.payload));
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+export type TaskStatus = "suggested" | "open" | "done" | "dismissed";
+export type TaskPriority = "low" | "normal" | "high";
+export type TaskOrigin = "manual" | "ai";
+
+export interface Task {
+  id: number;
+  customerId: number | null;
+  sourceMeetingId: number | null;
+  sourceStartMs: number | null;
+  sourceEndMs: number | null;
+  snippet: string | null;
+  title: string;
+  description: string | null;
+  status: TaskStatus;
+  priority: TaskPriority;
+  dueAt: number | null;
+  origin: TaskOrigin;
+  createdAtMs: number;
+  completedAtMs: number | null;
+}
+
+export function listTasksForCustomer(customerId: number): Promise<Task[]> {
+  return invoke<Task[]>("list_tasks_for_customer", { customerId });
+}
+
+/** All tasks sourced from a meeting (suggested + open + done; dismissed
+ * excluded). Used by the meeting page's Tasks tab. */
+export function listTasksForMeeting(meetingId: number): Promise<Task[]> {
+  return invoke<Task[]>("list_tasks_for_meeting", { meetingId });
+}
+
+export type TaskSort = "due" | "priority" | "created";
+
+/** All tasks for the global Tasks view (open + done, suggestions excluded).
+ * Customer / priority / origin filtering is applied client-side. */
+export function listAllTasks(sort: TaskSort = "due"): Promise<Task[]> {
+  return invoke<Task[]>("list_all_tasks", { sort });
+}
+
+export function createTask(args: {
+  customerId: number;
+  title: string;
+  description?: string | null;
+  priority?: TaskPriority;
+  dueAt?: number | null;
+  sourceMeetingId?: number | null;
+}): Promise<number> {
+  return invoke<number>("create_task", {
+    customerId: args.customerId,
+    title: args.title,
+    description: args.description ?? null,
+    priority: args.priority ?? null,
+    dueAt: args.dueAt ?? null,
+    sourceMeetingId: args.sourceMeetingId ?? null,
+  });
+}
+
+export function updateTask(args: {
+  taskId: number;
+  title: string;
+  description?: string | null;
+  priority?: TaskPriority;
+  dueAt?: number | null;
+}): Promise<void> {
+  return invoke<void>("update_task", {
+    taskId: args.taskId,
+    title: args.title,
+    description: args.description ?? null,
+    priority: args.priority ?? null,
+    dueAt: args.dueAt ?? null,
+  });
+}
+
+/** Toggle a task's status between "open" and "done". */
+export function setTaskStatus(taskId: number, status: "open" | "done"): Promise<void> {
+  return invoke<void>("set_task_status", { taskId, status });
+}
+
+export function deleteTask(taskId: number): Promise<void> {
+  return invoke<void>("delete_task", { taskId });
+}
+
+/** Run AI task extraction on a meeting's transcript. Returns the number of new
+ * suggestions inserted (0 if the model emitted nothing new or the JSON didn't
+ * parse). Rejects on an LLM dispatch failure (model/sidecar issue) — the
+ * transcript and summary are never affected. */
+export function extractMeetingTasks(meetingId: number, model?: string): Promise<number> {
+  return invoke<number>("extract_meeting_tasks", { meetingId, model: model ?? null });
+}
+
+/** Accept a suggestion: promote it to an `open` task assigned to `customerId`
+ * (required). Throws if the task isn't a current suggestion. */
+export function acceptTaskSuggestion(taskId: number, customerId: number): Promise<void> {
+  return invoke<void>("accept_task_suggestion", { taskId, customerId });
+}
+
+/** Dismiss a suggestion so re-extraction won't re-suggest it. */
+export function dismissTaskSuggestion(taskId: number): Promise<void> {
+  return invoke<void>("dismiss_task_suggestion", { taskId });
+}
+
+export interface TasksExtractionDone {
+  meetingId: number;
+  count: number;
+}
+export interface TasksExtractionError {
+  meetingId: number;
+  message: string;
+}
+
+export function onTasksExtractionDone(cb: (e: TasksExtractionDone) => void): Promise<UnlistenFn> {
+  return listen<TasksExtractionDone>("tasks:extraction:done", (ev) => cb(ev.payload));
+}
+
+export function onTasksExtractionError(cb: (e: TasksExtractionError) => void): Promise<UnlistenFn> {
+  return listen<TasksExtractionError>("tasks:extraction:error", (ev) => cb(ev.payload));
 }

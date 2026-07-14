@@ -17,6 +17,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { deleteMeeting, listMeetings, type MeetingSummary } from "@/lib/ipc";
 import type { Route } from "@/App";
@@ -108,11 +109,11 @@ export default function HomeView({ onNavigate }: Props) {
 
       <div className="relative">
         <Search className="absolute top-2.5 left-3 size-4 text-muted-foreground" />
-        <input
+        <Input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search titles and transcripts…"
-          className="h-9 w-full rounded-lg border bg-card pr-3 pl-9 text-sm outline-none focus:border-ring focus:ring-2 focus:ring-ring/30"
+          className="h-9 w-full rounded-lg bg-card pr-3 pl-9 text-sm"
         />
       </div>
 
