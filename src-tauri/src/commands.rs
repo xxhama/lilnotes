@@ -5,7 +5,6 @@
 //! to strings.
 
 use serde::Serialize;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -14,7 +13,7 @@ use crate::asr::{chunker, AsrEngine, Segment};
 use crate::audio::{offline_aec, CaptureEngine, StartedRecording};
 use crate::db::{
     CustomerDetail, CustomerRollupRow, CustomerSearchResult, CustomerSummary, LazyDb,
-    MeetingDetail, MeetingSummary, Persona, Task,
+    MeetingDetail, MeetingSummary, Persona,
 };
 use crate::diarize::DiarizeEngine;
 use crate::models::{self, DownloadManager};
@@ -22,7 +21,6 @@ use crate::permissions::{self, PermissionStatus};
 use crate::personas;
 use crate::settings::AppSettings;
 use crate::summary::{self, ollama, sidecar::SidecarLlmClient, SummaryBackend};
-use crate::tasks;
 use crate::transcript;
 use crate::voiceprint::VoiceprintEngine;
 
@@ -1096,233 +1094,6 @@ pub fn list_customer_summaries(
     db.list_customer_summaries(customer_id)
 }
 
-// ---------------------------------------------------------------------------
-// Tasks
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub fn list_tasks_for_customer(
-    db: State<'_, Arc<LazyDb>>,
-    customer_id: i64,
-) -> Result<Vec<Task>, String> {
-    db.list_tasks_for_customer(customer_id)
-}
-
-/// All tasks sourced from a meeting (suggested + open + done; dismissed
-/// excluded). Used by the meeting page's Tasks tab.
-#[tauri::command]
-pub fn list_tasks_for_meeting(
-    db: State<'_, Arc<LazyDb>>,
-    meeting_id: i64,
-) -> Result<Vec<Task>, String> {
-    db.list_tasks_for_meeting(meeting_id)
-}
-
-/// All tasks for the global Tasks view (open + done, suggestions excluded).
-/// `sort` is `due` (default) | `priority` | `created`. Customer / priority /
-/// origin filtering is applied client-side over this result.
-#[tauri::command]
-pub fn list_all_tasks(
-    db: State<'_, Arc<LazyDb>>,
-    sort: Option<String>,
-) -> Result<Vec<Task>, String> {
-    db.list_all_tasks(sort.as_deref())
-}
-
-/// Create a manual task. `customerId` is required for manual creation; a
-/// `sourceMeetingId` may be supplied when creating from a meeting.
-#[tauri::command]
-pub fn create_task(
-    db: State<'_, Arc<LazyDb>>,
-    customer_id: i64,
-    title: String,
-    description: Option<String>,
-    priority: Option<String>,
-    due_at: Option<i64>,
-    source_meeting_id: Option<i64>,
-) -> Result<i64, String> {
-    db.create_task(
-        customer_id,
-        &title,
-        description.as_deref(),
-        priority.as_deref().unwrap_or("normal"),
-        due_at,
-        source_meeting_id,
-    )
-}
-
-#[tauri::command]
-pub fn update_task(
-    db: State<'_, Arc<LazyDb>>,
-    task_id: i64,
-    title: String,
-    description: Option<String>,
-    priority: Option<String>,
-    due_at: Option<i64>,
-) -> Result<(), String> {
-    db.update_task(
-        task_id,
-        &title,
-        description.as_deref(),
-        priority.as_deref().unwrap_or("normal"),
-        due_at,
-    )
-}
-
-/// Toggle a task's status between `open` and `done`.
-#[tauri::command]
-pub fn set_task_status(
-    db: State<'_, Arc<LazyDb>>,
-    task_id: i64,
-    status: String,
-) -> Result<(), String> {
-    db.set_task_status(task_id, &status)
-}
-
-#[tauri::command]
-pub fn delete_task(db: State<'_, Arc<LazyDb>>, task_id: i64) -> Result<(), String> {
-    db.delete_task(task_id)
-}
-
-/// Payload of `tasks:extraction:done`.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TasksExtractionDone {
-    pub meeting_id: i64,
-    pub count: usize,
-}
-
-/// Payload of `tasks:extraction:error`.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TasksExtractionError {
-    pub meeting_id: i64,
-    pub message: String,
-}
-
-/// Extract task suggestions from a meeting's **summary**. The candidate tasks
-/// come from the latest summary's `## My action items` block (the summary
-/// reads naturally — plain bullets with no `[priority]` tags or `due` clauses
-/// — so the deterministic parse yields a clean **title** per item). One
-/// best-effort LLM pass then looks at the action items + the transcript and
-/// suggests a priority, an optional due date, a transcript timestamp, and a
-/// supporting snippet per item; if that pass fails, suggestions are still
-/// inserted as title-only with default `normal` priority. Emits
-/// `tasks:extraction:done` (count) on success and `tasks:extraction:error`
-/// only on a DB insert failure. Returns `Err("generate a summary first")`
-/// when the meeting has no summary yet.
-#[tauri::command]
-pub async fn extract_meeting_tasks(
-    app: AppHandle,
-    db: State<'_, Arc<LazyDb>>,
-    meeting_id: i64,
-    model: Option<String>,
-) -> Result<usize, String> {
-    run_extraction(app, db.inner().clone(), meeting_id, model).await
-}
-
-/// Shared extraction logic used by both the manual `extract_meeting_tasks`
-/// command and the auto-trigger spawned at the end of `summarize_meeting`.
-/// The summary parse produces action-item titles only; the enrichment LLM pass
-/// (items + transcript) suggests priority, due date, transcript anchor, and
-/// snippet. Best-effort and non-fatal: enrichment (LLM) failure degrades to
-/// title-only suggestions (default `normal` priority, no due date) rather
-/// than an error. Only DB failures and "no summary" surface as errors. Owns
-/// the `tasks:extraction:done`/`:error` events.
-async fn run_extraction(
-    app: AppHandle,
-    db: Arc<LazyDb>,
-    meeting_id: i64,
-    model: Option<String>,
-) -> Result<usize, String> {
-    let Some(latest) = db.get_latest_summary(meeting_id)? else {
-        return Err("generate a summary first".into());
-    };
-
-    let items = tasks::parse_action_items(&latest.content);
-    if items.is_empty() {
-        let _ = app.emit_to(
-            "main",
-            "tasks:extraction:done",
-            TasksExtractionDone {
-                meeting_id,
-                count: 0,
-            },
-        );
-        return Ok(0);
-    }
-
-    // Enrichment (best-effort): one LLM pass that looks at the action items +
-    // the transcript and suggests a priority, an optional due date, a
-    // transcript anchor, and a supporting snippet per item. Failure degrades
-    // silently to title-only suggestions (default `normal` priority) — no
-    // error event.
-    let mut enrichment: HashMap<usize, tasks::Enrichment> = HashMap::new();
-    if let Ok(meeting) = db.get_meeting(meeting_id) {
-        if !meeting.segments.is_empty() {
-            let settings = db.get_settings();
-            let transcript = summary::transcript_text(&meeting.segments, &meeting.renames);
-            let prompt = tasks::build_enrichment_prompt(&meeting.title, &transcript, &items);
-            if let Ok((raw, _model_id)) = dispatch_summary(
-                app.clone(),
-                settings,
-                prompt,
-                model,
-                Box::new(|_t, _i| {}), // non-streamed; enrichment output is short
-            )
-            .await
-            {
-                enrichment = tasks::parse_enrichment(&raw);
-            }
-        }
-    }
-
-    let suggestions = tasks::merge(&items, &enrichment);
-    let meeting = db.get_meeting(meeting_id)?;
-    let inserted = match db.insert_suggestions(meeting_id, meeting.customer_id, &suggestions) {
-        Ok(n) => n,
-        Err(e) => {
-            let _ = app.emit_to(
-                "main",
-                "tasks:extraction:error",
-                TasksExtractionError {
-                    meeting_id,
-                    message: e.clone(),
-                },
-            );
-            return Err(e);
-        }
-    };
-
-    let _ = app.emit_to(
-        "main",
-        "tasks:extraction:done",
-        TasksExtractionDone {
-            meeting_id,
-            count: inserted,
-        },
-    );
-    Ok(inserted)
-}
-
-/// Accept a suggestion: promote it to an `open` task assigned to `customer_id`
-/// (required). Errors if the task isn't a current suggestion.
-#[tauri::command]
-pub fn accept_task_suggestion(
-    db: State<'_, Arc<LazyDb>>,
-    task_id: i64,
-    customer_id: i64,
-) -> Result<(), String> {
-    db.accept_task_suggestion(task_id, customer_id)
-}
-
-/// Dismiss a suggestion so re-extraction won't re-suggest it. Errors if the
-/// task isn't a current suggestion.
-#[tauri::command]
-pub fn dismiss_task_suggestion(db: State<'_, Arc<LazyDb>>, task_id: i64) -> Result<(), String> {
-    db.dismiss_task_suggestion(task_id)
-}
-
 /// Reconstruct diarization turns from persisted system-channel segments.
 /// Avoids re-diarizing on identify/confirm, which could produce different
 /// `SPEAKER_xx` labels than the original run when a declared speaker count
@@ -1784,7 +1555,6 @@ pub async fn summarize_meeting(
 
     let app_for_tokens = app.clone();
     let app_for_title = app.clone();
-    let app_for_extract = app.clone();
     let settings_for_title = settings.clone();
     let (content, model_id) = dispatch_summary(
         app,
@@ -1822,17 +1592,6 @@ pub async fn summarize_meeting(
     if let Some(t) = &generated_title {
         let _ = db.update_title(meeting_id, t);
     }
-
-    // Auto-trigger task extraction from the summary we just persisted.
-    // Fire-and-forget: run in the background so the summary result returns
-    // immediately and tasks populate on the Tasks tab via
-    // `tasks:extraction:done` when ready. Non-fatal — a failure inside
-    // `run_extraction` emits its own `tasks:extraction:error` and never
-    // affects the summary.
-    let db_arc = db.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = run_extraction(app_for_extract, db_arc, meeting_id, None).await;
-    });
 
     Ok(SummaryResult {
         summary_id,
