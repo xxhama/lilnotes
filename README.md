@@ -17,7 +17,9 @@ model. No cloud, no telemetry, no Python at runtime.
 ## Development
 
 Prerequisites: Rust (stable, via rustup), Node 20+, Xcode Command Line
-Tools, and CMake for the whisper.cpp build (`brew install cmake`).
+Tools, CMake for the whisper.cpp build (`brew install cmake`), and
+meson + ninja for the bundled WebRTC AEC build
+(`brew install meson ninja`).
 
 ```sh
 npm install
