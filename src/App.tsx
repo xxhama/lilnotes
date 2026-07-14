@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { Building2, Home, ListTodo, Mic, Settings as SettingsIcon, Users } from "lucide-react";
+import { Building2, Home, Mic, Settings as SettingsIcon, Users } from "lucide-react";
 
 import logo from "@/../src-tauri/icons/128x128.png";
 
@@ -19,7 +19,6 @@ import RecordingView from "@/views/Recording";
 import MeetingDetailView from "@/views/MeetingDetail";
 import SettingsView from "@/views/Settings";
 import PersonasView from "@/views/Personas";
-import TasksView from "@/views/Tasks";
 import CustomersView from "@/views/Customers";
 import CustomerDetailView from "@/views/CustomerDetail";
 import OnboardingWizard from "@/components/OnboardingWizard";
@@ -39,7 +38,6 @@ export type Route =
     }
   | { name: "settings" }
   | { name: "personas" }
-  | { name: "tasks" }
   | { name: "customers" }
   | {
       name: "customer";
@@ -53,7 +51,6 @@ export type Route =
 const NAV = [
   { route: { name: "home" } as Route, label: "Meetings", icon: Home },
   { route: { name: "recording" } as Route, label: "Record", icon: Mic },
-  { route: { name: "tasks" } as Route, label: "Tasks", icon: ListTodo },
   { route: { name: "customers" } as Route, label: "Customers", icon: Building2 },
   { route: { name: "personas" } as Route, label: "Personas", icon: Users },
   { route: { name: "settings" } as Route, label: "Settings", icon: SettingsIcon },
@@ -231,7 +228,6 @@ export default function App() {
             )}
             {route?.name === "settings" && <SettingsView />}
             {route?.name === "personas" && <PersonasView />}
-            {route?.name === "tasks" && <TasksView onNavigate={setRoute} />}
             {route?.name === "customers" && <CustomersView onNavigate={setRoute} />}
             {route?.name === "customer" && (
               <CustomerDetailView
