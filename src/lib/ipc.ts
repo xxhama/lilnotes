@@ -663,8 +663,10 @@ export function onSpeakersIdentified(cb: (e: SpeakerMatch[]) => void): Promise<U
   return listen<SpeakerMatch[]>("speakers:identified", (ev) => cb(ev.payload));
 }
 
-/** Fires when a background voiceprint enrollment finishes (refresh counts). */
-export function onVoiceprintsEnrolled(cb: () => void): Promise<UnlistenFn> {
+/** Fires when a background voiceprint enrollment finishes (refresh counts).
+ *  The callback takes a `void` payload so this wrapper also fits
+ *  `useTauriEvent`'s `(e: T) => void` shape; zero-arg callbacks still work. */
+export function onVoiceprintsEnrolled(cb: (e: void) => void): Promise<UnlistenFn> {
   return listen("voiceprints:enrolled", () => cb());
 }
 
