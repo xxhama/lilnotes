@@ -36,10 +36,13 @@ pub fn pack_f32(v: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Unpack little-endian bytes back into f32.
+/// Unpack little-endian bytes back into f32 (a trailing partial word is
+/// ignored).
 pub fn unpack_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
