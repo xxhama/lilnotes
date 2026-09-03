@@ -18,7 +18,7 @@
     "test": "cd src-tauri && cargo test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "dependencies": {
     "@milkdown/kit": "^7.21.2",
