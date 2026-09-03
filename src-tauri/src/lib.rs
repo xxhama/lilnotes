@@ -21,6 +21,7 @@ mod commands;
 mod db;
 mod diarize;
 mod keystore;
+mod mcp;
 mod models;
 mod permissions;
 mod personas;
@@ -70,6 +71,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(CaptureEngine::default())
         .manage(Arc::new(AsrEngine::default()))
         .manage(Arc::new(DiarizeEngine::default()))
@@ -77,6 +79,7 @@ pub fn run() {
         .manage(AsrSession::default())
         .manage(DownloadManager::default())
         .manage(SidecarLlmClient::default())
+        .manage(mcp::McpServer::default())
         .setup(|app| {
             // Store the AppHandle for the panic hook.
             let _ = PANIC_APP_HANDLE.set(app.handle().clone());
@@ -106,6 +109,10 @@ pub fn run() {
                     .map_err(|e| std::io::Error::other(format!("cannot unlock database: {e}")))?;
             }
             app.manage(lazy_db);
+            // Read-only MCP server for local AI agents — only if the user
+            // enabled it and the DB is already unlocked (returning users).
+            // New users get it started from `init_db` after onboarding.
+            mcp::start_if_enabled(app.handle());
             tray::setup(app)?;
             Ok(())
         })
@@ -181,6 +188,8 @@ pub fn run() {
             commands::search_customer_meetings,
             commands::summarize_customer,
             commands::list_customer_summaries,
+            commands::mcp_status,
+            commands::regenerate_mcp_token,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

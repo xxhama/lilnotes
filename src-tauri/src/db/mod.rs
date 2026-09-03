@@ -58,6 +58,17 @@ impl LazyDb {
     pub fn get(&self) -> Option<&Db> {
         self.inner.get()
     }
+
+    /// Wrap an already-open `Db` (tests only — bypasses the Keychain).
+    #[cfg(test)]
+    pub fn for_tests(db: Db) -> Self {
+        let inner = OnceLock::new();
+        let _ = inner.set(db);
+        Self {
+            data_dir: PathBuf::new(),
+            inner,
+        }
+    }
 }
 
 impl Deref for LazyDb {
@@ -84,6 +95,36 @@ pub struct MeetingSummary {
     pub speaker_count: i64,
     pub preview: Option<String>,
     pub has_audio: bool,
+}
+
+/// Filter/pagination for `list_meetings_filtered` (MCP `list_meetings`).
+#[derive(Default, Clone, Debug)]
+pub struct MeetingFilter {
+    /// Case-insensitive substring over title + transcript text.
+    pub query: Option<String>,
+    pub customer_id: Option<i64>,
+    /// Inclusive bounds on `started_at` (epoch ms).
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// One row of `list_meetings_filtered`: `MeetingSummary` minus the audio
+/// flag (never exposed to agents) plus customer/summary/notes flags.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingIndexRow {
+    pub id: i64,
+    pub title: String,
+    pub started_at_ms: i64,
+    pub duration_ms: Option<i64>,
+    pub segment_count: i64,
+    pub speaker_count: i64,
+    pub customer_id: Option<i64>,
+    pub has_summary: bool,
+    pub has_notes: bool,
+    pub preview: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -482,6 +523,19 @@ impl Db {
         if let Some(v) = get("summary_backend") {
             s.summary_backend = v;
         }
+        if let Some(v) = get("mcp_enabled") {
+            s.mcp_enabled = v == "true";
+        }
+        if let Some(v) = get("mcp_port") {
+            if let Ok(p) = v.parse::<u16>() {
+                s.mcp_port = p;
+            }
+        }
+        if let Some(v) = get("mcp_token") {
+            if !v.is_empty() {
+                s.mcp_token = Some(v);
+            }
+        }
         s
     }
 
@@ -531,6 +585,9 @@ impl Db {
         )?;
         put("onboarding_complete", s.onboarding_complete.to_string())?;
         put("summary_backend", s.summary_backend.clone())?;
+        put("mcp_enabled", s.mcp_enabled.to_string())?;
+        put("mcp_port", s.mcp_port.to_string())?;
+        put("mcp_token", s.mcp_token.clone().unwrap_or_default())?;
         Ok(())
     }
 
@@ -652,6 +709,101 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(rows)
+    }
+
+    /// Filtered + paginated variant of `list_meetings` for the MCP server.
+    /// Returns `(rows, total)` where `total` is the match count before
+    /// `LIMIT/OFFSET`. `%`/`_` in the query are escaped so they match
+    /// literally (the UI's `list_meetings` keeps SQLite's wildcard semantics).
+    pub fn list_meetings_filtered(
+        &self,
+        f: &MeetingFilter,
+    ) -> Result<(Vec<MeetingIndexRow>, i64), String> {
+        let conn = self.conn.lock().unwrap();
+        let like = f
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(|q| format!("%{}%", escape_like(q)));
+        const WHERE: &str = r#"
+            WHERE m.ended_at IS NOT NULL
+              AND (?1 IS NULL
+               OR m.title LIKE ?1 ESCAPE '\'
+               OR EXISTS(SELECT 1 FROM segments s
+                          WHERE s.meeting_id = m.id AND s.text LIKE ?1 ESCAPE '\'))
+              AND (?2 IS NULL OR m.customer_id = ?2)
+              AND (?3 IS NULL OR m.started_at >= ?3)
+              AND (?4 IS NULL OR m.started_at <= ?4)
+        "#;
+        let total: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM meetings m {WHERE}"),
+                params![like, f.customer_id, f.from_ms, f.to_ms],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let sql = format!(
+            r#"
+            SELECT m.id, m.title, m.started_at, m.ended_at, m.customer_id,
+                   (SELECT COUNT(*) FROM segments s WHERE s.meeting_id = m.id),
+                   (SELECT COUNT(DISTINCT
+                       CASE
+                         WHEN s.speaker = 'Me' THEN 'me'
+                         ELSE COALESCE(
+                           (SELECT 'p:' || l.persona_id
+                            FROM speaker_persona_links l
+                            WHERE l.meeting_id = m.id
+                              AND l.raw_label = s.speaker
+                              AND l.persona_id IS NOT NULL
+                              AND l.confirmed = 1
+                            LIMIT 1),
+                           s.speaker)
+                       END)
+                    FROM segments s
+                    WHERE s.meeting_id = m.id AND s.speaker IS NOT NULL),
+                   EXISTS(SELECT 1 FROM summaries su WHERE su.meeting_id = m.id),
+                   (m.notes IS NOT NULL AND m.notes != ''),
+                   (SELECT s.text FROM segments s WHERE s.meeting_id = m.id
+                     ORDER BY s.start_ms LIMIT 1)
+            FROM meetings m
+            {WHERE}
+            ORDER BY m.started_at DESC
+            LIMIT ?5 OFFSET ?6
+        "#
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![
+                    like,
+                    f.customer_id,
+                    f.from_ms,
+                    f.to_ms,
+                    f.limit.max(0),
+                    f.offset.max(0)
+                ],
+                |r| {
+                    let started: i64 = r.get(2)?;
+                    let ended: Option<i64> = r.get(3)?;
+                    Ok(MeetingIndexRow {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        started_at_ms: started,
+                        duration_ms: ended.map(|e| e - started),
+                        customer_id: r.get(4)?,
+                        segment_count: r.get(5)?,
+                        speaker_count: r.get(6)?,
+                        has_summary: r.get(7)?,
+                        has_notes: r.get(8)?,
+                        preview: r.get(9)?,
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok((rows, total))
     }
 
     pub fn get_meeting(&self, id: i64) -> Result<MeetingDetail, String> {
@@ -2016,6 +2168,19 @@ impl Db {
         customer_id: i64,
         query: &str,
     ) -> Result<Vec<CustomerSearchResult>, String> {
+        self.search_meetings(Some(customer_id), query, i64::MAX)
+    }
+
+    /// Search meetings (optionally scoped to one customer) across title,
+    /// notes, transcript text, summary content, and persona display names,
+    /// newest first, with a short per-field snippet for each hit. Backs both
+    /// the customer search UI and the MCP `search_meetings` tool.
+    pub fn search_meetings(
+        &self,
+        customer_id: Option<i64>,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<CustomerSearchResult>, String> {
         let q = query.trim();
         if q.is_empty() {
             return Ok(Vec::new());
@@ -2025,7 +2190,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT m.id, m.title, m.started_at, m.notes FROM meetings m
-                 WHERE m.customer_id = ?1
+                 WHERE (?1 IS NULL OR m.customer_id = ?1)
                    AND (m.title LIKE ?2
                         OR (m.notes IS NOT NULL AND m.notes LIKE ?2)
                         OR EXISTS(SELECT 1 FROM segments s
@@ -2037,11 +2202,12 @@ impl Db {
                                    WHERE l.meeting_id = m.id
                                      AND l.persona_id IS NOT NULL
                                      AND p.display_name LIKE ?2))
-                 ORDER BY m.started_at DESC",
+                 ORDER BY m.started_at DESC
+                 LIMIT ?3",
             )
             .map_err(|e| e.to_string())?;
         let matched: Vec<(i64, String, i64, Option<String>)> = stmt
-            .query_map(params![customer_id, like], |r| {
+            .query_map(params![customer_id, like, limit.max(0)], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .map_err(|e| e.to_string())?
@@ -2251,6 +2417,19 @@ fn snippet_around(haystack: &str, needle: &str, pad: usize) -> String {
         s.push('…');
     }
     s
+}
+
+/// Escape `\`, `%` and `_` so a user string matches literally inside a
+/// `LIKE ... ESCAPE '\'` pattern.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Default database location: `<app data>/lilnotes.sqlite3`.
@@ -3256,5 +3435,173 @@ mod tests {
         // No match: fallback path must not panic when byte 80 is mid-char.
         let long: String = "xé".repeat(60); // every other char is 2 bytes
         let _ = snippet_around(&long, "zzz", 40);
+    }
+}
+
+#[cfg(test)]
+mod mcp_query_tests {
+    use super::*;
+    use crate::asr::Segment;
+
+    fn tmp() -> Db {
+        let dir = std::env::temp_dir().join(format!(
+            "lilnotes-mcpq-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Db::open(&dir.join("t.sqlite3"), &[7u8; 32]).unwrap()
+    }
+
+    fn seg(source: &str, speaker: &str, start_ms: u64, text: &str) -> Segment {
+        Segment {
+            id: 0,
+            source: source.into(),
+            start_ms,
+            end_ms: start_ms + 1000,
+            text: text.into(),
+            speaker: Some(speaker.into()),
+            kind: "speech".into(),
+            deleted: false,
+        }
+    }
+
+    /// Two finished meetings (one per customer) + one unfinished.
+    fn seed(db: &Db) -> (i64, i64, i64, i64) {
+        let c1 = db.create_customer("Acme", None).unwrap();
+        let c2 = db.create_customer("Globex", None).unwrap();
+        let m1 = db
+            .insert_meeting_started("a", "Acme kickoff", 1_000)
+            .unwrap();
+        db.finalize_meeting(m1, 61_000, "m.wav", "s.wav").unwrap();
+        db.replace_segments(m1, &[seg("mic", "Me", 0, "budget 100% done")])
+            .unwrap();
+        db.set_meeting_customer(m1, Some(c1)).unwrap();
+        db.insert_summary(m1, "m", "t", "Budget approved").unwrap();
+        let m2 = db
+            .insert_meeting_started("b", "Globex sync", 2_000)
+            .unwrap();
+        db.finalize_meeting(m2, 62_000, "m.wav", "s.wav").unwrap();
+        db.replace_segments(m2, &[seg("system", "SPEAKER_00", 0, "hello world")])
+            .unwrap();
+        db.set_meeting_customer(m2, Some(c2)).unwrap();
+        db.update_notes(m2, "note about budget").unwrap();
+        // Unfinished (no ended_at) — must never be listed.
+        db.insert_meeting_started("c", "live", 3_000).unwrap();
+        (c1, c2, m1, m2)
+    }
+
+    #[test]
+    fn filtered_list_honors_filters_and_paging() {
+        let db = tmp();
+        let (c1, _c2, m1, m2) = seed(&db);
+
+        let all = MeetingFilter {
+            limit: 50,
+            ..Default::default()
+        };
+        let (rows, total) = db.list_meetings_filtered(&all).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![m2, m1]);
+        assert!(rows[1].has_summary && !rows[1].has_notes);
+        assert!(!rows[0].has_summary && rows[0].has_notes);
+        assert_eq!(rows[1].customer_id, Some(c1));
+
+        let (rows, total) = db
+            .list_meetings_filtered(&MeetingFilter {
+                customer_id: Some(c1),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].id, m1);
+
+        let (rows, total) = db
+            .list_meetings_filtered(&MeetingFilter {
+                from_ms: Some(1_500),
+                to_ms: Some(2_500),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].id, m2);
+
+        let (rows, total) = db
+            .list_meetings_filtered(&MeetingFilter {
+                limit: 1,
+                offset: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, m1);
+
+        // Query over title and transcript; `%` is literal.
+        let (rows, _) = db
+            .list_meetings_filtered(&MeetingFilter {
+                query: Some("world".into()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, m2);
+        let (rows, _) = db
+            .list_meetings_filtered(&MeetingFilter {
+                query: Some("100%".into()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let (rows, _) = db
+            .list_meetings_filtered(&MeetingFilter {
+                query: Some("100%x".into()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn global_search_spans_customers_and_fields() {
+        let db = tmp();
+        let (c1, _c2, m1, m2) = seed(&db);
+
+        let r = db.search_meetings(None, "budget", 10).unwrap();
+        assert_eq!(
+            r.iter().map(|x| x.meeting_id).collect::<Vec<_>>(),
+            vec![m2, m1]
+        );
+        let fields = |i: usize| {
+            r[i].hits
+                .iter()
+                .map(|h| h.field.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields(0), vec!["notes"]);
+        assert_eq!(fields(1), vec!["transcript", "summary"]);
+
+        // Scoped variant equals the customer search.
+        let scoped = db.search_meetings(Some(c1), "budget", 10).unwrap();
+        let legacy = db.search_customer_meetings(c1, "budget").unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].meeting_id, legacy[0].meeting_id);
+
+        assert_eq!(db.search_meetings(None, "budget", 1).unwrap().len(), 1);
+        assert!(db.search_meetings(None, "   ", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn escape_like_escapes_wildcards() {
+        assert_eq!(escape_like("a%b_c\\d"), "a\\%b\\_c\\\\d");
+        assert_eq!(escape_like("plain"), "plain");
     }
 }
