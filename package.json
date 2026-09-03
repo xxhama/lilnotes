@@ -27,6 +27,7 @@
     "@radix-ui/react-dropdown-menu": "^2.1.19",
     "@radix-ui/react-slot": "^1.2.0",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "class-variance-authority": "^0.7.1",

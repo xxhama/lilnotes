@@ -11,12 +11,13 @@ model. No cloud, no telemetry, no Python at runtime.
 - **Diarization:** sherpa-onnx (pyannote segmentation-3.0 + CAM++ embeddings)
 - **Summaries:** Ollama HTTP API at `http://localhost:11434`, streaming
 - **Storage:** SQLite; WAVs + models in Application Support
+- **AI agents:** optional read-only [MCP](https://modelcontextprotocol.io) server on `127.0.0.1` (off by default, token-gated)
 
 **Target:** Apple Silicon, macOS 26 (Tahoe)+. Bundle ID: `com.lilnotes`.
 
 ## Development
 
-Prerequisites: Rust (stable, via rustup), Node 20+, Xcode Command Line
+Prerequisites: Rust (stable, via rustup), Node 24+, Xcode Command Line
 Tools, CMake for the whisper.cpp build (`brew install cmake`), and
 meson + ninja for the bundled WebRTC AEC build
 (`brew install meson ninja`).
@@ -177,6 +178,28 @@ ASR.
    makes the DB unreadable (intended factory-reset behavior). `cd src-tauri
 && cargo test` passes (pack/unpack round-trip, cosine, threshold
    classification, CRUD — all with the fixed test key, no Keychain access).
+
+## Connect an AI agent (MCP)
+
+LilNotes can expose your meetings to local AI agents over the Model Context
+Protocol. Turn it on in **Settings → MCP server (AI agents)**; the app starts
+a Streamable HTTP endpoint at `http://127.0.0.1:41777/mcp` (port
+configurable) protected by a bearer token shown in the same panel, with
+copy-ready snippets. For Claude Code:
+
+```sh
+claude mcp add --transport http lilnotes http://127.0.0.1:41777/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Tools (all read-only): `list_meetings`, `search_meetings`, `get_meeting`,
+`get_transcript` (speaker names resolved to personas), `list_summaries`,
+`list_customers`, `get_customer`, `list_customer_summaries`,
+`list_personas`.
+
+Privacy: off by default, binds to loopback only, every request needs the
+token, and audio files, settings and voiceprints are never exposed. The
+server only runs while LilNotes is open (including hidden in the menu bar).
 
 ## Architecture
 

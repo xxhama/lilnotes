@@ -186,6 +186,12 @@ export interface AppSettings {
   aecAggressiveness: AecAggressiveness;
   /** Whether the first-launch onboarding wizard has been completed. */
   onboardingComplete: boolean;
+  /** Expose a read-only MCP server on 127.0.0.1 for local AI agents. Off by default. */
+  mcpEnabled: boolean;
+  /** Loopback TCP port for the MCP server. */
+  mcpPort: number;
+  /** Bearer token agents must send; null until the server was enabled once. */
+  mcpToken: string | null;
 }
 
 /** Live AEC aggressiveness preset (serde lowercase). */
@@ -212,8 +218,32 @@ export function getSettings(): Promise<AppSettings> {
   return invoke<AppSettings>("get_settings");
 }
 
-export function updateSettings(newSettings: AppSettings): Promise<void> {
-  return invoke("update_settings", { newSettings });
+/** Persist settings. Returns the stored settings — enabling the MCP server
+ *  for the first time generates its bearer token server-side. */
+export function updateSettings(newSettings: AppSettings): Promise<AppSettings> {
+  return invoke<AppSettings>("update_settings", { newSettings });
+}
+
+// ---------------------------------------------------------------------------
+// MCP server (read-only, localhost)
+// ---------------------------------------------------------------------------
+
+export interface McpStatus {
+  running: boolean;
+  port: number | null;
+  /** Full endpoint URL while running, e.g. http://127.0.0.1:41777/mcp. */
+  url: string | null;
+  /** Last start failure (e.g. port in use); null when healthy. */
+  error: string | null;
+}
+
+export function mcpStatus(): Promise<McpStatus> {
+  return invoke<McpStatus>("mcp_status");
+}
+
+/** Rotate the MCP bearer token (invalidates configured clients) and restart. */
+export function regenerateMcpToken(): Promise<AppSettings> {
+  return invoke<AppSettings>("regenerate_mcp_token");
 }
 
 export function listAsrModels(): Promise<AsrModelInfo[]> {

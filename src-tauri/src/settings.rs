@@ -75,6 +75,15 @@ pub struct AppSettings {
     pub aec_aggressiveness: AecAggressiveness,
     /// Whether the first-launch onboarding wizard has been completed.
     pub onboarding_complete: bool,
+    /// Expose a read-only MCP server on 127.0.0.1 for local AI agents
+    /// (Claude Code, Cursor, …). Off by default; nothing leaves the Mac.
+    pub mcp_enabled: bool,
+    /// Loopback TCP port for the MCP server.
+    pub mcp_port: u16,
+    /// Bearer token agents must send. Generated on first enable and
+    /// persisted so client configs survive restarts; regenerable from
+    /// Settings. None until the server has been enabled once.
+    pub mcp_token: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -94,6 +103,9 @@ impl Default for AppSettings {
             aec_enabled: true,
             aec_aggressiveness: AecAggressiveness::default(),
             onboarding_complete: false,
+            mcp_enabled: false,
+            mcp_port: crate::mcp::DEFAULT_MCP_PORT,
+            mcp_token: None,
         }
     }
 }
