@@ -588,6 +588,9 @@ export default function MeetingDetailView({
     async (raw: string) => {
       await unlinkSpeakerPersona(id, raw);
       reload();
+      // Unlinking also drops the voiceprint enrolled from this speaker, so
+      // persona print counts change.
+      setPersonas(await listPersonas());
     },
     [id, reload],
   );
