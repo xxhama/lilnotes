@@ -5,15 +5,25 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger: re-prime the caches on main after an idle stretch (GitHub
+  # evicts any cache not accessed in 7 days, so the first run after a pause is
+  # a cold ~7 min build).
+  workflow_dispatch:
+
+# A new push to the same branch/PR cancels the still-running previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - run: npm run typecheck
@@ -22,11 +32,18 @@ jobs:
 
   rust:
     runs-on: macos-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: src-tauri
+    env:
+      # Dependency artifacts with full debug info dominate the ~1 GB target/
+      # cache. Line tables keep file:line in test backtraces at a fraction of
+      # the size and compile time. (rust-cache hashes CARGO_* env vars into its
+      # key, so changing this rolls the cache once.)
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install meson/ninja (webrtc-audio-processing build deps)
         run: brew install meson ninja pkg-config
       - uses: dtolnay/rust-toolchain@stable
@@ -37,28 +54,35 @@ jobs:
       # path points there. Without caching that dir, a restored target/ (build
       # script "fresh") + missing lib dir breaks linking for any NEW binary or
       # example target. prefix-key v1 busted the poisoned pre-existing cache.
+      #
+      # cache-on-failure: a failed clippy/test run still compiled every
+      # dependency; keep that work so the fix-up push starts warm instead of
+      # paying the full ~8 min again.
+      #
+      # Note: caches saved from a PR are only visible to that PR; main can only
+      # read main's caches. PRs fall back to main's cache via restore-keys.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
           prefix-key: v1-rust
           cache-directories: ~/Library/Caches/sherpa-rs
+          cache-on-failure: true
       - run: cargo fmt --check
       # The lilnotes build script (tauri_build) validates that the
-      # `binaries/llama-server-<triple>` sidecar resource declared in
-      # tauri.conf.json (bundle.externalBin) exists — even for clippy/test,
-      # not just `tauri build`. Build it before the cargo commands that
-      # compile the crate. Cached so the multi-minute llama.cpp CMake build
-      # only runs on cache miss; the key includes the pinned llama.cpp ref
-      # (b9957) via the build script hash, so a ref bump busts the cache.
-      - name: Cache llama.cpp build
-        uses: actions/cache@v4
-        with:
-          path: |
-            .llama.cpp
-            src-tauri/binaries
-          key: llama-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-llama-server.sh') }}
-      - name: Build llama-server sidecar
-        run: bash ${{ github.workspace }}/scripts/build-llama-server.sh
+      # `binaries/llama-server-<triple>` sidecar declared in tauri.conf.json
+      # (bundle.externalBin) exists — even for clippy/test, not just
+      # `tauri build`. It only checks that the path is a file and copies it, and
+      # no unit test spawns the sidecar, so an empty executable stub is enough
+      # here. The real llama.cpp build (~3 min) happens in the `sidecar` job
+      # below (main only) and in the Release workflow.
+      - name: Stub llama-server sidecar (tauri_build only checks the file exists)
+        run: |
+          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+          mkdir -p binaries
+          if [ ! -f "binaries/llama-server-$TRIPLE" ]; then
+            : > "binaries/llama-server-$TRIPLE"
+            chmod +x "binaries/llama-server-$TRIPLE"
+          fi
       - run: cargo clippy -- -D warnings
       # A full-match target/ restore marks the sherpa-rs-sys build script
       # fresh, so it never re-copies its dylibs into target/debug — but
@@ -72,3 +96,28 @@ jobs:
           mkdir -p target/debug
           find ~/Library/Caches/sherpa-rs -name '*.dylib' -exec cp -n {} target/debug/ \; || true
       - run: cargo test
+
+  # Keeps the llama.cpp sidecar build cached on the default branch so the
+  # Release workflow (which can read main's caches) gets a hit instead of
+  # rebuilding llama.cpp from source. Runs in parallel with `rust`, so it never
+  # extends PR/main wall time; on a cache hit it finishes in ~30 s. The key
+  # includes the pinned llama.cpp ref (via the build script hash), so a ref
+  # bump rebuilds and re-caches.
+  sidecar:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache llama.cpp build
+        id: llama
+        uses: actions/cache@v5
+        with:
+          path: |
+            .llama.cpp
+            src-tauri/binaries
+          key: llama-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-llama-server.sh') }}
+      - name: Build llama-server sidecar
+        if: steps.llama.outputs.cache-hit != 'true'
+        run: bash scripts/build-llama-server.sh
