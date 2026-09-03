@@ -29,6 +29,29 @@ cd src-tauri && cargo fmt --check  # Rust format check
 > **Do NOT use `npx tauri dev`** — it skips the sidecar build and
 > summarization breaks silently. Always use `npm run tauri:dev` (colon).
 
+## Commits & releases
+
+Releases are automated with **release-please** (`release-please-config.json`,
+`.github/workflows/release.yml`). It only reacts to **Conventional Commits**:
+
+- `fix: …` → patch release, `feat: …` → minor release, `feat!: …` / `fix!: …`
+  (breaking) → minor while the app is < 1.0 (`bump-minor-pre-major`).
+- `chore:`, `docs:`, `ci:`, `refactor:`, `test:` never trigger a release.
+- Commits without a `type:` prefix are ignored for versioning and left out of
+  the changelog, so always use a prefix.
+
+Flow: releasable commits on `main` → the bot opens/updates a
+`chore(main): release X.Y.Z` PR that bumps every version file (`package.json`,
+`package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`, `Cargo.lock`)
+and `CHANGELOG.md` → merging it builds the DMG and publishes the GitHub
+Release. **Never edit version fields or push `v*` tags by hand.** To force a
+specific version, use an empty commit: `git commit --allow-empty -m "chore:
+release 0.3.0" -m "Release-As: 0.3.0"`.
+
+CI note: `ci.yml` stubs the `llama-server` sidecar (an empty file satisfies
+`tauri_build`'s existence check); the real llama.cpp build only runs in the
+`sidecar` job on `main` and in the Release workflow.
+
 ## Architecture
 
 ```
