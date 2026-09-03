@@ -369,6 +369,43 @@ impl Db {
             )
             .map_err(|e| format!("migration to v7 failed: {e}"))?;
         }
+        if version < 8 {
+            // The cluster count the meeting was last diarized with (NULL =
+            // automatic). Re-transcribe re-diarizes the unchanged system
+            // audio; feeding sherpa the same k makes that run reproduce the
+            // original clustering (it's deterministic), so `SPEAKER_xx`
+            // labels — the key for renames, persona links and voiceprints —
+            // stay put. See `transcript::remap_labels` for the safety net.
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE meetings ADD COLUMN diarize_num_speakers INTEGER;
+                PRAGMA user_version = 8;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v8 failed: {e}"))?;
+        }
+        if version < 9 {
+            // Per-meeting speaker embedding (CAM++, L2-normalized, packed
+            // f32 LE like `voiceprints.embedding`), captured when identify
+            // runs after diarization. Lets a persona confirm enroll the
+            // voiceprint instantly and atomically instead of re-reading the
+            // audio — and even after the audio has been deleted. Rows go
+            // with their label in `reconcile_speakers`, so an embedding
+            // never outlives the speaker it describes.
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE speakers ADD COLUMN embedding BLOB;
+                ALTER TABLE speakers ADD COLUMN embedding_dim INTEGER;
+                ALTER TABLE speakers ADD COLUMN speech_ms INTEGER;
+                PRAGMA user_version = 9;
+                COMMIT;
+                "#,
+            )
+            .map_err(|e| format!("migration to v9 failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -881,6 +918,35 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Record the remote-speaker count the meeting was diarized with
+    /// (`None` = automatic estimation).
+    pub fn set_diarize_num_speakers(&self, id: i64, n: Option<i32>) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET diarize_num_speakers = ?2 WHERE id = ?1",
+                params![id, n],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// The remote-speaker count from the last diarization, if one was
+    /// declared (NULL/None = automatic, including meetings diarized before
+    /// this column existed).
+    pub fn diarize_num_speakers(&self, id: i64) -> Result<Option<i32>, String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT diarize_num_speakers FROM meetings WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("meeting {id} not found: {e}"))
+    }
+
     /// Drop the echo-cleaned mic WAV pointer, reverting to the original
     /// `mic.wav` for playback and re-transcription.
     pub fn clear_mic_cleaned_wav(&self, id: i64) -> Result<(), String> {
@@ -930,19 +996,6 @@ impl Db {
             }
         }
         tx.commit().map_err(|e| e.to_string())
-    }
-
-    /// Ensure a speakers row exists for every distinct raw label.
-    pub fn ensure_speakers(&self, meeting_id: i64, raw_labels: &[String]) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        for raw in raw_labels {
-            conn.execute(
-                "INSERT OR IGNORE INTO speakers(meeting_id, raw_label) VALUES(?1, ?2)",
-                params![meeting_id, raw],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        Ok(())
     }
 
     pub fn rename_speaker(
@@ -1394,6 +1447,13 @@ impl Db {
     /// Insert a voiceprint. If the persona now exceeds `cap`, drop the most
     /// redundant print (see `prune_redundant`) — keeping the gallery diverse
     /// and quality-weighted rather than FIFO.
+    ///
+    /// A print is keyed by where it came from: when both `source_meeting_id`
+    /// and `source_label` are given, any existing print with that source —
+    /// under *any* persona — is replaced in the same transaction. One
+    /// speaker in one meeting therefore backs at most one persona, even if a
+    /// late background enrollment lands after the user re-assigned the
+    /// speaker.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_voiceprint(
         &self,
@@ -1405,29 +1465,54 @@ impl Db {
         speech_ms: u64,
         cap: i32,
     ) -> Result<(), String> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let blob = crate::voiceprint::pack_f32(embedding);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO voiceprints(persona_id, embedding, dim, source_meeting_id, source_label, speech_ms, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![persona_id, blob, dim, source_meeting_id, source_label, speech_ms as i64, now],
-        )
-        .map_err(|e| e.to_string())?;
-        if cap > 0 {
-            prune_redundant(&tx, persona_id, cap)?;
-        }
-        tx.execute(
-            "UPDATE personas SET updated_at = ?2 WHERE id = ?1",
-            params![persona_id, now],
-        )
-        .map_err(|e| e.to_string())?;
+        insert_voiceprint_tx(
+            &tx,
+            persona_id,
+            embedding,
+            dim,
+            source_meeting_id,
+            source_label,
+            speech_ms,
+            cap,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Upsert a `speaker_persona_links` row. Preserves an existing
-    /// `confirmed = 1` (re-running identify never un-confirms).
+    /// Store a speaker's per-meeting embedding (see migration v9). Upserts
+    /// so it works whether or not the row exists yet; the rename is left
+    /// alone.
+    pub fn set_speaker_embedding(
+        &self,
+        meeting_id: i64,
+        raw_label: &str,
+        embedding: &[f32],
+        speech_ms: u64,
+    ) -> Result<(), String> {
+        let blob = crate::voiceprint::pack_f32(embedding);
+        let dim = embedding.len() as i64;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO speakers(meeting_id, raw_label, embedding, embedding_dim, speech_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(meeting_id, raw_label) DO UPDATE SET
+                    embedding = excluded.embedding,
+                    embedding_dim = excluded.embedding_dim,
+                    speech_ms = excluded.speech_ms",
+                params![meeting_id, raw_label, blob, dim, speech_ms as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Upsert an automatic suggestion into `speaker_persona_links`. A row the
+    /// user has confirmed is frozen: neither `persona_id` nor `confidence`
+    /// changes (the chip only shows confidence for unconfirmed links, so a
+    /// stale value there is never visible). Re-running identify can
+    /// therefore never flip or clear a human decision.
     pub fn upsert_link(
         &self,
         meeting_id: i64,
@@ -1443,40 +1528,97 @@ impl Db {
                  VALUES(?1, ?2, ?3, ?4, 0)
                  ON CONFLICT(meeting_id, raw_label) DO UPDATE SET
                     persona_id = excluded.persona_id,
-                    confidence = excluded.confidence,
-                    confirmed = MAX(speaker_persona_links.confirmed, 0)",
+                    confidence = excluded.confidence
+                 WHERE speaker_persona_links.confirmed = 0",
                 params![meeting_id, raw_label, persona_id, confidence],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    pub fn set_link_confirmed(
+    /// The user says `raw_label` in this meeting is `persona_id`. In one
+    /// transaction: drop any voiceprint previously enrolled from this
+    /// (meeting, label) — whichever persona it went to, so a wrong first
+    /// pick can't keep matching that voice — write the link as confirmed
+    /// (inserting it if identify never ran), apply `display_name` as the
+    /// per-meeting rename so the chip updates immediately, and, when the
+    /// speaker row carries an embedding (stored at identify time), enroll it
+    /// into `persona_id` right here so both personas' counts move together.
+    /// Returns whether a voiceprint was enrolled; when `false` the caller
+    /// may fall back to enrolling from audio.
+    pub fn confirm_link(
         &self,
         meeting_id: i64,
         raw_label: &str,
         persona_id: i64,
-    ) -> Result<(), String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE speaker_persona_links
-                 SET persona_id = ?3, confirmed = 1
-                 WHERE meeting_id = ?1 AND raw_label = ?2",
-                params![meeting_id, raw_label, persona_id],
+        display_name: &str,
+        cap: i32,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        delete_source_voiceprints(&tx, meeting_id, raw_label)?;
+        tx.execute(
+            "INSERT INTO speaker_persona_links(meeting_id, raw_label, persona_id, confidence, confirmed)
+             VALUES(?1, ?2, ?3, NULL, 1)
+             ON CONFLICT(meeting_id, raw_label) DO UPDATE SET
+                persona_id = excluded.persona_id,
+                confidence = NULL,
+                confirmed = 1",
+            params![meeting_id, raw_label, persona_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO speakers(meeting_id, raw_label, display_name) VALUES(?1, ?2, ?3)
+             ON CONFLICT(meeting_id, raw_label) DO UPDATE SET display_name = excluded.display_name",
+            params![meeting_id, raw_label, display_name],
+        )
+        .map_err(|e| e.to_string())?;
+
+        let stored: Option<(Vec<u8>, i64, i64)> = tx
+            .query_row(
+                "SELECT embedding, embedding_dim, speech_ms FROM speakers
+                 WHERE meeting_id = ?1 AND raw_label = ?2
+                   AND embedding IS NOT NULL AND embedding_dim IS NOT NULL",
+                params![meeting_id, raw_label],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    ))
+                },
             )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let enrolled = match stored {
+            Some((blob, dim, speech_ms)) if dim > 0 => {
+                let emb = crate::voiceprint::unpack_f32(&blob[..blob.len().min(dim as usize * 4)]);
+                insert_voiceprint_tx(
+                    &tx,
+                    persona_id,
+                    &emb,
+                    dim as i32,
+                    Some(meeting_id),
+                    Some(raw_label),
+                    speech_ms.max(0) as u64,
+                    cap,
+                )?;
+                true
+            }
+            _ => false,
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(enrolled)
     }
 
-    /// Atomically remove a persona link AND clear the per-meeting display
-    /// rename for that label (revert to the raw `SPEAKER_xx` chip). Wrapping
-    /// both in one transaction prevents a partial-failure state where the
-    /// link is gone but the persona's name persists.
+    /// Atomically remove a persona link, the voiceprint enrolled from that
+    /// speaker, AND the per-meeting display rename for the label (revert to
+    /// the raw `SPEAKER_xx` chip). One transaction, so a partial failure
+    /// can't leave the link gone but the persona's name or voice behind.
     pub fn unlink_and_clear_rename(&self, meeting_id: i64, raw_label: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        delete_source_voiceprints(&tx, meeting_id, raw_label)?;
         tx.execute(
             "DELETE FROM speaker_persona_links WHERE meeting_id = ?1 AND raw_label = ?2",
             params![meeting_id, raw_label],
@@ -1491,32 +1633,67 @@ impl Db {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Delete `speaker_persona_links` rows for labels not in `keep`. Used by
-    /// re-identify to drop links for speakers that disappeared on a re-run
-    /// (e.g. re-diarization merged two clusters into one).
-    pub fn delete_orphaned_links(
-        &self,
-        meeting_id: i64,
-        keep: &std::collections::HashSet<String>,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        let labels: Vec<String> = conn
-            .prepare("SELECT raw_label FROM speaker_persona_links WHERE meeting_id = ?1")
-            .map_err(|e| e.to_string())?
-            .query_map(params![meeting_id], |r| r.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        for label in labels {
-            if !keep.contains(&label) {
-                conn.execute(
-                    "DELETE FROM speaker_persona_links WHERE meeting_id = ?1 AND raw_label = ?2",
-                    params![meeting_id, label],
+    /// Bring every per-label table in line with the labels that actually
+    /// exist in the meeting after a (re-)diarization. Labels not in `keep`
+    /// have vanished (a re-run merged clusters, or they were never real
+    /// diarization labels): their persona link, display rename, and any
+    /// voiceprint enrolled from them are removed; every label in `keep`
+    /// gets a `speakers` row. One transaction. Voiceprints from other
+    /// meetings are untouched.
+    pub fn reconcile_speakers(&self, meeting_id: i64, keep: &[String]) -> Result<(), String> {
+        let keep: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        let mut stale: Vec<String> = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT raw_label FROM speakers WHERE meeting_id = ?1
+                     UNION
+                     SELECT raw_label FROM speaker_persona_links WHERE meeting_id = ?1
+                     UNION
+                     SELECT source_label FROM voiceprints
+                      WHERE source_meeting_id = ?1 AND source_label IS NOT NULL",
                 )
                 .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![meeting_id], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for label in rows {
+                let label = label.map_err(|e| e.to_string())?;
+                if !keep.contains(label.as_str()) {
+                    stale.push(label);
+                }
             }
         }
-        Ok(())
+        for label in &stale {
+            let dropped = delete_source_voiceprints(&tx, meeting_id, label)?;
+            if dropped > 0 {
+                eprintln!(
+                    "reconcile_speakers: meeting {meeting_id} label {label} vanished; \
+                     dropped {dropped} voiceprint(s) enrolled from it"
+                );
+            }
+            tx.execute(
+                "DELETE FROM speaker_persona_links WHERE meeting_id = ?1 AND raw_label = ?2",
+                params![meeting_id, label],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM speakers WHERE meeting_id = ?1 AND raw_label = ?2",
+                params![meeting_id, label],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for label in keep {
+            tx.execute(
+                "INSERT OR IGNORE INTO speakers(meeting_id, raw_label) VALUES(?1, ?2)",
+                params![meeting_id, label],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// All links for a meeting, joined with persona display_name.
@@ -2092,6 +2269,58 @@ pub fn db_path(app_data_dir: &Path) -> PathBuf {
 /// So a high-quality old print survives over a marginal new duplicate, and
 /// a high-quality new duplicate replaces an old marginal one.
 ///
+/// Body of `Db::insert_voiceprint`, runnable inside a caller's transaction
+/// (`confirm_link` enrolls in the same transaction that drops the old print
+/// and confirms the link). Replaces any print with the same source, inserts,
+/// prunes to `cap`, and bumps the persona's `updated_at`.
+#[allow(clippy::too_many_arguments)]
+fn insert_voiceprint_tx(
+    tx: &rusqlite::Transaction<'_>,
+    persona_id: i64,
+    embedding: &[f32],
+    dim: i32,
+    source_meeting_id: Option<i64>,
+    source_label: Option<&str>,
+    speech_ms: u64,
+    cap: i32,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let blob = crate::voiceprint::pack_f32(embedding);
+    if let (Some(mid), Some(label)) = (source_meeting_id, source_label) {
+        delete_source_voiceprints(tx, mid, label)?;
+    }
+    tx.execute(
+        "INSERT INTO voiceprints(persona_id, embedding, dim, source_meeting_id, source_label, speech_ms, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![persona_id, blob, dim, source_meeting_id, source_label, speech_ms as i64, now],
+    )
+    .map_err(|e| e.to_string())?;
+    if cap > 0 {
+        prune_redundant(tx, persona_id, cap)?;
+    }
+    tx.execute(
+        "UPDATE personas SET updated_at = ?2 WHERE id = ?1",
+        params![persona_id, now],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())
+}
+
+/// Delete every voiceprint enrolled from `(meeting_id, label)`, whichever
+/// persona holds it. Returns the number of rows removed. Runs inside the
+/// caller's transaction.
+fn delete_source_voiceprints(
+    tx: &rusqlite::Transaction<'_>,
+    meeting_id: i64,
+    label: &str,
+) -> Result<usize, String> {
+    tx.execute(
+        "DELETE FROM voiceprints WHERE source_meeting_id = ?1 AND source_label = ?2",
+        params![meeting_id, label],
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Runs inside the caller's transaction (atomic with the enroll insert).
 /// Inserts are one-at-a-time, so the gallery is at most 1 over cap → one
 /// deletion per call.
@@ -2211,7 +2440,27 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7);
+        assert_eq!(v, 9);
+        let has_k: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'diarize_num_speakers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_k, 1, "v8 adds meetings.diarize_num_speakers");
+        let has_emb: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('speakers')
+                 WHERE name IN ('embedding', 'embedding_dim', 'speech_ms')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_emb, 3,
+            "v9 adds speakers.embedding/embedding_dim/speech_ms"
+        );
         for table in ["personas", "voiceprints", "speaker_persona_links"] {
             let n: i64 = conn
                 .query_row(
@@ -2251,21 +2500,35 @@ mod tests {
         assert_eq!(links[0].persona_name.as_deref(), Some("Priya"));
         assert!(!links[0].confirmed);
 
-        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid)
+        db.confirm_link(meeting_id, "SPEAKER_00", pid, "Priya", 50)
             .unwrap();
         let links = db.meeting_speaker_links(meeting_id).unwrap();
         assert!(links[0].confirmed);
+        assert_eq!(
+            links[0].confidence, None,
+            "confirm clears the suggestion score"
+        );
 
-        // Re-running upsert after confirm must NOT clear confirmed.
-        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.8))
+        // Re-running identify after confirm must leave the row frozen —
+        // neither a new score, a different persona, nor a NULL suggestion
+        // may touch a human decision.
+        let other = db.create_persona("Other").unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_00", Some(other), Some(0.8))
+            .unwrap();
+        db.upsert_link(meeting_id, "SPEAKER_00", None, None)
             .unwrap();
         let links = db.meeting_speaker_links(meeting_id).unwrap();
         assert!(links[0].confirmed, "upsert must preserve confirmed=1");
         assert_eq!(
-            links[0].confidence,
-            Some(0.8),
-            "upsert should update confidence"
+            links[0].persona_id,
+            Some(pid),
+            "upsert must not flip a confirmed persona"
         );
+        assert_eq!(
+            links[0].confidence, None,
+            "upsert must not touch a confirmed row"
+        );
+        db.delete_persona(other).unwrap();
 
         db.unlink_and_clear_rename(meeting_id, "SPEAKER_00")
             .unwrap();
@@ -2359,9 +2622,7 @@ mod tests {
         // Simulate a prior confirm: link + display rename applied.
         db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
             .unwrap();
-        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid)
-            .unwrap();
-        db.rename_speaker(meeting_id, "SPEAKER_00", Some("Priya"))
+        db.confirm_link(meeting_id, "SPEAKER_00", pid, "Priya", 50)
             .unwrap();
         // Sanity: the rename is present.
         let detail = db.get_meeting(meeting_id).unwrap();
@@ -2408,25 +2669,309 @@ mod tests {
     }
 
     #[test]
-    fn delete_orphaned_links_keeps_current_labels() {
+    fn reconcile_speakers_purges_vanished_labels() {
         let db = tmp_db();
         let meeting_id = db.insert_meeting_started("s3", "t", 0).unwrap();
-        let pid = db.create_persona("Priya").unwrap();
-        // Two speakers linked from a prior run.
-        db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
+        let other_meeting = db.insert_meeting_started("s3b", "t", 0).unwrap();
+        let priya = db.create_persona("Priya").unwrap();
+        let sam = db.create_persona("Sam").unwrap();
+        // Prior run: SPEAKER_00 confirmed Priya, SPEAKER_01 confirmed Sam
+        // (rename + voiceprint each), plus a Sam print from another meeting.
+        db.confirm_link(meeting_id, "SPEAKER_00", priya, "Priya", 50)
             .unwrap();
-        db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.7))
+        db.insert_voiceprint(
+            priya,
+            &[1.0, 0.0],
+            2,
+            Some(meeting_id),
+            Some("SPEAKER_00"),
+            5000,
+            50,
+        )
+        .unwrap();
+        db.confirm_link(meeting_id, "SPEAKER_01", sam, "Sam", 50)
             .unwrap();
+        db.insert_voiceprint(
+            sam,
+            &[0.0, 1.0],
+            2,
+            Some(meeting_id),
+            Some("SPEAKER_01"),
+            5000,
+            50,
+        )
+        .unwrap();
+        db.insert_voiceprint(
+            sam,
+            &[0.5, 0.5],
+            2,
+            Some(other_meeting),
+            Some("SPEAKER_01"),
+            5000,
+            50,
+        )
+        .unwrap();
         assert_eq!(db.meeting_speaker_links(meeting_id).unwrap().len(), 2);
 
-        // Re-identify only finds SPEAKER_00 now; SPEAKER_01 is orphaned.
-        let keep: std::collections::HashSet<String> =
-            ["SPEAKER_00".to_string()].into_iter().collect();
-        db.delete_orphaned_links(meeting_id, &keep).unwrap();
+        // Re-diarization: SPEAKER_01 merged away; SPEAKER_02 is new.
+        db.reconcile_speakers(meeting_id, &["SPEAKER_00".into(), "SPEAKER_02".into()])
+            .unwrap();
 
         let links = db.meeting_speaker_links(meeting_id).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].raw_label, "SPEAKER_00");
+        assert!(links[0].confirmed, "surviving confirmed link is untouched");
+
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert_eq!(
+            detail.renames.get("SPEAKER_00").map(String::as_str),
+            Some("Priya")
+        );
+        assert!(
+            !detail.renames.contains_key("SPEAKER_01"),
+            "vanished rename dropped"
+        );
+
+        let counts: std::collections::HashMap<i64, i64> = db
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.voiceprint_count))
+            .collect();
+        assert_eq!(counts[&priya], 1, "surviving label keeps its print");
+        assert_eq!(
+            counts[&sam], 1,
+            "vanished label's print dropped; other meeting's kept"
+        );
+
+        let conn = db.conn.lock().unwrap();
+        let rows: Vec<String> = conn
+            .prepare("SELECT raw_label FROM speakers WHERE meeting_id = ?1 ORDER BY raw_label")
+            .unwrap()
+            .query_map(params![meeting_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec!["SPEAKER_00".to_string(), "SPEAKER_02".to_string()]
+        );
+    }
+
+    #[test]
+    fn confirm_link_replaces_source_voiceprint_and_inserts_missing_row() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("s4", "t", 0).unwrap();
+        let a = db.create_persona("A").unwrap();
+        let b = db.create_persona("B").unwrap();
+
+        // No identify run → no link row yet. Confirm must still create it.
+        db.confirm_link(meeting_id, "SPEAKER_00", a, "A", 50)
+            .unwrap();
+        db.insert_voiceprint(
+            a,
+            &[1.0, 0.0],
+            2,
+            Some(meeting_id),
+            Some("SPEAKER_00"),
+            5000,
+            50,
+        )
+        .unwrap();
+        let links = db.meeting_speaker_links(meeting_id).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].persona_id, links[0].confirmed), (Some(a), true));
+
+        // Change of mind: A → B. A must lose the print from this speaker.
+        db.confirm_link(meeting_id, "SPEAKER_00", b, "B", 50)
+            .unwrap();
+        let links = db.meeting_speaker_links(meeting_id).unwrap();
+        assert_eq!(
+            links[0].persona_id,
+            Some(b),
+            "re-confirm overrides a confirmed row"
+        );
+        let detail = db.get_meeting(meeting_id).unwrap();
+        assert_eq!(
+            detail.renames.get("SPEAKER_00").map(String::as_str),
+            Some("B")
+        );
+        let counts: std::collections::HashMap<i64, i64> = db
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.voiceprint_count))
+            .collect();
+        assert_eq!(counts[&a], 0, "A no longer holds this speaker's voice");
+        assert_eq!(
+            counts[&b], 0,
+            "enrollment into B happens later, by the caller"
+        );
+    }
+
+    #[test]
+    fn insert_voiceprint_replaces_same_source_across_personas() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("s5", "t", 0).unwrap();
+        let a = db.create_persona("A").unwrap();
+        let b = db.create_persona("B").unwrap();
+        db.insert_voiceprint(
+            a,
+            &[1.0, 0.0],
+            2,
+            Some(meeting_id),
+            Some("SPEAKER_00"),
+            5000,
+            50,
+        )
+        .unwrap();
+        // A late enrollment into B for the same speaker evicts A's print.
+        db.insert_voiceprint(
+            b,
+            &[1.0, 0.0],
+            2,
+            Some(meeting_id),
+            Some("SPEAKER_00"),
+            6000,
+            50,
+        )
+        .unwrap();
+        // Re-enrolling the same source into B is idempotent, not additive.
+        db.insert_voiceprint(
+            b,
+            &[1.0, 0.0],
+            2,
+            Some(meeting_id),
+            Some("SPEAKER_00"),
+            6000,
+            50,
+        )
+        .unwrap();
+        // Source-less prints are never treated as duplicates.
+        db.insert_voiceprint(a, &[0.0, 1.0], 2, None, None, 6000, 50)
+            .unwrap();
+        db.insert_voiceprint(a, &[0.0, 1.0], 2, None, None, 6000, 50)
+            .unwrap();
+        let counts: std::collections::HashMap<i64, i64> = db
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.voiceprint_count))
+            .collect();
+        assert_eq!(counts[&a], 2);
+        assert_eq!(counts[&b], 1);
+    }
+
+    #[test]
+    fn unlink_deletes_source_voiceprint() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("s6", "t", 0).unwrap();
+        let a = db.create_persona("A").unwrap();
+        db.confirm_link(meeting_id, "SPEAKER_00", a, "A", 50)
+            .unwrap();
+        db.insert_voiceprint(
+            a,
+            &[1.0, 0.0],
+            2,
+            Some(meeting_id),
+            Some("SPEAKER_00"),
+            5000,
+            50,
+        )
+        .unwrap();
+        db.insert_voiceprint(a, &[0.0, 1.0], 2, None, None, 5000, 50)
+            .unwrap();
+        db.unlink_and_clear_rename(meeting_id, "SPEAKER_00")
+            .unwrap();
+        assert!(db.meeting_speaker_links(meeting_id).unwrap().is_empty());
+        assert_eq!(
+            db.list_personas().unwrap()[0].voiceprint_count,
+            1,
+            "only the source print goes"
+        );
+        assert!(db.get_meeting(meeting_id).unwrap().renames.is_empty());
+    }
+
+    #[test]
+    fn confirm_link_enrolls_stored_embedding_atomically() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("s8", "t", 0).unwrap();
+        let a = db.create_persona("A").unwrap();
+        let b = db.create_persona("B").unwrap();
+        db.set_speaker_embedding(meeting_id, "SPEAKER_00", &[0.6, 0.8], 7000)
+            .unwrap();
+
+        assert!(db
+            .confirm_link(meeting_id, "SPEAKER_00", a, "A", 50)
+            .unwrap());
+        let counts = |db: &Db| -> std::collections::HashMap<i64, i64> {
+            db.list_personas()
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.id, p.voiceprint_count))
+                .collect()
+        };
+        let c = counts(&db);
+        assert_eq!((c[&a], c[&b]), (1, 0));
+        let with_emb = db.list_personas_with_voiceprints().unwrap();
+        let ga = with_emb.iter().find(|p| p.id == a).unwrap();
+        assert_eq!(
+            ga.embeddings[0],
+            vec![0.6, 0.8],
+            "enrolled the stored embedding"
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            let (src_m, src_l, ms): (i64, String, i64) = conn
+                .query_row(
+                    "SELECT source_meeting_id, source_label, speech_ms FROM voiceprints WHERE persona_id = ?1",
+                    params![a],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (src_m, src_l.as_str(), ms),
+                (meeting_id, "SPEAKER_00", 7000)
+            );
+        }
+
+        // Change of mind A → B: one transaction moves the print.
+        assert!(db
+            .confirm_link(meeting_id, "SPEAKER_00", b, "B", 50)
+            .unwrap());
+        let c = counts(&db);
+        assert_eq!((c[&a], c[&b]), (0, 1));
+
+        // Re-confirming B is idempotent.
+        assert!(db
+            .confirm_link(meeting_id, "SPEAKER_00", b, "B", 50)
+            .unwrap());
+        let c = counts(&db);
+        assert_eq!((c[&a], c[&b]), (0, 1));
+    }
+
+    #[test]
+    fn confirm_link_without_stored_embedding_enrolls_nothing() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("s9", "t", 0).unwrap();
+        let a = db.create_persona("A").unwrap();
+        assert!(!db
+            .confirm_link(meeting_id, "SPEAKER_00", a, "A", 50)
+            .unwrap());
+        assert_eq!(db.list_personas().unwrap()[0].voiceprint_count, 0);
+        let links = db.meeting_speaker_links(meeting_id).unwrap();
+        assert_eq!((links[0].persona_id, links[0].confirmed), (Some(a), true));
+    }
+
+    #[test]
+    fn diarize_num_speakers_roundtrip() {
+        let db = tmp_db();
+        let meeting_id = db.insert_meeting_started("s7", "t", 0).unwrap();
+        assert_eq!(db.diarize_num_speakers(meeting_id).unwrap(), None);
+        db.set_diarize_num_speakers(meeting_id, Some(3)).unwrap();
+        assert_eq!(db.diarize_num_speakers(meeting_id).unwrap(), Some(3));
+        db.set_diarize_num_speakers(meeting_id, None).unwrap();
+        assert_eq!(db.diarize_num_speakers(meeting_id).unwrap(), None);
     }
 
     #[test]
@@ -2486,11 +3031,11 @@ mod tests {
         let pid = db.create_persona("Priya").unwrap();
         db.upsert_link(meeting_id, "SPEAKER_00", Some(pid), Some(0.9))
             .unwrap();
-        db.set_link_confirmed(meeting_id, "SPEAKER_00", pid)
+        db.confirm_link(meeting_id, "SPEAKER_00", pid, "Priya", 50)
             .unwrap();
         db.upsert_link(meeting_id, "SPEAKER_01", Some(pid), Some(0.85))
             .unwrap();
-        db.set_link_confirmed(meeting_id, "SPEAKER_01", pid)
+        db.confirm_link(meeting_id, "SPEAKER_01", pid, "Priya", 50)
             .unwrap();
 
         assert_eq!(db.count_speaker_identities(meeting_id).unwrap(), 3);

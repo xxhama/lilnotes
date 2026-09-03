@@ -13,9 +13,11 @@ import {
   deleteAllVoiceprints,
   deletePersona,
   listPersonas,
+  onVoiceprintsEnrolled,
   renamePersona,
   type Persona,
 } from "@/lib/ipc";
+import { useTauriEvent } from "@/lib/useTauriEvent";
 
 export default function PersonasView() {
   const [personas, setPersonas] = useState<Persona[]>([]);
@@ -31,6 +33,12 @@ export default function PersonasView() {
   }, []);
 
   useEffect(reload, [reload]);
+
+  // Confirming a speaker in a meeting drops the old persona's voiceprint at
+  // once but enrolls the new one in the background (seconds). Refresh counts
+  // when that finishes, so opening this page mid-enrollment doesn't show the
+  // removal without the addition.
+  useTauriEvent(onVoiceprintsEnrolled, reload);
 
   const add = useCallback(async () => {
     const name = draft.trim();

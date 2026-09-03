@@ -364,13 +364,25 @@ pub async fn transcribe_meeting(
             _ => return Err("this meeting's audio files have been deleted".into()),
         };
         ensure_asr_model(&app, &asr, &cfg)?;
-        let segments = chunker::transcribe_wavs(
+        let mut segments = chunker::transcribe_wavs(
             app.clone(),
             &asr,
             format!("meeting-{meeting_id}"),
             &mic,
             &system,
         )?;
+        // A meeting that was already diarized keeps its speaker labels (the
+        // key for renames/personas/voiceprints): treat the previous system
+        // segments as turns so the fresh transcript inherits them. A
+        // following `diarize_meeting` then remaps against these.
+        let old_turns: Vec<crate::diarize::Turn> =
+            turns_from_segments(&db.meeting_segments_all(meeting_id)?)
+                .into_iter()
+                .filter(|t| t.speaker.starts_with(transcript::RAW_LABEL_PREFIX))
+                .collect();
+        if !old_turns.is_empty() {
+            transcript::assign_speakers(&mut segments, &old_turns);
+        }
         // Preserve echo/delete marks across the re-transcribe: replace_segments
         // DELETEs all rows, so snapshot the marks first and re-apply them to the
         // fresh rows by (source, start_ms ± 250ms).
@@ -427,50 +439,19 @@ pub async fn diarize_meeting(
     tauri::async_runtime::spawn_blocking(move || {
         let (mic_wav, system_wav) = db.meeting_wavs(meeting_id)?;
         let system_wav = system_wav.ok_or("this meeting's audio files have been deleted")?;
-        // Load ALL segments (including echo-marked + soft-deleted) so the
-        // replace below preserves their kind/deleted flags — diarization only
-        // relabels system speakers; mic/echo/deleted rows pass through.
-        let mut segments = db.meeting_segments_all(meeting_id)?;
-        if segments.is_empty() {
-            return Err("transcribe the meeting before identifying speakers".into());
-        }
-
-        let turns = diarizer.diarize_wav(&app, &system_wav, num_speakers)?;
-        let speaker_count = transcript::assign_speakers(&mut segments, &turns);
-        segments.sort_by_key(|s| s.start_ms);
-
-        // Belt-and-suspenders: the rows already carry their marks (loaded via
-        // _all), but snapshot/reapply keeps them safe if timestamp shifting
-        // ever changes row identity.
-        let marks = db.snapshot_marks(meeting_id)?;
-        db.replace_segments(meeting_id, &segments)?;
-        db.reapply_marks(meeting_id, &marks)?;
-        let mut labels: Vec<String> = segments
-            .iter()
-            .filter_map(|s| s.speaker.clone())
-            .filter(|s| s.starts_with("SPEAKER_"))
-            .collect();
-        labels.sort();
-        labels.dedup();
-        db.ensure_speakers(meeting_id, &labels)?;
-
-        // Milestone 9: identity layer (additive). Runs after speakers are
-        // persisted; never blocks the diarize result on failure.
-        let settings = db.get_settings();
-        if let Err(e) = personas::identify_and_persist(
-            &db,
-            &voiceprint,
+        // The previous run's labels are the identities renames/personas are
+        // keyed on; capture them before the pipeline rewrites the segments.
+        let old = db.meeting_segments_all(meeting_id)?;
+        let speaker_count = diarize_and_persist(
             &app,
+            &diarizer,
+            &voiceprint,
+            &db,
             meeting_id,
             &system_wav,
-            &turns,
-            &settings,
-        )
-        .map(|m| {
-            let _ = app.emit_to("main", "speakers:identified", m);
-        }) {
-            eprintln!("identify_speakers failed (non-fatal): {e}");
-        }
+            num_speakers,
+            &old,
+        )?;
 
         // Transcript + speakers are safely stored; drop the audio if asked.
         let mut audio_deleted = false;
@@ -493,6 +474,80 @@ pub async fn diarize_meeting(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Diarize the system channel and persist the result while keeping every
+/// voice's existing `SPEAKER_xx` label. Those labels are the key for
+/// per-meeting renames, persona links, and enrolled voiceprints, so a fresh
+/// diarization must not re-mint them: new clusters are matched to the labels
+/// in `old_segments` by time overlap (`transcript::remap_labels`), the
+/// relabeled turns are assigned to the segments, and
+/// `Db::reconcile_speakers` drops the link/rename/voiceprint of any label
+/// that genuinely vanished. Shared by `diarize_meeting` and
+/// `retranscribe_and_rediarize`.
+///
+/// `old_segments` must be captured by the caller BEFORE anything rewrites
+/// the meeting's segments (a re-transcribe wipes speaker labels first).
+/// Returns the distinct system-speaker count.
+#[allow(clippy::too_many_arguments)]
+fn diarize_and_persist(
+    app: &AppHandle,
+    diarizer: &DiarizeEngine,
+    voiceprint: &VoiceprintEngine,
+    db: &crate::db::LazyDb,
+    meeting_id: i64,
+    system_wav: &str,
+    num_speakers: Option<i32>,
+    old_segments: &[Segment],
+) -> Result<usize, String> {
+    // Load ALL segments (including echo-marked + soft-deleted) so the replace
+    // below preserves their kind/deleted flags — diarization only relabels
+    // system speakers; mic/echo/deleted rows pass through.
+    let mut segments = db.meeting_segments_all(meeting_id)?;
+    if segments.is_empty() {
+        return Err("transcribe the meeting before identifying speakers".into());
+    }
+
+    let mut turns = diarizer.diarize_wav(app, system_wav, num_speakers)?;
+    let map = transcript::remap_labels(old_segments, &turns);
+    transcript::relabel_turns(&mut turns, &map);
+    let speaker_count = transcript::assign_speakers(&mut segments, &turns);
+    segments.sort_by_key(|s| s.start_ms);
+
+    // Belt-and-suspenders: the rows already carry their marks (loaded via
+    // _all), but snapshot/reapply keeps them safe if timestamp shifting ever
+    // changes row identity.
+    let marks = db.snapshot_marks(meeting_id)?;
+    db.replace_segments(meeting_id, &segments)?;
+    db.reapply_marks(meeting_id, &marks)?;
+
+    db.reconcile_speakers(meeting_id, &raw_labels(&segments))?;
+    db.set_diarize_num_speakers(meeting_id, num_speakers)?;
+
+    // Identity layer (additive). Runs after speakers are persisted; never
+    // blocks the diarize result on failure.
+    let settings = db.get_settings();
+    if let Err(e) = personas::identify_and_persist(
+        db, voiceprint, app, meeting_id, system_wav, &turns, &settings,
+    )
+    .map(|m| {
+        let _ = app.emit_to("main", "speakers:identified", m);
+    }) {
+        eprintln!("identify_speakers failed (non-fatal): {e}");
+    }
+    Ok(speaker_count)
+}
+
+/// Distinct diarizer labels (`SPEAKER_xx`) present in `segments`, sorted.
+fn raw_labels(segments: &[Segment]) -> Vec<String> {
+    let mut labels: Vec<String> = segments
+        .iter()
+        .filter_map(|s| s.speaker.clone())
+        .filter(|s| s.starts_with(transcript::RAW_LABEL_PREFIX))
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
 }
 
 // ---------------------------------------------------------------------------
@@ -557,7 +612,8 @@ pub fn restore_segment(db: State<'_, Arc<LazyDb>>, segment_id: i64) -> Result<()
 // ---------------------------------------------------------------------------
 
 /// Re-transcribe a meeting's mic (from `mic_path`) + system WAV and re-run
-/// diarization on the system channel, restoring speaker labels/personas.
+/// diarization on the system channel, keeping speaker labels — and with them
+/// renames, persona links, and voiceprints — attached to the same voices.
 /// Shared by `clean_echo` (mic_path = the cleaned WAV), `revert_echo_clean`
 /// (mic_path = the original `mic.wav`), and `retranscribe_meeting` (mic_path =
 /// cleaned-or-original, `model_id` = the user's per-meeting pick). Echo/delete
@@ -577,6 +633,10 @@ fn retranscribe_and_rediarize(
     model_id: &str,
 ) -> Result<DiarizedTranscript, String> {
     ensure_asr_model_id(app, asr, model_id)?;
+    // Snapshot the previous speaker labels BEFORE the transcribe rewrite
+    // below wipes them; the diarize step needs them to keep each voice's
+    // label (and everything keyed on it).
+    let old = db.meeting_segments_all(meeting_id)?;
     let segments = chunker::transcribe_wavs(
         app.clone(),
         asr,
@@ -591,43 +651,21 @@ fn retranscribe_and_rediarize(
     // Record which model produced this transcript.
     db.set_meeting_asr_model(meeting_id, model_id)?;
 
-    // Re-run diarization on the (unchanged) system channel so speaker labels
-    // survive the segment rebuild. Use the existing speaker count as a hint
-    // when it was already >= 2 (more reliable than automatic estimation).
-    let num_speakers = {
-        let detail = db.get_meeting(meeting_id)?;
-        if detail.speaker_count >= 2 {
-            Some(detail.speaker_count as i32)
-        } else {
-            None
-        }
-    };
-    let turns = diarizer.diarize_wav(app, system_wav, num_speakers)?;
-    let mut segs = db.meeting_segments_all(meeting_id)?;
-    let speaker_count = transcript::assign_speakers(&mut segs, &turns);
-    segs.sort_by_key(|s| s.start_ms);
-    let marks2 = db.snapshot_marks(meeting_id)?;
-    db.replace_segments(meeting_id, &segs)?;
-    db.reapply_marks(meeting_id, &marks2)?;
-    let mut labels: Vec<String> = segs
-        .iter()
-        .filter_map(|s| s.speaker.clone())
-        .filter(|s| s.starts_with("SPEAKER_"))
-        .collect();
-    labels.sort();
-    labels.dedup();
-    db.ensure_speakers(meeting_id, &labels)?;
-
-    // Identity layer (additive, non-fatal).
-    let settings = db.get_settings();
-    if let Err(e) = personas::identify_and_persist(
-        db, voiceprint, app, meeting_id, system_wav, &turns, &settings,
-    )
-    .map(|m| {
-        let _ = app.emit_to("main", "speakers:identified", m);
-    }) {
-        eprintln!("identify_speakers failed (non-fatal): {e}");
-    }
+    // Re-diarize the (unchanged) system channel with the same cluster count
+    // as the original run: diarization is deterministic, so identical
+    // input + k reproduces the original clustering and labels. The remap in
+    // `diarize_and_persist` covers whatever still shifts.
+    let num_speakers = db.diarize_num_speakers(meeting_id)?;
+    let speaker_count = diarize_and_persist(
+        app,
+        diarizer,
+        voiceprint,
+        db,
+        meeting_id,
+        system_wav,
+        num_speakers,
+        &old,
+    )?;
 
     Ok(DiarizedTranscript {
         segments: db.meeting_segments(meeting_id)?,
@@ -1113,9 +1151,11 @@ fn turns_from_segments(segments: &[Segment]) -> Vec<crate::diarize::Turn> {
 }
 
 /// Re-run embedding + matching for a meeting's diarized speakers; persists
-/// suggestions (confirmed preserved). Useful to re-match after the gallery
-/// grew. Fails gracefully if the audio has been deleted. Turns are rebuilt
-/// from persisted segments (no re-diarization), so labels stay stable.
+/// suggestions (confirmed links are frozen). Useful to re-match after the
+/// gallery grew. Fails gracefully if the audio has been deleted. Turns are
+/// rebuilt from persisted segments (no re-diarization), so labels stay
+/// stable; per-label rows for labels no longer in the transcript are
+/// reconciled away first.
 #[tauri::command]
 pub async fn identify_speakers(
     app: AppHandle,
@@ -1128,6 +1168,10 @@ pub async fn identify_speakers(
     tauri::async_runtime::spawn_blocking(move || {
         let (_, system_wav) = db.meeting_wavs(meeting_id)?;
         let system_wav = system_wav.ok_or("this meeting's audio files have been deleted")?;
+        db.reconcile_speakers(
+            meeting_id,
+            &raw_labels(&db.meeting_segments_all(meeting_id)?),
+        )?;
         let turns = turns_from_segments(&db.meeting_segments(meeting_id)?);
         let settings = db.get_settings();
         let matches = personas::identify_and_persist(
@@ -1146,12 +1190,16 @@ pub async fn identify_speakers(
     .map_err(|e| e.to_string())?
 }
 
-/// Confirm that `raw_label` in a meeting is `persona_id`. Marks the link
-/// confirmed and applies the persona name via the per-meeting display
-/// mapping (so the chip updates immediately), then enrolls the speaker's
-/// embedding in the background (best-effort, slow — CAM++ extraction over
-/// the full system WAV). A `voiceprints:enrolled` event fires when the
-/// enrollment attempt finishes so persona counts can refresh.
+/// Confirm that `raw_label` in a meeting is `persona_id`. In one transaction:
+/// marks the link confirmed, drops any voiceprint previously enrolled from
+/// this speaker (so a changed mind doesn't leave the voice under the old
+/// persona), applies the persona name via the per-meeting display mapping,
+/// and enrolls the embedding stored on the speaker row at identify time —
+/// so both persona counts change together, instantly. Only when no stored
+/// embedding exists (meeting identified before embeddings were persisted)
+/// does it fall back to a detached audio-based enrollment (slow — CAM++
+/// over the system WAV). A `voiceprints:enrolled` event fires either way so
+/// persona counts can refresh.
 #[tauri::command]
 pub async fn confirm_speaker_persona(
     app: AppHandle,
@@ -1163,27 +1211,30 @@ pub async fn confirm_speaker_persona(
 ) -> Result<(), String> {
     let db2 = db.inner().clone();
     let raw = raw_label.clone();
-    // Steps 1-2 (what the chip reflects) run synchronously so the UI
-    // updates as soon as the command resolves.
-    tauri::async_runtime::spawn_blocking(move || {
-        // 1. Mark the link confirmed.
-        db2.set_link_confirmed(meeting_id, &raw, persona_id)?;
-        // 2. Apply the persona name to the per-meeting display mapping.
+    // Everything the chip and persona counts reflect runs synchronously so
+    // the UI is consistent as soon as the command resolves.
+    let enrolled = tauri::async_runtime::spawn_blocking(move || {
         let name = db2
             .list_personas()?
             .into_iter()
             .find(|p| p.id == persona_id)
             .map(|p| p.display_name)
             .ok_or("persona not found")?;
-        db2.rename_speaker(meeting_id, &raw, Some(&name))?;
-        Ok::<(), String>(())
+        let cap = db2.get_settings().voiceprint_gallery_cap;
+        // Link confirmed + stale voiceprint dropped + display name applied
+        // + stored embedding enrolled, atomically.
+        db2.confirm_link(meeting_id, &raw, persona_id, &name, cap)
     })
     .await
     .map_err(|e| e.to_string())??;
+    if enrolled {
+        let _ = app.emit_to("main", "voiceprints:enrolled", ());
+        return Ok(());
+    }
 
-    // Step 3: enroll the voiceprint detached — embedding extraction takes a
-    // few seconds and must not block the chip update. Emit when done so the
-    // frontend can refresh persona voiceprint counts.
+    // Fallback: no stored embedding for this speaker. Enroll from audio,
+    // detached — extraction takes a few seconds and must not block the chip
+    // update. Emit when done so the frontend can refresh persona counts.
     let db3 = db.inner().clone();
     let voiceprint2 = voiceprint.inner().clone();
     let raw2 = raw_label.clone();
@@ -1211,10 +1262,10 @@ pub async fn confirm_speaker_persona(
     Ok(())
 }
 
-/// Remove the persona link for a raw label and clear any display rename
-/// applied by a prior confirm (revert to the raw `SPEAKER_xx` label). Both
-/// operations run in one transaction so a partial failure can't leave the
-/// link removed but the persona's name still showing.
+/// Remove the persona link for a raw label, the voiceprint enrolled from it,
+/// and any display rename applied by a prior confirm (revert to the raw
+/// `SPEAKER_xx` label). All run in one transaction so a partial failure can't
+/// leave the link removed but the persona's name or voice still around.
 #[tauri::command]
 pub fn unlink_speaker_persona(
     db: State<'_, Arc<LazyDb>>,

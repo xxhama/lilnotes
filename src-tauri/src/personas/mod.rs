@@ -3,7 +3,7 @@
 //! orchestrate enrollment when a human confirms an identity.
 
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::db::Db;
 use crate::diarize::Turn;
@@ -99,8 +99,11 @@ pub fn rank_personas(personas: &[PersonaWithEmbeddings], query: &[f32]) -> Vec<P
 }
 
 /// Run embedding + matching for a meeting's diarized speakers and persist
-/// suggestions into `speaker_persona_links` (confirmed preserved). Returns
-/// one `SpeakerMatch` per raw label that has a usable embedding.
+/// suggestions into `speaker_persona_links`. Confirmed links are frozen —
+/// `Db::upsert_link` never touches them — but a fresh `SpeakerMatch` is still
+/// returned for every raw label that has a usable embedding. Callers are
+/// responsible for `Db::reconcile_speakers` (dropping rows for labels that no
+/// longer exist) before invoking this.
 pub fn identify_and_persist(
     db: &Db,
     voiceprint: &VoiceprintEngine,
@@ -111,12 +114,13 @@ pub fn identify_and_persist(
     settings: &AppSettings,
 ) -> Result<Vec<SpeakerMatch>, String> {
     let embeddings = voiceprint.embed_speakers(app, system_wav_path, turns)?;
+    // Keep each speaker's embedding with the meeting so a later confirm can
+    // enroll it instantly (no audio pass) — and even after the audio is gone.
+    for (raw_label, emb) in &embeddings {
+        db.set_speaker_embedding(meeting_id, raw_label, &emb.vec, emb.speech_ms)?;
+    }
 
     let personas = db.list_personas_with_voiceprints()?;
-    // Drop links for labels that no longer appear in the current turns
-    // (e.g. a re-diarization merged two clusters into one).
-    let current_labels: HashSet<String> = turns.iter().map(|t| t.speaker.clone()).collect();
-    db.delete_orphaned_links(meeting_id, &current_labels)?;
     // Snapshot links BEFORE upserting so `already_linked` reflects prior
     // identify runs (not the row we're about to write). Also collapses the
     // per-label `meeting_speaker_links` query into one upfront call.
@@ -156,10 +160,12 @@ pub fn identify_and_persist(
     Ok(out)
 }
 
-/// Enroll a speaker's embedding into a persona's gallery (called only on
-/// human confirmation). Re-derives the embedding from `system_wav_path` for
-/// the given label's turns. If the audio is gone, returns Ok(false) so the
-/// caller can still mark the link confirmed without a voiceprint.
+/// Fallback enrollment from audio, for a speaker with no embedding stored on
+/// its `speakers` row (identified before embeddings were persisted). The
+/// normal path is `Db::confirm_link`, which enrolls the stored embedding
+/// synchronously. Re-derives the embedding from `system_wav_path` for the
+/// given label's turns only. If the audio is gone, returns Ok(false) so the
+/// caller can still leave the link confirmed without a voiceprint.
 #[allow(clippy::too_many_arguments)]
 pub fn enroll(
     db: &Db,
@@ -176,7 +182,14 @@ pub fn enroll(
         Some(p) => p,
         None => return Ok(false),
     };
-    let embeddings = voiceprint.embed_speakers(app, path, turns)?;
+    // Only this speaker's turns: embedding every label would multiply the
+    // (already slow) CAM++ pass by the speaker count for nothing.
+    let own: Vec<Turn> = turns
+        .iter()
+        .filter(|t| t.speaker == raw_label)
+        .cloned()
+        .collect();
+    let embeddings = voiceprint.embed_speakers(app, path, &own)?;
     let emb: &SpeakerEmbedding = embeddings.get(raw_label).ok_or_else(|| {
         format!(
             "no embedding for {raw_label} (need >= {} ms speech)",
