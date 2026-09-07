@@ -16,6 +16,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_TAURI="$ROOT/src-tauri"
 
+# Preflight: fail with a clear message instead of a bare "command not found".
+for tool in cmake git rustc; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "build-llama-server: '$tool' is required (see CONTRIBUTING.md; cmake: brew install cmake)" >&2
+    exit 1
+  fi
+done
+
 # Get the Rust target triple (e.g. aarch64-apple-darwin on Apple Silicon).
 TARGET=$(rustc -vV | grep '^host:' | awk '{print $2}')
 echo "build-llama-server: target triple = $TARGET"
@@ -58,7 +66,7 @@ cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
   -DLLAMA_BUILD_EXAMPLES=OFF
 
 echo "build-llama-server: building llama-server (this takes a few minutes)…"
-cmake --build "$BUILD_DIR" --config Release -j 8 --target llama-server
+cmake --build "$BUILD_DIR" --config Release -j "$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" --target llama-server
 
 # The binary lands at build/bin/llama-server.
 BINARY="$BUILD_DIR/bin/llama-server"

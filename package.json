@@ -11,7 +11,7 @@
     "tauri:dev": "bash scripts/build-llama-server.sh && tauri dev",
     "tauri:build": "bash scripts/build-llama-server.sh && tauri build && bash scripts/fix-bundle.sh",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
+    "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
