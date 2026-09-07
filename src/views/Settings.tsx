@@ -6,7 +6,19 @@
  * personas/voiceprints management.
  */
 import { useCallback, useEffect, useState } from "react";
-import { CheckCircle2, Download, ExternalLink, HelpCircle, X, XCircle } from "lucide-react";
+import {
+  Check,
+  CheckCircle2,
+  Copy,
+  Download,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  HelpCircle,
+  RefreshCw,
+  X,
+  XCircle,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,18 +31,22 @@ import {
   downloadAsrModel,
   getSettings,
   listAsrModels,
+  mcpStatus,
   micPermissionStatus,
   onModelProgress,
   openPrivacySettings,
   probeSystemAudioPermission,
+  regenerateMcpToken,
   requestMicPermission,
   updateSettings,
   type AecAggressiveness,
   type AppSettings,
   type AsrModelInfo,
   type DownloadProgress,
+  type McpStatus,
   type PermissionStatus,
 } from "@/lib/ipc";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import NativeModelManager from "@/components/NativeModelManager";
@@ -80,6 +96,16 @@ export default function SettingsView() {
   const [asrModels, setAsrModels] = useState<AsrModelInfo[]>([]);
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
   const [templatePlaceholder, setTemplatePlaceholder] = useState("");
+  const [mcp, setMcp] = useState<McpStatus | null>(null);
+  const [showToken, setShowToken] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [portDraft, setPortDraft] = useState<string | null>(null);
+
+  const refreshMcp = useCallback(() => {
+    mcpStatus()
+      .then(setMcp)
+      .catch(() => {});
+  }, []);
 
   const refreshModels = useCallback(() => {
     listAsrModels()
@@ -92,6 +118,7 @@ export default function SettingsView() {
     getSettings().then(setSettings);
     defaultSummaryTemplate().then(setTemplatePlaceholder);
     refreshModels();
+    refreshMcp();
     // Auto-probe system audio access. There's no status-query API, so the
     // probe (create + destroy a process tap) is the only way to check. On
     // first use it surfaces the TCC prompt automatically.
@@ -106,7 +133,15 @@ export default function SettingsView() {
         setProbing(false);
       }
     })();
-  }, [refreshModels]);
+  }, [refreshModels, refreshMcp]);
+
+  // While the MCP server is enabled, poll its status so a port conflict or
+  // a crash shows up without a reload (no event exists for it).
+  useEffect(() => {
+    if (!settings?.mcpEnabled) return;
+    const id = setInterval(refreshMcp, 5000);
+    return () => clearInterval(id);
+  }, [settings?.mcpEnabled, refreshMcp]);
 
   useTauriEvent(onModelProgress, (p) => {
     setProgress((prev) => ({ ...prev, [p.id]: p }));
@@ -116,11 +151,33 @@ export default function SettingsView() {
   const saveSettings = useCallback(
     async (next: AppSettings) => {
       setSettings(next);
-      await updateSettings(next);
+      // The backend may normalize (e.g. generate the MCP token on first
+      // enable) — adopt what it stored.
+      const stored = await updateSettings(next);
+      setSettings(stored);
       refreshModels(); // "active" flags depend on settings
+      refreshMcp();
     },
-    [refreshModels],
+    [refreshModels, refreshMcp],
   );
+
+  const copy = useCallback(async (key: string, text: string) => {
+    try {
+      await writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied((c) => (c === key ? null : c)), 1500);
+    } catch {
+      /* clipboard unavailable — text stays selectable */
+    }
+  }, []);
+
+  const commitPort = useCallback(() => {
+    if (!settings || portDraft === null) return;
+    const n = parseInt(portDraft, 10);
+    setPortDraft(null);
+    if (!Number.isFinite(n) || n < 1024 || n > 65535 || n === settings.mcpPort) return;
+    saveSettings({ ...settings, mcpPort: n });
+  }, [settings, portDraft, saveSettings]);
 
   const requestMic = useCallback(async () => {
     const granted = await requestMicPermission();
@@ -336,6 +393,237 @@ export default function SettingsView() {
             className="w-full resize-y rounded-md bg-background px-2 py-2 font-mono text-xs leading-relaxed"
             data-selectable
           />
+        </div>
+      </section>
+
+      {/* ------------------------------------------------------------- */}
+      {/* MCP server (AI agents)                                          */}
+      {/* ------------------------------------------------------------- */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">MCP server (AI agents)</h2>
+
+        <div className="divide-y rounded-xl border bg-card">
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Enable MCP server</div>
+              <p className="text-xs text-muted-foreground">
+                Lets local AI agents such as Claude Code read your meetings, transcripts, summaries,
+                notes, customers and personas over the Model Context Protocol. Localhost only,
+                token-protected, read-only.
+              </p>
+            </div>
+            {settings && (
+              <Toggle
+                checked={settings.mcpEnabled}
+                onChange={(v) => saveSettings({ ...settings, mcpEnabled: v })}
+              />
+            )}
+          </div>
+
+          <div className={cn("space-y-4 p-4", !settings?.mcpEnabled && "opacity-60")}>
+            <div className="flex items-center justify-between gap-4">
+              <div className="space-y-0.5">
+                <div className="text-sm font-medium">Status</div>
+                <p className="text-xs text-muted-foreground">
+                  {mcp?.error
+                    ? "The server could not start — pick another port or free this one."
+                    : mcp?.running
+                      ? "Agents can connect while LilNotes is running (also when hidden in the menu bar)."
+                      : "Turn the server on to accept connections."}
+                </p>
+              </div>
+              {mcp?.error ? (
+                <span className="inline-flex max-w-[50%] items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive">
+                  <XCircle className="size-3 shrink-0" />
+                  <span className="truncate" title={mcp.error}>
+                    {mcp.error}
+                  </span>
+                </span>
+              ) : mcp?.running ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
+                  <CheckCircle2 className="size-3" /> Running · {mcp.url}
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-full bg-secondary px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                  <HelpCircle className="size-3" /> Stopped
+                </span>
+              )}
+            </div>
+
+            <label className="flex items-center justify-between gap-3 text-xs">
+              <span>
+                Port <span className="text-muted-foreground">(1024–65535, loopback only)</span>
+              </span>
+              <Input
+                type="number"
+                min="1024"
+                max="65535"
+                step="1"
+                value={portDraft ?? settings?.mcpPort ?? 41777}
+                disabled={!settings?.mcpEnabled}
+                onChange={(e) => setPortDraft(e.target.value)}
+                onBlur={commitPort}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                }}
+                className="h-7 w-24 rounded-md bg-background px-2 text-right"
+              />
+            </label>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span>Bearer token</span>
+                <div className="flex gap-1">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 px-2"
+                    disabled={!settings?.mcpToken}
+                    onClick={() => setShowToken((v) => !v)}
+                    title={showToken ? "Hide token" : "Reveal token"}
+                  >
+                    {showToken ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 px-2"
+                    disabled={!settings?.mcpToken}
+                    onClick={() => settings?.mcpToken && copy("token", settings.mcpToken)}
+                    title="Copy token"
+                  >
+                    {copied === "token" ? (
+                      <Check className="size-3.5" />
+                    ) : (
+                      <Copy className="size-3.5" />
+                    )}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7"
+                    disabled={!settings?.mcpEnabled}
+                    onClick={async () => {
+                      if (
+                        !confirm(
+                          "Regenerate the MCP token? Every configured agent must be updated.",
+                        )
+                      )
+                        return;
+                      const stored = await regenerateMcpToken();
+                      setSettings(stored);
+                      refreshMcp();
+                    }}
+                  >
+                    <RefreshCw className="size-3.5" /> Regenerate
+                  </Button>
+                </div>
+              </div>
+              <code
+                className="block truncate rounded-md bg-background px-2 py-1.5 font-mono text-xs"
+                data-selectable
+              >
+                {settings?.mcpToken
+                  ? showToken
+                    ? settings.mcpToken
+                    : `${"•".repeat(24)}…${settings.mcpToken.slice(-4)}`
+                  : "Generated when you enable the server"}
+              </code>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span>Connect Claude Code</span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2"
+                  disabled={!settings?.mcpToken}
+                  onClick={() =>
+                    settings?.mcpToken &&
+                    copy(
+                      "claude",
+                      `claude mcp add --transport http lilnotes ${mcp?.url ?? `http://127.0.0.1:${settings.mcpPort}/mcp`} --header "Authorization: Bearer ${settings.mcpToken}"`,
+                    )
+                  }
+                  title="Copy command"
+                >
+                  {copied === "claude" ? (
+                    <Check className="size-3.5" />
+                  ) : (
+                    <Copy className="size-3.5" />
+                  )}
+                </Button>
+              </div>
+              <pre
+                className="overflow-x-auto rounded-md bg-background px-2 py-1.5 font-mono text-xs leading-relaxed"
+                data-selectable
+              >
+                {`claude mcp add --transport http lilnotes ${mcp?.url ?? `http://127.0.0.1:${settings?.mcpPort ?? 41777}/mcp`} --header "Authorization: Bearer ${settings?.mcpToken ? (showToken ? settings.mcpToken : "<token>") : "<token>"}"`}
+              </pre>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span>Other clients (Cursor, generic MCP config)</span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2"
+                  disabled={!settings?.mcpToken}
+                  onClick={() =>
+                    settings?.mcpToken &&
+                    copy(
+                      "json",
+                      JSON.stringify(
+                        {
+                          mcpServers: {
+                            lilnotes: {
+                              url: mcp?.url ?? `http://127.0.0.1:${settings.mcpPort}/mcp`,
+                              headers: { Authorization: `Bearer ${settings.mcpToken}` },
+                            },
+                          },
+                        },
+                        null,
+                        2,
+                      ),
+                    )
+                  }
+                  title="Copy JSON"
+                >
+                  {copied === "json" ? (
+                    <Check className="size-3.5" />
+                  ) : (
+                    <Copy className="size-3.5" />
+                  )}
+                </Button>
+              </div>
+              <pre
+                className="overflow-x-auto rounded-md bg-background px-2 py-1.5 font-mono text-xs leading-relaxed"
+                data-selectable
+              >
+                {JSON.stringify(
+                  {
+                    mcpServers: {
+                      lilnotes: {
+                        url: mcp?.url ?? `http://127.0.0.1:${settings?.mcpPort ?? 41777}/mcp`,
+                        headers: {
+                          Authorization: `Bearer ${settings?.mcpToken && showToken ? settings.mcpToken : "<token>"}`,
+                        },
+                      },
+                    },
+                  },
+                  null,
+                  2,
+                )}
+              </pre>
+            </div>
+
+            <p className="text-xs text-muted-foreground">
+              Off by default. Binds to 127.0.0.1 only — nothing leaves your Mac. Audio files, app
+              settings and voiceprints are never exposed; all tools are read-only.
+            </p>
+          </div>
         </div>
       </section>
 

@@ -67,21 +67,22 @@ labels (renamable per meeting). Channels are never mixed before ASR.
 
 ### Rust backend (`src-tauri/src/`)
 
-| Module        | Purpose                                                                                                    |
-| ------------- | ---------------------------------------------------------------------------------------------------------- |
-| `commands`    | All Tauri IPC commands (thin wrappers — parse/validate, call module, map errors to strings)                |
-| `audio`       | Dual-source capture: mic + Core Audio process tap, 16 kHz mono WAV per channel                             |
-| `permissions` | TCC status/request helpers for microphone + system audio                                                   |
-| `asr`         | whisper-rs transcription (Metal), context reuse, silence-based chunking                                    |
-| `models`      | ML model registry + downloader with progress events                                                        |
-| `diarize`     | sherpa-onnx speaker diarization (pyannote + CAM++)                                                         |
-| `voiceprint`  | CAM++ speaker embeddings for cross-meeting identity                                                        |
-| `personas`    | Named identity layer + voiceprint matching + enrollment                                                    |
-| `transcript`  | Merge ASR + diarization, overlap-based speaker assignment                                                  |
-| `db`          | SQLite persistence (SQLCipher encrypted), single `Mutex<Connection>`, migrations via `PRAGMA user_version` |
-| `keystore`    | macOS Keychain key for SQLCipher                                                                           |
-| `summary`     | Summarization via Ollama (localhost) + bundled llama.cpp sidecar                                           |
-| `tray`        | Menu bar tray icon — "pure remote control" via events, no second recording path                            |
+| Module        | Purpose                                                                                                                                                           |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `commands`    | All Tauri IPC commands (thin wrappers — parse/validate, call module, map errors to strings)                                                                       |
+| `audio`       | Dual-source capture: mic + Core Audio process tap, 16 kHz mono WAV per channel                                                                                    |
+| `permissions` | TCC status/request helpers for microphone + system audio                                                                                                          |
+| `asr`         | whisper-rs transcription (Metal), context reuse, silence-based chunking                                                                                           |
+| `models`      | ML model registry + downloader with progress events                                                                                                               |
+| `diarize`     | sherpa-onnx speaker diarization (pyannote + CAM++)                                                                                                                |
+| `voiceprint`  | CAM++ speaker embeddings for cross-meeting identity                                                                                                               |
+| `personas`    | Named identity layer + voiceprint matching + enrollment                                                                                                           |
+| `transcript`  | Merge ASR + diarization, overlap-based speaker assignment                                                                                                         |
+| `db`          | SQLite persistence (SQLCipher encrypted), single `Mutex<Connection>`, migrations via `PRAGMA user_version`                                                        |
+| `keystore`    | macOS Keychain key for SQLCipher                                                                                                                                  |
+| `summary`     | Summarization via Ollama (localhost) + bundled llama.cpp sidecar                                                                                                  |
+| `tray`        | Menu bar tray icon — "pure remote control" via events, no second recording path                                                                                   |
+| `mcp`         | Read-only MCP server (rmcp + axum) on 127.0.0.1, bearer-token gated, off by default; exposes meetings/transcripts/summaries/customers/personas to local AI agents |
 
 ### Frontend (`src/`)
 
@@ -186,6 +187,39 @@ handlers. Single `Mutex<Connection>`. Migrations via `PRAGMA user_version`.
     Apple's voice processing can't reference other apps' audio. The
     system-audio stream is the render reference. Both signals must be
     16 kHz mono, 10 ms frames.
+
+## MCP server (local AI agents)
+
+`src-tauri/src/mcp/` serves the Model Context Protocol over Streamable HTTP
+at `http://127.0.0.1:<port>/mcp` **inside the app process**, reusing the
+single DB connection (`Arc<LazyDb>`). Off by default; enabled in Settings →
+"MCP server (AI agents)", which also shows the bearer token and a
+`claude mcp add` snippet. Invariants:
+
+- Loopback bind only; every request needs `Authorization: Bearer <token>`
+  (`mcp/auth.rs`, constant-time compare). The token is generated on first
+  enable and persisted in settings (`mcp_token`), regenerable from Settings.
+- **Read-only.** Tools never expose audio paths, settings or voiceprints.
+  Speaker names resolve persona > per-meeting rename > raw label
+  (`mcp/format.rs`), unlike `summary::transcript_text` which ignores personas.
+- Lifecycle lives in `McpServer` (Tauri state): `apply_settings` is an
+  idempotent reconciler called from `update_settings`, `regenerate_mcp_token`,
+  `init_db` and app setup; `shutdown::cleanup_on_exit` calls `stop`.
+- Only serves once the DB is unlocked (returning users at startup; new users
+  after onboarding's `init_db`).
+
+To add a tool: define a `#[derive(Deserialize, JsonSchema)]` params struct
+(doc comments become the schema descriptions the agent reads), add a
+`#[tool(description = …, annotations(read_only_hint = true, …))]` async fn
+in `mcp/tools.rs` that runs its DB closure through `with_db` and returns via
+`respond`, then cover it in `mcp/tests.rs` (real listener on port 0, plain
+JSON-RPC over reqwest). Smoke test against a running dev app:
+
+```sh
+curl -i -X POST http://127.0.0.1:41777/mcp -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
 
 ## How to add a new Tauri command
 

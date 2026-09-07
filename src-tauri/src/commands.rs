@@ -16,6 +16,7 @@ use crate::db::{
     MeetingDetail, MeetingSummary, Persona,
 };
 use crate::diarize::DiarizeEngine;
+use crate::mcp::{self, McpServer, McpStatus};
 use crate::models::{self, DownloadManager};
 use crate::permissions::{self, PermissionStatus};
 use crate::personas;
@@ -80,11 +81,15 @@ pub fn db_exists(app: AppHandle) -> bool {
 /// the access is silent. Called from the onboarding wizard's "Security"
 /// step.
 #[tauri::command]
-pub async fn init_db(db: State<'_, Arc<LazyDb>>) -> Result<(), String> {
+pub async fn init_db(app: AppHandle, db: State<'_, Arc<LazyDb>>) -> Result<(), String> {
     let db = db.inner().clone();
     tauri::async_runtime::spawn_blocking(move || db.init())
         .await
-        .map_err(|e| format!("database init failed: {e}"))?
+        .map_err(|e| format!("database init failed: {e}"))??;
+    // The MCP server waits for an unlocked DB; a returning user who enabled
+    // it gets it started here (setup skipped it while the DB was locked).
+    mcp::start_if_enabled(&app);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,12 +1336,50 @@ pub fn get_settings(db: State<'_, Arc<LazyDb>>) -> AppSettings {
     db.get_settings()
 }
 
+/// Persist settings and reconcile the MCP server with them. Returns the
+/// stored settings, which may differ from the input: enabling MCP for the
+/// first time generates the bearer token server-side.
 #[tauri::command]
 pub fn update_settings(
     db: State<'_, Arc<LazyDb>>,
+    mcp_server: State<'_, McpServer>,
     new_settings: AppSettings,
-) -> Result<(), String> {
-    db.set_settings(&new_settings)
+) -> Result<AppSettings, String> {
+    let mut s = new_settings;
+    if s.mcp_enabled && s.mcp_port < 1024 {
+        return Err("MCP port must be 1024 or higher".into());
+    }
+    if s.mcp_enabled && s.mcp_token.as_deref().is_none_or(str::is_empty) {
+        s.mcp_token = Some(mcp::generate_token());
+    }
+    db.set_settings(&s)?;
+    // Start/stop failures (e.g. port in use) are surfaced via `mcp_status`,
+    // never by failing the settings save.
+    mcp_server.apply_settings(db.inner().clone(), &s);
+    Ok(s)
+}
+
+// ---------------------------------------------------------------------------
+// MCP server (read-only, localhost)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn mcp_status(mcp_server: State<'_, McpServer>) -> McpStatus {
+    mcp_server.status()
+}
+
+/// Rotate the MCP bearer token (invalidates every configured client) and
+/// restart the server with it. Returns the stored settings.
+#[tauri::command]
+pub fn regenerate_mcp_token(
+    db: State<'_, Arc<LazyDb>>,
+    mcp_server: State<'_, McpServer>,
+) -> Result<AppSettings, String> {
+    let mut s = db.get_settings();
+    s.mcp_token = Some(mcp::generate_token());
+    db.set_settings(&s)?;
+    mcp_server.apply_settings(db.inner().clone(), &s);
+    Ok(s)
 }
 
 #[derive(Serialize)]
