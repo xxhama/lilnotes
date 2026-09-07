@@ -6,3 +6,5 @@ package-lock.json
 Cargo.lock
 CHANGELOG.md
 src-tauri/tauri.conf.json
+THIRD_PARTY_NOTICES.md
+src-tauri/about.hbs

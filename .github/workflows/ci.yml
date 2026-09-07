@@ -97,6 +97,35 @@ jobs:
           find ~/Library/Caches/sherpa-rs -name '*.dylib' -exec cp -n {} target/debug/ \; || true
       - run: cargo test
 
+  # License policy: every Rust dependency must carry an allowlisted license
+  # (src-tauri/deny.toml), and THIRD_PARTY_NOTICES.md must match what
+  # scripts/gen-third-party-notices.sh produces from the current lockfiles.
+  # Both tools read Cargo.lock only — nothing is compiled — so this runs on
+  # Linux in about a minute. Tool versions are pinned so the generated text
+  # is byte-stable across runs.
+  licenses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-about@0.9.2
+      - run: cargo deny --manifest-path src-tauri/Cargo.toml check licenses
+      - run: bash scripts/gen-third-party-notices.sh
+      - name: THIRD_PARTY_NOTICES.md is up to date
+        run: |
+          if ! git diff --exit-code --stat THIRD_PARTY_NOTICES.md; then
+            echo "::error::THIRD_PARTY_NOTICES.md is stale. Run 'bash scripts/gen-third-party-notices.sh' (brew install cargo-about) and commit the result."
+            exit 1
+          fi
+
   # Keeps the llama.cpp sidecar build cached on the default branch so the
   # Release workflow (which can read main's caches) gets a hit instead of
   # rebuilding llama.cpp from source. Runs in parallel with `rust`, so it never

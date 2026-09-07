@@ -4,6 +4,10 @@ version = "0.2.0"
 description = "Local-first meeting notes: on-device transcription, diarization, and summaries."
 authors = ["Johnny Xhama"]
 edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/xxhama/lilnotes"
+homepage = "https://github.com/xxhama/lilnotes"
+readme = "../README.md"
 
 [lib]
 name = "lilnotes_lib"
