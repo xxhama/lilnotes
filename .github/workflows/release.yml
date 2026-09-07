@@ -24,10 +24,21 @@ name: Release
 # setting "Allow GitHub Actions to create and approve pull requests" must be
 # enabled for the GITHUB_TOKEN path.
 #
-# The app is ad-hoc signed (no Apple Developer ID yet), so the release notes
-# include the Gatekeeper workaround users need on first launch. When a
-# Developer ID is available, add proper codesign + notarytool steps here and
-# in scripts/fix-bundle.sh.
+# Signing: when the MACOS_CERT_P12 secret is present the build imports the
+# Developer ID certificate into a throwaway keychain and scripts/fix-bundle.sh
+# signs with the hardened runtime, notarizes with an App Store Connect API
+# key and staples the .app and .dmg. Without the secret (forks, or before
+# the secrets are configured) the exact same pipeline produces an ad-hoc
+# signed DMG and the release notes carry the Gatekeeper workaround instead.
+# Secrets (all optional, all-or-nothing):
+#   MACOS_CERT_P12        base64 of the "Developer ID Application" .p12
+#   MACOS_CERT_PASSWORD   password of that .p12
+#   MACOS_SIGN_IDENTITY   e.g. "Developer ID Application: Name (TEAMID)"
+#   NOTARY_KEY_P8         base64 of the App Store Connect API key (.p8)
+#   NOTARY_KEY_ID         its Key ID
+#   NOTARY_ISSUER_ID      its Issuer ID
+# Deliberately not the APPLE_* names Tauri's bundler reads: Tauri would sign
+# and notarize before fix-bundle.sh adds the dylibs, wasting the effort.
 
 on:
   push:
@@ -107,6 +118,8 @@ jobs:
     timeout-minutes: 40
     env:
       GH_TOKEN: ${{ github.token }}
+      # Step-level `if:` cannot read secrets; job-level env can.
+      HAVE_CERT: ${{ secrets.MACOS_CERT_P12 != '' }}
     steps:
       - name: Resolve release tag + commit
         id: rel
@@ -185,11 +198,47 @@ jobs:
           mkdir -p src-tauri/target/release
           find ~/Library/Caches/sherpa-rs -name '*.dylib' -exec cp -n {} src-tauri/target/release/ \; || true
 
+      # Throwaway keychain for the Developer ID certificate; deleted in the
+      # cleanup step below. The API key goes to $RUNNER_TEMP for notarytool.
+      - name: Import signing certificate
+        if: env.HAVE_CERT == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PW=$(openssl rand -hex 16)
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -f pkcs12 -k "$KC" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KC"
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          echo "NOTARY_KEY_P8_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
       # Builds the llama-server sidecar, runs `tauri build`, then
       # scripts/fix-bundle.sh (copies sherpa/onnxruntime dylibs into the .app,
-      # ad-hoc re-signs, and re-creates the DMG from the fixed bundle).
+      # signs, re-creates the DMG from the fixed bundle, and notarizes +
+      # staples when the NOTARY_* variables are set). Empty secrets leave the
+      # variables empty, which the script treats as "ad-hoc, no notarization".
       - name: Build app
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: npm run tauri:build
+
+      - name: Remove signing keychain
+        if: always() && env.HAVE_CERT == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
 
       - name: Collect artifacts
         run: |
@@ -210,13 +259,30 @@ jobs:
         run: gh release upload "${{ steps.rel.outputs.tag }}" dist-release/* --clobber
 
       # release-please wrote the changelog into the release body; append the
-      # install instructions once (idempotent on manual rebuilds).
+      # install instructions once (idempotent on manual rebuilds). The text
+      # depends on whether this build was signed + notarized.
       - name: Add install notes
         run: |
           TAG="${{ steps.rel.outputs.tag }}"
           gh release view "$TAG" --json body -q .body > release-notes.md
           if ! grep -q '^## Installation' release-notes.md; then
-            cat >> release-notes.md <<'NOTES'
+            if [ "$HAVE_CERT" = "true" ]; then
+              cat >> release-notes.md <<'NOTES'
+
+          ## Installation
+
+          1. Download `LilNotes_*_aarch64.dmg` below (Apple Silicon, macOS 15+ only).
+          2. Open the DMG and drag **LilNotes** to Applications.
+          3. Launch it. The app is signed with a Developer ID and notarized by Apple.
+
+          ### Verify your download (optional)
+
+          ```sh
+          shasum -a 256 -c checksums.txt
+          ```
+          NOTES
+            else
+              cat >> release-notes.md <<'NOTES'
 
           ## Installation
 
@@ -225,7 +291,7 @@ jobs:
 
           ### First launch (important)
 
-          LilNotes is not yet notarized by Apple, so macOS will refuse to open
+          This build is not notarized by Apple, so macOS will refuse to open
           it with a "damaged" or "cannot be opened" warning. Two ways past it:
 
           - Run this once in Terminal, then launch normally:
@@ -243,5 +309,6 @@ jobs:
           shasum -a 256 -c checksums.txt
           ```
           NOTES
+            fi
           fi
           gh release edit "$TAG" --notes-file release-notes.md

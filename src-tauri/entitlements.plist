@@ -5,9 +5,10 @@
 	<!-- Microphone input -->
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
-	<!-- App Sandbox stays off for v1: Core Audio process taps are fragile
-	     under sandbox and there is no Mac App Store target. Hardened Runtime
-	     is enabled at signing time for notarization (milestone 8). -->
+	<!-- App Sandbox stays off: Core Audio process taps are fragile under
+	     sandbox and there is no Mac App Store target. Hardened Runtime is
+	     applied at signing time by scripts/fix-bundle.sh (release builds);
+	     audio-input above is the only entitlement it needs. -->
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
 </dict>
