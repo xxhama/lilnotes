@@ -50,6 +50,11 @@ version fields or push `v*` tags by hand.** To force a specific version, use
 an empty commit: `git commit --allow-empty -m "chore: release 0.3.0" -m
 "Release-As: 0.3.0"`.
 
+The GitHub Release is published (and tagged) by release-please itself;
+the DMG lands a few minutes later. Do not switch it to `draft: true`: a
+draft has no tag, so release-please would not see it as the latest release
+and would open a bogus follow-up release PR.
+
 **Merge PRs with squash** (`gh pr merge --squash`), using a conventional PR
 title. A merge commit whose PR title is conventional makes release-please
 count both the PR title and the branch commits, producing duplicate
