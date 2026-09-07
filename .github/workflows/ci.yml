@@ -121,7 +121,7 @@ jobs:
       - run: bash scripts/gen-third-party-notices.sh
       - name: THIRD_PARTY_NOTICES.md is up to date
         run: |
-          if ! git diff --exit-code --stat THIRD_PARTY_NOTICES.md; then
+          if ! git diff --exit-code THIRD_PARTY_NOTICES.md; then
             echo "::error::THIRD_PARTY_NOTICES.md is stale. Run 'bash scripts/gen-third-party-notices.sh' (brew install cargo-about) and commit the result."
             exit 1
           fi

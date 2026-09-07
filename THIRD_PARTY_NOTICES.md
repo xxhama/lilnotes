@@ -17,29 +17,29 @@ fails if the committed file is out of date.
 These are compiled from C/C++ sources or downloaded as prebuilt libraries at
 build time, so Cargo and npm metadata do not cover them.
 
-| Component | What ships | License |
-| --- | --- | --- |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | `llama-server` sidecar binary (built by `scripts/build-llama-server.sh` from the ref pinned there) | MIT |
-| [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | statically linked into the app via the `whisper-rs-sys` crate | MIT |
-| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | `libsherpa-onnx-c-api.dylib` in `Contents/Frameworks` (prebuilt, fetched by `sherpa-rs-sys`) | Apache-2.0 |
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | `libonnxruntime.*.dylib` in `Contents/Frameworks` (prebuilt, fetched by `sherpa-rs-sys`) | MIT |
-| [WebRTC AudioProcessing](https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing) | statically linked via the `webrtc-audio-processing-sys` crate | BSD-3-Clause |
-| [SQLCipher](https://www.zetetic.net/sqlcipher/) | statically linked via `libsqlite3-sys` (`bundled-sqlcipher-vendored-openssl`) | BSD-3-Clause |
-| [OpenSSL](https://www.openssl.org/) | statically linked via `openssl-src` for SQLCipher | Apache-2.0 |
-| [shadcn/ui](https://ui.shadcn.com/) | component sources vendored under `src/components/ui/` | MIT |
+| Component                                                                                   | What ships                                                                                         | License      |
+| ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------ |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp)                                          | `llama-server` sidecar binary (built by `scripts/build-llama-server.sh` from the ref pinned there) | MIT          |
+| [whisper.cpp](https://github.com/ggml-org/whisper.cpp)                                      | statically linked into the app via the `whisper-rs-sys` crate                                      | MIT          |
+| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)                                        | `libsherpa-onnx-c-api.dylib` in `Contents/Frameworks` (prebuilt, fetched by `sherpa-rs-sys`)       | Apache-2.0   |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime)                                    | `libonnxruntime.*.dylib` in `Contents/Frameworks` (prebuilt, fetched by `sherpa-rs-sys`)           | MIT          |
+| [WebRTC AudioProcessing](https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing) | statically linked via the `webrtc-audio-processing-sys` crate                                      | BSD-3-Clause |
+| [SQLCipher](https://www.zetetic.net/sqlcipher/)                                             | statically linked via `libsqlite3-sys` (`bundled-sqlcipher-vendored-openssl`)                      | BSD-3-Clause |
+| [OpenSSL](https://www.openssl.org/)                                                         | statically linked via `openssl-src` for SQLCipher                                                  | Apache-2.0   |
+| [shadcn/ui](https://ui.shadcn.com/)                                                         | component sources vendored under `src/components/ui/`                                              | MIT          |
 
 ## Models downloaded on demand
 
 No model weights are bundled in the app. LilNotes downloads the models you
 choose in Settings, from these sources, under their own licenses:
 
-| Model | Source | License |
-| --- | --- | --- |
-| Whisper (large-v3-turbo, large-v3, medium, small), ggml format | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) on Hugging Face | MIT (OpenAI Whisper) |
-| pyannote segmentation-3.0, ONNX export | [csukuangfj/sherpa-onnx-pyannote-segmentation-3-0](https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0) (the export published by the sherpa-onnx maintainers; upstream is [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)) | MIT |
-| 3D-Speaker CAM++ speaker embedding, ONNX export | [csukuangfj/speaker-embedding-models](https://huggingface.co/csukuangfj/speaker-embedding-models) (upstream: [modelscope/3D-Speaker](https://github.com/modelscope/3D-Speaker)) | Apache-2.0 |
-| Qwen3.5 4B / 9B, Q4_K_M GGUF | [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | Apache-2.0 |
-| Ollama models | [ollama.com/library](https://ollama.com/library), pulled by Ollama on your Mac | per model; see each model's page |
+| Model                                                          | Source                                                                                                                                                                                                                                                                       | License                          |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| Whisper (large-v3-turbo, large-v3, medium, small), ggml format | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) on Hugging Face                                                                                                                                                                                        | MIT (OpenAI Whisper)             |
+| pyannote segmentation-3.0, ONNX export                         | [csukuangfj/sherpa-onnx-pyannote-segmentation-3-0](https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0) (the export published by the sherpa-onnx maintainers; upstream is [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)) | MIT                              |
+| 3D-Speaker CAM++ speaker embedding, ONNX export                | [csukuangfj/speaker-embedding-models](https://huggingface.co/csukuangfj/speaker-embedding-models) (upstream: [modelscope/3D-Speaker](https://github.com/modelscope/3D-Speaker))                                                                                              | Apache-2.0                       |
+| Qwen3.5 4B / 9B, Q4_K_M GGUF                                   | [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)                                                                                                                         | Apache-2.0                       |
+| Ollama models                                                  | [ollama.com/library](https://ollama.com/library), pulled by Ollama on your Mac                                                                                                                                                                                               | per model; see each model's page |
 
 ## License texts for the native components
 
