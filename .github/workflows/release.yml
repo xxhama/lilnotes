@@ -55,11 +55,44 @@ jobs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
       sha: ${{ steps.rp.outputs.sha }}
+      prs_created: ${{ steps.rp.outputs.prs_created }}
+      pr: ${{ steps.rp.outputs.pr }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: rp
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # release-please bumps Cargo.toml but cannot address the
+  # `[[package]] name = "lilnotes"` entry in Cargo.lock (its TOML updater has
+  # no filter support), so regenerate that one entry with cargo on the
+  # release PR branch. `cargo update --workspace` touches only workspace
+  # crates — dependency versions stay pinned. Pushes made with GITHUB_TOKEN
+  # never trigger workflows, so this cannot loop; when release-please
+  # rewrites its branch on the next push to main, this job re-applies.
+  sync-cargo-lock:
+    needs: [release-please]
+    if: needs.release-please.outputs.prs_created == 'true' && needs.release-please.outputs.pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Re-lock the workspace crate at the bumped version
+        run: cargo update --workspace --manifest-path src-tauri/Cargo.toml
+      - name: Commit Cargo.lock to the release PR
+        run: |
+          if git diff --quiet -- src-tauri/Cargo.lock; then
+            echo "Cargo.lock already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: sync Cargo.lock with the release version" -- src-tauri/Cargo.lock
+          git push
 
   build:
     needs: [release-please]
