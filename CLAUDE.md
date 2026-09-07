@@ -42,11 +42,18 @@ Releases are automated with **release-please** (`release-please-config.json`,
 
 Flow: releasable commits on `main` → the bot opens/updates a
 `chore(main): release X.Y.Z` PR that bumps every version file (`package.json`,
-`package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`, `Cargo.lock`)
-and `CHANGELOG.md` → merging it builds the DMG and publishes the GitHub
-Release. **Never edit version fields or push `v*` tags by hand.** To force a
-specific version, use an empty commit: `git commit --allow-empty -m "chore:
-release 0.3.0" -m "Release-As: 0.3.0"`.
+`package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`) and
+`CHANGELOG.md`; the `sync-cargo-lock` job then commits the matching
+`Cargo.lock` entry onto that PR (release-please cannot edit lockfiles) →
+merging it builds the DMG and publishes the GitHub Release. **Never edit
+version fields or push `v*` tags by hand.** To force a specific version, use
+an empty commit: `git commit --allow-empty -m "chore: release 0.3.0" -m
+"Release-As: 0.3.0"`.
+
+**Merge PRs with squash** (`gh pr merge --squash`), using a conventional PR
+title. A merge commit whose PR title is conventional makes release-please
+count both the PR title and the branch commits, producing duplicate
+changelog lines.
 
 CI note: `ci.yml` stubs the `llama-server` sidecar (an empty file satisfies
 `tauri_build`'s existence check); the real llama.cpp build only runs in the
