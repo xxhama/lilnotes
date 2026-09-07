@@ -20,7 +20,7 @@ tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"]
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
-tokio = { version = "1", features = ["time"] }  # tokio::time::sleep for async sidecar startup
+tokio = { version = "1", features = ["time", "net"] }  # time: async sidecar startup; net: MCP TcpListener
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -71,6 +71,23 @@ objc2-core-audio = "0.3"       # process taps, aggregate devices, HAL properties
 objc2-core-audio-types = "0.3" # AudioBufferList, ASBD, AudioTimeStamp
 objc2-av-foundation = "0.3"    # AVCaptureDevice for mic TCC status/request
 objc2-avf-audio = "0.3"        # AVAudioEngine voice-processed mic (AEC)
+
+# --- MCP server (read-only, localhost, off by default) ---
+# rmcp = official Rust MCP SDK; Streamable HTTP transport is a tower service
+# mounted in axum. The app already carries hyper/tower via reqwest, so axum
+# is the only genuinely new HTTP dependency.
+rmcp = { version = "3.2", features = ["server", "macros", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+schemars = "1"       # JsonSchema derives for MCP tool parameter structs
+tokio-util = "0.7"   # CancellationToken for MCP server shutdown
+subtle = "2"         # constant-time bearer-token compare
+tauri-plugin-clipboard-manager = "2"  # "Copy" button for the MCP connect snippet
+
+[dev-dependencies]
+# MCP integration test drives the server with plain JSON-RPC over reqwest
+# (the app's existing 0.12 client), so no rmcp client feature is needed.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }  # ServiceExt::oneshot for router auth tests
 
 [profile.release]
 lto = true

@@ -25,6 +25,7 @@ use crate::asr::{AsrEngine, Segment};
 use crate::audio::CaptureEngine;
 use crate::commands::AsrSession;
 use crate::db::LazyDb;
+use crate::mcp::McpServer;
 use crate::summary::sidecar::SidecarLlmClient;
 
 /// Dispatched from `lib.rs`'s `App::run` callback for every run event.
@@ -129,6 +130,12 @@ fn stop_recording_and_finalize(app: &AppHandle) -> Result<(), String> {
 /// exits — covers all exit paths (tray quit, Cmd+Q, system logout). Best-effort:
 /// each step is independent and errors are logged, never propagated.
 fn cleanup_on_exit(app: &AppHandle) {
+    // 0. Stop the MCP listener so agents get a clean connection-refused
+    //    rather than a hung request, and the port is free for a relaunch.
+    if let Some(mcp) = app.try_state::<McpServer>() {
+        mcp.stop();
+    }
+
     // 1. Kill llama-server sidecar (frees GPU memory). This is the most
     //    important step — without it the child process outlives the app.
     if let Some(sidecar) = app.try_state::<SidecarLlmClient>() {
