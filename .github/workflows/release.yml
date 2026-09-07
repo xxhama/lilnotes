@@ -8,10 +8,12 @@ name: Release
 #      PR that bumps every version file (package.json, package-lock.json,
 #      src-tauri/tauri.conf.json, Cargo.toml, Cargo.lock) and CHANGELOG.md.
 #      Config: release-please-config.json + .release-please-manifest.json.
-#   2. Merging that PR runs release-please again; it creates the vX.Y.Z GitHub
-#      Release as a DRAFT (config `draft: true`) and the `build` job below
-#      builds the DMG, uploads it + checksums, appends the install notes, and
-#      flips the release to published. The tag is created at publish time.
+#   2. Merging that PR runs release-please again; it tags vX.Y.Z and publishes
+#      the GitHub Release right away, and the `build` job below builds the DMG,
+#      uploads it + checksums, and appends the install notes (~10 min window
+#      without assets). The release must NOT be a draft: a draft has no git
+#      tag, so the next release-please run would not see it as the latest
+#      release and would open a bogus follow-up release PR.
 #   3. `workflow_dispatch` with an existing tag rebuilds and re-uploads the
 #      assets for that release (e.g. after a build-script fix).
 #
@@ -115,8 +117,8 @@ jobs:
             REF="$TAG"
           else
             TAG="${{ needs.release-please.outputs.tag_name }}"
-            # Draft releases don't create the git tag until publish; build the
-            # exact commit release-please released.
+            # Build the exact commit release-please tagged (the tag itself
+            # may still be propagating when this job starts).
             REF="${{ needs.release-please.outputs.sha }}"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -208,8 +210,8 @@ jobs:
         run: gh release upload "${{ steps.rel.outputs.tag }}" dist-release/* --clobber
 
       # release-please wrote the changelog into the release body; append the
-      # install instructions once (idempotent on manual rebuilds), then publish.
-      - name: Add install notes and publish
+      # install instructions once (idempotent on manual rebuilds).
+      - name: Add install notes
         run: |
           TAG="${{ steps.rel.outputs.tag }}"
           gh release view "$TAG" --json body -q .body > release-notes.md
@@ -242,4 +244,4 @@ jobs:
           ```
           NOTES
           fi
-          gh release edit "$TAG" --notes-file release-notes.md --draft=false
+          gh release edit "$TAG" --notes-file release-notes.md
