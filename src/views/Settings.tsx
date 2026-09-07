@@ -7,6 +7,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import {
+  Bug,
   Check,
   CheckCircle2,
   Copy,
@@ -14,13 +15,23 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  FileText,
+  Github,
   HelpCircle,
   RefreshCw,
+  Scale,
   X,
   XCircle,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
@@ -46,8 +57,10 @@ import {
   type McpStatus,
   type PermissionStatus,
 } from "@/lib/ipc";
+import { getVersion } from "@tauri-apps/api/app";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import NativeModelManager from "@/components/NativeModelManager";
 import OllamaManager from "@/components/OllamaManager";
@@ -56,6 +69,8 @@ import { useTauriEvent } from "@/lib/useTauriEvent";
 import { cn } from "@/lib/utils";
 
 type SysAudioState = "unknown" | "granted" | "denied";
+
+const REPO_URL = "https://github.com/xxhama/lilnotes";
 
 function fmtBytes(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)} GB`;
@@ -89,6 +104,24 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
 }
 
 export default function SettingsView() {
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [noticesOpen, setNoticesOpen] = useState(false);
+  const [notices, setNotices] = useState<string | null>(null);
+
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(null));
+  }, []);
+
+  // The notices file is ~600 kB; load it only when the dialog is opened.
+  useEffect(() => {
+    if (!noticesOpen || notices !== null) return;
+    import("../../THIRD_PARTY_NOTICES.md?raw")
+      .then((m) => setNotices(m.default))
+      .catch(() => setNotices("Could not load THIRD_PARTY_NOTICES.md."));
+  }, [noticesOpen, notices]);
+
   const [micPerm, setMicPerm] = useState<PermissionStatus | null>(null);
   const [sysAudio, setSysAudio] = useState<SysAudioState>("unknown");
   const [probing, setProbing] = useState(false);
@@ -914,6 +947,69 @@ export default function SettingsView() {
           </div>
         </div>
       </section>
+
+      {/* ------------------------------------------------------------- */}
+      {/* About                                                           */}
+      {/* ------------------------------------------------------------- */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium text-muted-foreground">About</h2>
+
+        <div className="divide-y rounded-xl border bg-card">
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">
+                LilNotes{appVersion ? ` ${appVersion}` : ""}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Free software under the GNU AGPL v3. Everything stays on this Mac.
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-wrap justify-end gap-2">
+              <Button size="sm" variant="outline" onClick={() => openUrl(REPO_URL)}>
+                <Github /> Source code
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => openUrl(`${REPO_URL}/issues`)}>
+                <Bug /> Report an issue
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div className="space-y-0.5">
+              <div className="text-sm font-medium">Licenses</div>
+              <p className="text-xs text-muted-foreground">
+                Built on whisper.cpp, llama.cpp, sherpa-onnx, ONNX Runtime, WebRTC and others.
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-wrap justify-end gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => openUrl(`${REPO_URL}/blob/main/LICENSE`)}
+              >
+                <Scale /> AGPL-3.0
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => setNoticesOpen(true)}>
+                <FileText /> Third-party notices
+              </Button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <Dialog open={noticesOpen} onOpenChange={setNoticesOpen}>
+        <DialogContent className="flex max-h-[80vh] flex-col sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Third-party notices</DialogTitle>
+            <DialogDescription>
+              Licenses of the open-source components LilNotes is built from.
+            </DialogDescription>
+          </DialogHeader>
+          <pre className="min-h-0 flex-1 overflow-auto rounded-md border bg-muted/40 p-3 text-xs whitespace-pre-wrap">
+            {notices ?? "Loading…"}
+          </pre>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
