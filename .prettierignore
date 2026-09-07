@@ -5,3 +5,4 @@ src-tauri/gen/
 package-lock.json
 Cargo.lock
 CHANGELOG.md
+src-tauri/tauri.conf.json
