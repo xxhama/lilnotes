@@ -1,0 +1,56 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not attach recordings or transcripts that contain other people's voices or private information.
+  - type: input
+    id: version
+    attributes:
+      label: LilNotes version
+      description: Settings → About shows the version.
+      placeholder: 0.2.0
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and chip
+      placeholder: macOS 15.6, M2 Pro
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Recording / audio capture
+        - Transcription
+        - Speaker identification / personas
+        - Summaries (bundled model or Ollama)
+        - MCP server
+        - UI
+        - Build / development
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Audio context (if recording-related)
+      description: Which app was playing audio (Zoom, Teams, a browser tab…), headphones or speakers, and whether Microphone / System Audio Recording permissions are granted in System Settings.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Open Console.app, filter on `LilNotes`, and paste relevant lines. For dev builds, paste the terminal output.
+      render: text

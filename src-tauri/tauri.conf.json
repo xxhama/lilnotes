@@ -38,6 +38,16 @@
       "app"
     ],
     "category": "Productivity",
+    "copyright": "Copyright © 2026 Johnny Xhama. Licensed under the GNU AGPL v3.",
+    "publisher": "Johnny Xhama",
+    "homepage": "https://github.com/xxhama/lilnotes",
+    "shortDescription": "Local-first meeting recorder and notes",
+    "longDescription": "Records microphone and system audio, transcribes and identifies speakers entirely on-device, and summarizes with a local language model. No cloud, no telemetry.",
+    "licenseFile": "../LICENSE",
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    },
     "externalBin": [
       "binaries/llama-server"
     ],

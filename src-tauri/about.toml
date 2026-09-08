@@ -1,0 +1,51 @@
+# cargo-about config: generates the Rust-crate section of THIRD_PARTY_NOTICES.md
+# via scripts/gen-third-party-notices.sh. Keep `accepted` in sync with the
+# allowlist in deny.toml (cargo-deny enforces it in CI; this list only decides
+# which license texts cargo-about is willing to emit).
+accepted = [
+    "0BSD",
+    "AGPL-3.0-only", # this crate
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# Only the shipped target: the app is Apple Silicon macOS only.
+targets = ["aarch64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# The webrtc-audio-processing crates declare `license-file = "COPYING"` with no
+# SPDX expression, and askalono misreads that file as "BSD-3-Clause AND NCL".
+# It is Google's plain BSD-3-Clause notice; pin it by checksum.
+[webrtc-audio-processing.clarify]
+license = "BSD-3-Clause"
+[[webrtc-audio-processing.clarify.files]]
+path = "COPYING"
+license = "BSD-3-Clause"
+checksum = "6db9d4840c6ff0fb3c37ace8e32cfd3eb6c6e759c67b4ecbee969cd8d75154a9"
+
+[webrtc-audio-processing-sys.clarify]
+license = "BSD-3-Clause"
+[[webrtc-audio-processing-sys.clarify.files]]
+path = "COPYING"
+license = "BSD-3-Clause"
+checksum = "9b79539028e216e813e152d45f5c1ed5fdd0554426ad50270fb03134e7082dac"
+
+[webrtc-audio-processing-config.clarify]
+license = "BSD-3-Clause"
+[[webrtc-audio-processing-config.clarify.files]]
+path = "COPYING"
+license = "BSD-3-Clause"
+checksum = "9b79539028e216e813e152d45f5c1ed5fdd0554426ad50270fb03134e7082dac"
