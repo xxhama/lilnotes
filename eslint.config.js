@@ -26,6 +26,15 @@ export default tseslint.config(
     },
   },
   {
+    // shadcn/ui files export variant helpers (e.g. `buttonVariants`) next to
+    // their component. That is the upstream layout, so the fast-refresh
+    // purity rule is not enforced there.
+    files: ["src/components/ui/**"],
+    rules: {
+      "react-refresh/only-export-components": "off",
+    },
+  },
+  {
     rules: {
       "@typescript-eslint/no-unused-vars": [
         "error",

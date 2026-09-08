@@ -83,7 +83,8 @@ jobs:
             : > "binaries/llama-server-$TRIPLE"
             chmod +x "binaries/llama-server-$TRIPLE"
           fi
-      - run: cargo clippy -- -D warnings
+      # --all-targets: tests, examples and mcp/tests.rs are linted too.
+      - run: cargo clippy --all-targets -- -D warnings
       # A full-match target/ restore marks the sherpa-rs-sys build script
       # fresh, so it never re-copies its dylibs into target/debug — but
       # rust-cache prunes them from the saved cache, and the test binaries'
