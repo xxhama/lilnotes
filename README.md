@@ -1,183 +1,118 @@
 # LilNotes
 
-Local-first meeting notes for Apple Silicon Macs. Records microphone and
-system audio as **two separate channels**, transcribes and diarizes entirely
-on-device, and summarizes with a locally running [Ollama](https://ollama.com)
-model. No cloud, no telemetry, no Python at runtime.
+Local-first meeting notes for Apple Silicon Macs. LilNotes records your
+microphone and the other participants (system audio) as two separate tracks,
+transcribes and identifies speakers entirely on-device, and writes a summary
+with a language model running on your Mac. Nothing leaves the machine: no
+cloud, no accounts, no telemetry.
 
-- **Shell:** Tauri v2 (Rust core, React + TypeScript + Tailwind + shadcn/ui front-end)
-- **Capture:** Core Audio process tap (system) + mic, 16 kHz mono WAV per channel
-- **ASR:** whisper.cpp via `whisper-rs` (Metal), default model `large-v3-turbo`
-- **Diarization:** sherpa-onnx (pyannote segmentation-3.0 + CAM++ embeddings)
-- **Summaries:** Ollama HTTP API at `http://localhost:11434`, streaming
-- **Storage:** SQLite; WAVs + models in Application Support
-- **AI agents:** optional read-only [MCP](https://modelcontextprotocol.io) server on `127.0.0.1` (off by default, token-gated)
+<!-- Screenshots: docs/screenshot-meetings.png and docs/screenshot-detail.png -->
 
-**Target:** Apple Silicon, macOS 26 (Tahoe)+. Bundle ID: `com.lilnotes`.
+## Features
 
-## Development
+- **Two-channel capture.** Your mic and the meeting app's audio (Zoom, Teams,
+  Meet, a browser tab, anything that plays sound) are recorded separately, so
+  your voice is never mixed with theirs. Works with speakers or headphones;
+  echo cancellation keeps remote voices out of your track.
+- **On-device transcription** with [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+  on Metal, live while you record or after the fact.
+- **Speaker identification.** The remote track is diarized
+  ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): pyannote
+  segmentation + CAM++ embeddings). Name a speaker once and LilNotes
+  recognises their voice in later meetings.
+- **Summaries and action items** from a bundled
+  [llama.cpp](https://github.com/ggml-org/llama.cpp) sidecar (Qwen3.5,
+  downloaded in-app) or from [Ollama](https://ollama.com) if you already run
+  it. Streams tokens live; prompt template is editable.
+- **Notes alongside the transcript**, a per-customer view that groups
+  meetings and summarises the relationship, and a menu-bar recorder so you
+  can start and stop without opening the window.
+- **Encrypted at rest.** Everything is stored in a SQLCipher database whose
+  key lives in your macOS Keychain.
+- **Read-only [MCP](https://modelcontextprotocol.io) server** (off by
+  default) so local AI agents such as Claude Code can query your meetings.
 
-Prerequisites: Rust (stable, via rustup), Node 24+, Xcode Command Line
-Tools, CMake for the whisper.cpp build (`brew install cmake`), and
-meson + ninja for the bundled WebRTC AEC build
-(`brew install meson ninja`).
+## Requirements
+
+- Apple Silicon Mac (M1 or later). Intel Macs are not supported.
+- macOS 15 (Sequoia) or newer.
+- Disk space for the models you pick: about 1.6 GB for the recommended
+  Whisper model, 35 MB for speaker identification, and 2.7 GB (Qwen3.5 4B)
+  or 5.7 GB (Qwen3.5 9B) for the bundled summariser. Ollama models are
+  managed by Ollama.
+- 16 GB of memory is comfortable; 8 GB works with the smaller models.
+
+## Install
+
+1. Download `LilNotes_<version>_aarch64.dmg` from the
+   [latest release](https://github.com/xxhama/lilnotes/releases/latest).
+2. Open the DMG and drag **LilNotes** to Applications.
+3. Launch it. Releases are signed with a Developer ID and notarized by Apple,
+   so there is nothing to click through.
+
+To verify a download, compare it against the `checksums.txt` published with
+the release:
 
 ```sh
-npm install
-npm run tauri:dev     # dev app window (builds sidecar first)
-npm run tauri:build   # release .app/.dmg (builds sidecar + fixes dylibs)
+shasum -a 256 -c checksums.txt
 ```
 
-## Testing
+Building from source yourself? Unsigned local builds trigger Gatekeeper's
+"damaged" warning on first launch. Either right-click → Open, or run
+`xattr -cr /Applications/LilNotes.app` once.
+
+## First run
+
+The onboarding wizard walks through this, but here is what happens and why:
+
+1. **Microphone** permission: your side of the meeting.
+2. **System Audio Recording** permission: the other participants. macOS
+   calls this "System Audio Recording Only" under System Settings → Privacy
+   & Security → Screen & System Audio Recording. Nothing on screen is
+   captured.
+3. **Pick a transcription model** in Settings → Transcription. _Large v3
+   Turbo_ is the default and the best trade-off for live transcription.
+4. **Pick a summariser** in Settings → Summaries: download Qwen3.5 for the
+   bundled engine, or point LilNotes at a running Ollama.
+
+If a prompt never appeared, or you clicked the wrong button, reset it and
+relaunch:
 
 ```sh
-npm test                          # Rust unit tests
-npm run typecheck                 # TypeScript typecheck
-npm run lint                      # ESLint
-cd src-tauri && cargo clippy      # Rust lints
-cd src-tauri && cargo fmt --check # Rust format check
+tccutil reset Microphone com.lilnotes
+tccutil reset SystemAudioCaptureRequests com.lilnotes
 ```
 
-## Milestone status
+## Privacy
 
-| #   | Milestone                                                          | Status  |
-| --- | ------------------------------------------------------------------ | ------- |
-| 1   | Scaffold: app shell, IPC round-trip                                | ✅ done |
-| 2   | Dual-source capture → two 16 kHz WAVs, level meters, permissions   | ✅ done |
-| 3   | Transcription (whisper-rs Metal), model download, near-live chunks | ✅ done |
-| 4   | Diarization + merged speaker-labeled transcript                    | ✅ done |
-| 5   | SQLite persistence, history/detail UI, speaker rename              | ✅ done |
-| 6   | Ollama summaries + in-app model manager (pull w/ progress)         | ✅ done |
-| 7   | Export: Markdown, PDF, clipboard                                   | ⬜      |
-| 8   | Signing, notarization, .dmg, first-run flow                        | ⬜      |
-| 9   | Cross-meeting voiceprints & named personas                         | ✅ done |
+- **Where data lives.** Recordings, models and the database are under
+  `~/Library/Application Support/com.lilnotes/`. Audio can be deleted
+  automatically after transcription (Settings → Recording), and you can move
+  the recordings folder.
+- **Encryption.** The database (meetings, transcripts, summaries, notes,
+  customers, personas, voiceprints) is encrypted with SQLCipher. The 256-bit
+  key is generated on first launch and stored in your login Keychain
+  (service `com.lilnotes`). Deleting that Keychain item makes the database
+  unreadable; this is the intended factory reset.
+- **Voiceprints are biometric data.** They are speaker embeddings, not
+  audio, stored only in the encrypted database, and only added when you
+  confirm an identity. Delete them per persona in **Personas** or all at
+  once in Settings → Personas & voiceprints.
+- **Network.** LilNotes only talks to the network to download models you
+  ask for (Hugging Face), and to `localhost` for Ollama or its own sidecar.
+  There is no crash reporting, analytics or update check.
+- **Recording other people** may require their consent where you live. That
+  is on you.
 
-### Verifying milestone 1
+## Summaries
 
-`npm install && npm run tauri dev` — the window should open with the LilNotes
-sidebar; on the Meetings screen, click **Test backend connection**: it should
-show the backend version, round-trip latency, and echoed message.
-
-### Verifying milestone 2
-
-1. Go to **Record**, hit the record button. Approve the Microphone prompt,
-   then the System Audio Recording prompt (first run only).
-2. Talk, and play something (music, a video) so both meters move.
-3. Stop. The card shows the two WAV paths under
-   `~/Library/Application Support/com.lilnotes/recordings/<session>/`.
-4. Inspect: `afinfo mic.wav system.wav` (both 16 kHz mono 16-bit) and play
-   them — mic.wav has only your voice, system.wav only the playback.
-
-Rust unit tests (resampler + limiter): `cd src-tauri && cargo test`.
-
-**Troubleshooting capture**
-
-- _No system-audio prompt appears / OSStatus error on start:_ the
-  system-audio TCC category requires a signed binary. Dev builds are ad-hoc
-  signed, which normally works; if not, run `npm run tauri build` once and
-  launch the bundled app from `src-tauri/target/release/bundle/macos/`.
-- _Re-test the prompts:_ `tccutil reset Microphone com.lilnotes` and
-  `tccutil reset SystemAudioCaptureRequests com.lilnotes`.
-- _system.wav is silent:_ make sure something is actually playing to the
-  default output device (the tap follows the default output).
-
-### Verifying milestone 3
-
-1. In **Settings → Transcription**, download **Large v3 Turbo** (~1.6 GB;
-   progress bar + cancel should work) and make sure it's selected. Leave
-   "Live transcription" on.
-2. Record a short session with speech on both channels (talk + play a video
-   with speech). The transcript should fill in below the meters within
-   ~5–15 s of each utterance, labeled Me / Speaker with timestamps.
-3. Stop: the last chunk flushes, and `stop_recording` returns the full
-   segment list. Timestamps should match the audio (`afplay` + spot-check).
-4. Batch mode: toggle live transcription off, record again, then click
-   **Transcribe recording** — same output, produced after the fact.
-
-### Verifying milestone 4
-
-1. Record a session where the system channel has **two or more distinct
-   voices** (e.g. play a podcast/interview) while you also speak.
-2. Stop. After transcription finishes, "Identifying speakers…" runs — the
-   first time it downloads two small ONNX models (~34 MB total).
-3. The generic "Speaker" chips become SPEAKER_00 / SPEAKER_01 (color-coded);
-   your speech stays "Me". Spot-check that alternating voices in the
-   recording alternate labels.
-4. Click any SPEAKER_xx chip to rename it (e.g. "Priya") — the name applies
-   across the transcript. (Renames persist per meeting from milestone 5.)
-
-Diarization models: pyannote segmentation-3.0 + 3D-Speaker CAM++
-embeddings, both ONNX via sherpa-onnx; clustering is threshold-based since
-the speaker count is unknown. Rust tests: `cd src-tauri && cargo test`.
-
-### Verifying milestone 5
-
-1. Record a short meeting; after speakers are identified you land on the
-   meeting's detail page automatically.
-2. Rename a speaker and the meeting title, quit the app fully, relaunch —
-   everything (transcript, labels, names, title) reloads from SQLite
-   (`<app data>/lilnotes.sqlite3`).
-3. Meetings shows the history; search matches titles _and_ transcript text;
-   hovering a row reveals delete.
-4. Settings → Storage: change the recordings folder (new sessions land
-   there) and try "Delete audio after transcription" — after the next
-   recording finishes processing, its WAVs are gone and the detail page
-   shows an "audio deleted" badge.
-
-### Verifying milestone 6
-
-1. Install [Ollama](https://ollama.com/download) and launch it. (Quit it
-   first to check the setup panel: Settings → Summaries should show "Ollama
-   isn't running" with install guidance, and the rest of the app keeps
-   working.)
-2. Settings → Summaries: with Ollama running you see its version, the
-   installed-model picker, and the curated suggestions (gemma4:26b
-   recommended; gemma4:12b is the fast alternative if you want a quicker
-   first test). Pull one — the progress bar should track real percent and
-   cancel must work (a re-pull resumes where it left off).
-3. Open a transcribed meeting → the Summary panel on the right →
-   **Summarize**. Tokens should stream in live; the result is saved (check
-   it survives an app restart) with model + timestamp shown.
-4. Rename a speaker, hit **Regenerate** — action items should now use the
-   new name. Try editing the prompt template in Settings and regenerating.
-
-**Mic echo cancellation.** The mic channel uses macOS voice processing
-(Apple's AEC + noise suppression, the FaceTime stack): speaker output and
-steady room noise are removed from `mic.wav` at the driver level, so remote
-voices shouldn't bleed into the "Me" track even without headphones. Ducking
-of other audio is disabled so the system channel keeps its level. If voice
-processing can't initialize on a device, capture automatically falls back to
-the raw mic (a console line notes the fallback). Expect the voice-processed
-mic to sound "thinner" than a raw recording — that is normal and fine for
-ASR.
-
-### Verifying milestone 9
-
-1. Record/transcribe/diarize a meeting with a distinct remote speaker; click
-   that speaker's chip → **Create new persona** "Priya" → confirm. Verify via
-   the Personas view (shows "Priya — 1 voiceprint"). The DB is now encrypted
-   with SQLCipher, so plain `sqlite3` reports "file is not a database" — that
-   itself confirms encryption is active. To inspect rows, install
-   `sqlcipher` (`brew install sqlcipher`), fetch the key from the Keychain
-   (`security find-generic-password -s com.lilnotes -a db-key -w`),
-   hex-encode it, and open with `PRAGMA key = "x'<64 hex chars>'"`.
-2. Record a **second** meeting with the same person. After diarization the
-   chip should pre-fill "Priya" with a confidence % (dashed ring = suggested).
-   Confirm it → `SELECT COUNT(*) FROM voiceprints;` increments (gallery grew).
-3. Negative: a brand-new voice stays `SPEAKER_xx` (no false auto-match).
-4. Adaptive case: in a meeting where Priya is _not_ auto-matched (below
-   threshold), manually assign her via the picker; confirm a new voiceprint
-   row is enrolled, then re-run a similar later recording and check the
-   confidence is higher / now clears the threshold.
-5. `delete_persona("Priya")` (Personas view) removes her voiceprints and
-   nulls links; the transcript falls back to the raw `SPEAKER_xx` label.
-6. Encryption: on first launch a Keychain entry is created (service
-   `com.lilnotes`, account `db-key` — verify with `security find-generic-password -s com.lilnotes -a db-key`). Quit, relaunch — the DB
-   unlocks and all data reloads. `sqlite3` on the DB file reports "file is
-   not a database" (encrypted). Deleting the Keychain item and relaunching
-   makes the DB unreadable (intended factory-reset behavior). `cd src-tauri
-&& cargo test` passes (pack/unpack round-trip, cosine, threshold
-   classification, CRUD — all with the fixed test key, no Keychain access).
+LilNotes ships a `llama-server` sidecar (llama.cpp) and can download Qwen3.5
+in 4B (fast, fits any Mac) or 9B (better, needs 16 GB+) quantized builds from
+Settings → Summaries. If you already use Ollama, switch the backend to Ollama
+and pick any installed model; LilNotes talks to it at `http://localhost:11434`
+and can pull models with progress from the same screen. Summaries regenerate
+on demand, so renaming a speaker and hitting **Regenerate** updates the
+action items.
 
 ## Connect an AI agent (MCP)
 
@@ -201,36 +136,57 @@ Privacy: off by default, binds to loopback only, every request needs the
 token, and audio files, settings and voiceprints are never exposed. The
 server only runs while LilNotes is open (including hidden in the menu bar).
 
-## Architecture
+## How it works
 
 ```
-Mic ─────────► Capture (Rust/Core Audio) ── mic.wav ───► whisper-rs ─┐
-System audio ► (process tap, separate)  ── system.wav ► whisper-rs ─┤
+Mic ─────────► Capture (Rust/Core Audio) ── mic.wav ───► whisper.cpp ─┐
+System audio ► (process tap, separate)  ── system.wav ► whisper.cpp ─┤
                                              │                       ├─► merge ─► SQLite ◄─► UI
-                                             └─► sherpa-onnx diarize ┘             │
-                                                (system channel only)              └─► Ollama (localhost)
+                                             └─► sherpa-onnx diarize ┘  (SQLCipher)  │
+                                                (system channel only)               └─► llama.cpp sidecar
+                                                                                        or Ollama (localhost)
 ```
 
-Mic segments are labeled **Me**; system-channel segments get diarized speaker
-labels (renamable per meeting). Channels are never mixed before ASR.
+- **Shell:** [Tauri v2](https://tauri.app) (Rust core; React + TypeScript +
+  Tailwind + shadcn/ui front-end).
+- **Capture:** a Core Audio process tap for system audio plus the mic, each
+  written as 16 kHz mono WAV. The two are never mixed before transcription.
+  Mic segments are labelled **Me**; system-channel segments get diarized
+  speaker labels, renamable per meeting.
+- **Echo cancellation:** WebRTC AudioProcessing (AEC3), with the system
+  track as the reference signal, so remote voices are removed from your
+  track even on speakers.
+- **Voiceprints & personas:** CAM++ embeddings computed during diarization
+  are kept per persona as a small gallery. Matching is cosine similarity
+  on-device; a gallery grows only when you confirm an identity, so a wrong
+  suggestion never pollutes it.
+- **Summaries:** the sidecar is a separate `llama-server` process (llama.cpp
+  and whisper.cpp cannot share one process on Metal), spoken to over
+  localhost HTTP.
 
-**Voiceprints & personas.** CAM++ speaker embeddings computed during
-diarization are persisted (L2-normalized f32 vectors) as per-persona
-"voiceprint galleries" in the same SQLite database. Matching is brute-force
-cosine similarity on-device; a persona's gallery grows only when you confirm
-an identity, so unconfirmed suggestions never corrupt it. Voiceprints are
-biometric data at rest and never leave your Mac. Manage or delete them in
-**Personas** (sidebar) or **Settings → Personas & voiceprints**.
+## Building from source
 
-**Encryption at rest.** The entire SQLite database (meetings, transcripts,
-summaries, personas, and voiceprints) is encrypted with SQLCipher. The
-256-bit key is generated on first run and stored in the macOS Keychain
-(service `com.lilnotes`); it is protected by your login keychain
-(FileVault + user password). If the key is deleted, the database becomes
-unreadable — effectively a factory reset. Nothing in the database or the
-key ever leaves your Mac.
+```sh
+git clone https://github.com/xxhama/lilnotes.git && cd lilnotes
+brew install cmake meson ninja pkg-config   # plus Rust (rustup), Node 24, Xcode CLT
+npm install
+npm run tauri:dev       # dev window; builds the llama-server sidecar first
+npm run tauri:build     # release .app + .dmg
+```
 
-## Signing & notarization (milestone 8)
+Use `npm run tauri:dev` (with the colon), not `npx tauri dev`, or summaries
+will not work. Everything else a contributor needs, including the checks CI
+runs and the parts of the build that look odd but are load-bearing, is in
+[CONTRIBUTING.md](CONTRIBUTING.md). Manual test walkthroughs for each
+subsystem are in [docs/manual-testing.md](docs/manual-testing.md).
 
-Documented once distribution lands. You provide your own Developer ID
-identity; it is configured via environment variables, never committed.
+## License
+
+LilNotes is free software under the
+[GNU Affero General Public License v3.0](LICENSE). It builds on whisper.cpp,
+llama.cpp, sherpa-onnx, ONNX Runtime, WebRTC AudioProcessing, SQLCipher and
+others; their licenses are collected in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and shown in Settings →
+About. Models are downloaded on demand under their own licenses (Whisper:
+MIT; pyannote segmentation: MIT; 3D-Speaker CAM++: Apache-2.0; Qwen3.5:
+Apache-2.0).
