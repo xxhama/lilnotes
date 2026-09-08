@@ -5,7 +5,7 @@
 
 ### Features
 
-* read-only MCP server so local AI agents can query meetings ([102bf31](https://github.com/xxhama/lilnotes/commit/102bf31f02e7cb32fd94514b409a3d2dbae9de3b))
+* read-only MCP server so local AI agents can query meetings ([571fad3](https://github.com/xxhama/lilnotes/commit/571fad39b295f21633b5db5714d343ff142a07f1))
 
 ## [0.1.0](https://github.com/xxhama/lilnotes/releases/tag/v0.1.0) (2026-07-14)
 
