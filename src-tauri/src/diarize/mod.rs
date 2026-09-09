@@ -2,7 +2,7 @@
 //!
 //! Pipeline: pyannote segmentation-3.0 detects speech regions and speaker
 //! changes; CAM++ embeddings + clustering group them into speakers. Runs
-//! offline over the finished `system.wav` — the mic channel is "Me" by
+//! offline over the finished `system.flac` — the mic channel is "Me" by
 //! construction and is never diarized.
 //!
 //! Speaker count is unknown in a meeting, so clustering uses a similarity
@@ -78,7 +78,8 @@ impl DiarizeEngine {
         Ok(())
     }
 
-    /// Diarize a 16 kHz mono WAV; emits `diarize:progress` events.
+    /// Diarize a 16 kHz mono channel recording (FLAC or legacy WAV); emits
+    /// `diarize:progress` events.
     /// `num_speakers`: Some(k) when the user knows the speaker count
     /// (dramatically more reliable), None for automatic.
     pub fn diarize_wav(
@@ -90,13 +91,7 @@ impl DiarizeEngine {
         let num_clusters = num_speakers.filter(|&n| n > 0).unwrap_or(-1);
         self.ensure_loaded(app, num_clusters)?;
 
-        let mut reader =
-            hound::WavReader::open(wav_path).map_err(|e| format!("cannot open {wav_path}: {e}"))?;
-        let samples: Vec<f32> = reader
-            .samples::<i16>()
-            .map(|s| s.map(|v| v as f32 / 32768.0))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("cannot read {wav_path}: {e}"))?;
+        let (_, samples) = crate::audio::codec::read_mono_f32(wav_path)?;
         if samples.len() < 16_000 {
             return Ok(Vec::new()); // < 1 s of audio: nothing to diarize
         }

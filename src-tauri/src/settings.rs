@@ -45,7 +45,7 @@ pub struct AppSettings {
     pub live_transcription: bool,
     /// Where session recordings are stored; None = app data dir.
     pub storage_dir: Option<String>,
-    /// Delete the WAVs once a meeting is transcribed + diarized.
+    /// Delete the audio files once a meeting is transcribed + diarized.
     pub delete_audio_after_transcription: bool,
     /// Summary backend: "native" (built-in llama.cpp) or "ollama".
     pub summary_backend: String,

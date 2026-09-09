@@ -254,7 +254,7 @@ export default function TranscriptToolbar({
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                Discard the echo-cleaned mic and re-transcribe from the original mic.wav.
+                Discard the echo-cleaned mic and re-transcribe from the original mic recording.
               </TooltipContent>
             </Tooltip>
           )}

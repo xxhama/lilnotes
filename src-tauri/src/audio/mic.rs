@@ -4,7 +4,7 @@
 //! Apple's echo cancellation + noise suppression (the FaceTime stack). This
 //! subtracts whatever is playing on the speakers from the mic signal and
 //! suppresses steady background noise, which keeps remote voices and room
-//! noise out of `mic.wav` when the user isn't wearing headphones.
+//! noise out of `mic.flac` when the user isn't wearing headphones.
 //!
 //! Fallback path: plain cpal capture (raw mic), used only if voice
 //! processing fails to initialize on this device.

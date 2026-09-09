@@ -474,9 +474,9 @@ export default function MeetingDetailView({
     }
   }, [id, reload, speakerCount]);
 
-  /** Run offline AEC on the mic using system.wav as the reference (seeded by
+  /** Run offline AEC on the mic using the system recording as the reference (seeded by
    *  echo-marked mic segments), then re-transcribe + re-diarize. The original
-   *  mic.wav is preserved; `meeting.micCleanedWav` points at the cleaned copy. */
+   *  mic file is preserved; `meeting.micCleanedWav` points at the cleaned copy. */
   const runCleanEcho = useCallback(async () => {
     setBusy("cleaning");
     setAecPct(0);
@@ -492,7 +492,7 @@ export default function MeetingDetailView({
     }
   }, [id, reload]);
 
-  /** Drop the cleaned mic, re-transcribe from the original mic.wav. */
+  /** Drop the cleaned mic, re-transcribe from the original mic recording. */
   const runRevertEchoClean = useCallback(async () => {
     setBusy("cleaning");
     setAecPct(null);

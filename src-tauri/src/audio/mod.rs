@@ -2,11 +2,13 @@
 //!
 //! Microphone and system audio are captured on independent threads and are
 //! NEVER mixed: each channel is resampled to 16 kHz mono and written to its
-//! own WAV (`mic.wav`, `system.wav`). Level meters and elapsed time stream to
-//! the UI via the `capture:levels` Tauri event (~10 Hz).
+//! own FLAC (`mic.flac`, `system.flac`; see `codec.rs`). Level meters and
+//! elapsed time stream to the UI via the `capture:levels` Tauri event (~10 Hz).
 
 pub mod aec;
+pub mod codec;
 pub mod mic;
+pub mod migrate;
 pub mod offline_aec;
 pub mod pipeline;
 pub mod resampler;
@@ -83,7 +85,7 @@ impl CaptureEngine {
     }
 
     /// Start a new capture session. `dir` is the per-session directory the
-    /// WAVs are written into. When `live_tx` is set, both pipelines feed
+    /// channel FLACs are written into. When `live_tx` is set, both pipelines feed
     /// 16 kHz chunks into it for near-live transcription; the senders drop
     /// when capture stops, which is the ASR worker's end-of-stream signal.
     /// When `aec_enabled` is true, a shared WebRTC APM is created: the system
@@ -137,7 +139,7 @@ impl CaptureEngine {
         let (sys_ready_tx, sys_ready_rx) = crossbeam_channel::bounded(1);
 
         let mic_thread = mic::spawn(
-            dir.join("mic.wav"),
+            dir.join(codec::MIC_FILE),
             stop_flag.clone(),
             mic_meters.clone(),
             live_tx.clone(),
@@ -146,7 +148,7 @@ impl CaptureEngine {
             aec_capture,
         );
         let sys_thread = system_tap::spawn(
-            dir.join("system.wav"),
+            dir.join(codec::SYSTEM_FILE),
             stop_flag.clone(),
             sys_meters.clone(),
             live_tx,

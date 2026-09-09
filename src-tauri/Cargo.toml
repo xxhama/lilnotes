@@ -36,7 +36,14 @@ rand = "0.8"                 # OsRng for key generation
 
 # --- audio capture (M2) ---
 cpal = "0.18"                 # microphone capture
-hound = "3.5"                 # WAV writing
+hound = "3.5"                 # legacy .wav reads (pre-FLAC recordings) + WAV test fixtures
+
+# --- lossless recording format ---
+# Channel files are FLAC (see audio/codec.rs). libFLAC's streaming encoder via
+# libflac-sys, built from source with cmake (already required by whisper-rs)
+# and linked statically; no Ogg. claxon is a pure-Rust decoder.
+flac-bound = { version = "0.5", default-features = false, features = ["libflac-noogg"] }
+claxon = "0.4"
 crossbeam-channel = "0.5"     # realtime-ish handoff between audio callbacks and writers
 chrono = "0.4"                # session ids / timestamps
 

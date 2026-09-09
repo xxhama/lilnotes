@@ -411,7 +411,7 @@ pub async fn transcribe_meeting(
 pub struct DiarizedTranscript {
     pub segments: Vec<Segment>,
     pub speaker_count: usize,
-    /// True if the WAVs were removed per the delete-audio setting.
+    /// True if the audio files were removed per the delete-audio setting.
     pub audio_deleted: bool,
 }
 
@@ -458,13 +458,14 @@ pub async fn diarize_meeting(
             &old,
         )?;
 
-        // Transcript + speakers are safely stored; drop the audio if asked.
+        // Transcript + speakers are safely stored; drop the audio if asked
+        // (mic, system, and any echo-cleaned mic).
         let mut audio_deleted = false;
         if db.get_settings().delete_audio_after_transcription {
-            if let Some(mic) = mic_wav {
-                let _ = std::fs::remove_file(&mic);
+            let cleaned = db.get_meeting(meeting_id)?.mic_cleaned_wav;
+            for file in [mic_wav, Some(system_wav), cleaned].into_iter().flatten() {
+                let _ = std::fs::remove_file(&file);
             }
-            let _ = std::fs::remove_file(&system_wav);
             db.clear_audio_paths(meeting_id)?;
             audio_deleted = true;
         }
@@ -616,11 +617,11 @@ pub fn restore_segment(db: State<'_, Arc<LazyDb>>, segment_id: i64) -> Result<()
 // Offline echo re-processing (Tier 3)
 // ---------------------------------------------------------------------------
 
-/// Re-transcribe a meeting's mic (from `mic_path`) + system WAV and re-run
+/// Re-transcribe a meeting's mic (from `mic_path`) + system recording and re-run
 /// diarization on the system channel, keeping speaker labels — and with them
 /// renames, persona links, and voiceprints — attached to the same voices.
-/// Shared by `clean_echo` (mic_path = the cleaned WAV), `revert_echo_clean`
-/// (mic_path = the original `mic.wav`), and `retranscribe_meeting` (mic_path =
+/// Shared by `clean_echo` (mic_path = the cleaned file), `revert_echo_clean`
+/// (mic_path = the original mic recording), and `retranscribe_meeting` (mic_path =
 /// cleaned-or-original, `model_id` = the user's per-meeting pick). Echo/delete
 /// marks are snapshotted and re-applied across both `replace_segments` calls so
 /// they survive the rebuild. The meeting's `asr_model` is recorded as
@@ -734,9 +735,16 @@ fn run_offline_clean(
     windows: &[offline_aec::EchoWindow],
     scope: offline_aec::ApplyScope,
 ) -> Result<DiarizedTranscript, String> {
-    // Write mic_cleaned.wav next to mic.wav.
-    let out_path = std::path::Path::new(mic_wav).with_file_name("mic_cleaned.wav");
+    // Write mic_cleaned.flac next to the mic recording. A previous clean may
+    // have left a differently named file (legacy `mic_cleaned.wav`); drop it
+    // so overwriting the pointer below doesn't orphan it.
+    let out_path = crate::audio::codec::cleaned_mic_path(mic_wav);
     let out_str = out_path.to_string_lossy().into_owned();
+    if let Some(old) = db.get_meeting(meeting_id)?.mic_cleaned_wav {
+        if old != out_str {
+            let _ = std::fs::remove_file(&old);
+        }
+    }
 
     // Run the offline filter with progress events. If no echo windows were
     // marked, the filter falls back to unsupervised adaptation — but the apply
@@ -767,13 +775,13 @@ fn run_offline_clean(
     )
 }
 
-/// Run offline AEC on a meeting's `mic.wav` using `system.wav` as the exact
-/// echo reference, seeded by the user's echo-marked mic segments, then
-/// re-transcribe the cleaned mic and re-diarize. The apply scope is the mic
-/// **speech** segments only (learn from marked echo regions, apply to speech) —
-/// so pure-echo regions and untouched audio are not mangled. With no speech
-/// segments this is a no-op (no `mic_cleaned_wav` written, transcript
-/// unchanged). The original `mic.wav` is preserved; the cleaned path is stored
+/// Run offline AEC on a meeting's mic recording using the system recording as
+/// the exact echo reference, seeded by the user's echo-marked mic segments,
+/// then re-transcribe the cleaned mic and re-diarize. The apply scope is the
+/// mic **speech** segments only (learn from marked echo regions, apply to
+/// speech) — so pure-echo regions and untouched audio are not mangled. With no
+/// speech segments this is a no-op (no `mic_cleaned_wav` written, transcript
+/// unchanged). The original mic file is preserved; the cleaned path is stored
 /// in `meetings.mic_cleaned_wav` so the action is revertible via
 /// `revert_echo_clean`. Emits `offline_aec:progress` events (0..=1).
 #[tauri::command]
@@ -805,11 +813,11 @@ pub async fn clean_echo(
         );
 
         // No speech to de-echo → true no-op (don't blast the whole track).
-        // Drop any stale cleaned WAV + pointer and return the current transcript.
+        // Drop any stale cleaned file + pointer and return the current transcript.
         if apply.is_empty() {
-            db.clear_mic_cleaned_wav(meeting_id)?;
-            let cleaned = std::path::Path::new(&mic_wav).with_file_name("mic_cleaned.wav");
-            let _ = std::fs::remove_file(&cleaned);
+            if let Some(cleaned) = db.clear_mic_cleaned_wav(meeting_id)? {
+                let _ = std::fs::remove_file(&cleaned);
+            }
             return Ok(DiarizedTranscript {
                 segments: db.meeting_segments(meeting_id)?,
                 speaker_count: db.get_meeting(meeting_id)?.speaker_count as usize,
@@ -890,7 +898,7 @@ pub async fn clean_echo_segment(
 }
 
 /// Revert an offline echo clean: drop the `mic_cleaned_wav` pointer and
-/// re-transcribe from the original `mic.wav`. Marks are snapshot/reapplied so
+/// re-transcribe from the original mic recording. Marks are snapshot/reapplied so
 /// echo/delete marks survive the rebuild.
 #[tauri::command]
 pub async fn revert_echo_clean(
@@ -911,11 +919,11 @@ pub async fn revert_echo_clean(
             (Some(m), Some(s)) => (m, s),
             _ => return Err("this meeting's audio files have been deleted".into()),
         };
-        db.clear_mic_cleaned_wav(meeting_id)?;
-        // Best effort: remove the cleaned WAV from disk so we don't accumulate
-        // stale copies if the user re-runs a clean later.
-        let cleaned = std::path::Path::new(&mic_wav).with_file_name("mic_cleaned.wav");
-        let _ = std::fs::remove_file(&cleaned);
+        // Best effort: remove the cleaned file from disk so we don't
+        // accumulate stale copies if the user re-runs a clean later.
+        if let Some(cleaned) = db.clear_mic_cleaned_wav(meeting_id)? {
+            let _ = std::fs::remove_file(&cleaned);
+        }
         let model_id = meeting_asr_model(&db, meeting_id)?;
         retranscribe_and_rediarize(
             &app,
@@ -937,7 +945,7 @@ pub async fn revert_echo_clean(
 /// (the user's per-meeting pick from the dropdown), then re-diarize. Does NOT
 /// touch the global/live `settings.asr_model` — future recordings keep using
 /// that. The mic source is the echo-cleaned mic if one exists (so an echo clean
-/// survives a model swap), otherwise the original `mic.wav`. Echo/delete marks
+/// survives a model swap), otherwise the original mic recording. Echo/delete marks
 /// are snapshot/reapplied so they survive the rebuild, and the meeting's
 /// `asr_model` is recorded as `model_id` so the UI reflects the new model.
 #[tauri::command]
@@ -1281,17 +1289,22 @@ pub fn unlink_speaker_persona(
     Ok(())
 }
 
-/// Delete a meeting row; also removes its WAVs from disk.
+/// Delete a meeting row; also removes its audio files (mic, system, and the
+/// echo-cleaned mic if any) from disk.
 #[tauri::command]
 pub fn delete_meeting(db: State<'_, Arc<LazyDb>>, meeting_id: i64) -> Result<(), String> {
-    let (mic, system) = db.delete_meeting(meeting_id)?;
-    for wav in [mic, system].into_iter().flatten() {
-        let path = std::path::PathBuf::from(&wav);
-        let _ = std::fs::remove_file(&path);
-        // Remove the (now likely empty) session directory.
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
+    let paths = db.delete_meeting(meeting_id)?;
+    for file in paths.iter() {
+        let _ = std::fs::remove_file(file);
+    }
+    // Remove the (now likely empty) session directory. Non-recursive on
+    // purpose: anything we don't know about stays.
+    if let Some(dir) = paths
+        .iter()
+        .next()
+        .and_then(|p| std::path::Path::new(p).parent())
+    {
+        let _ = std::fs::remove_dir(dir);
     }
     Ok(())
 }

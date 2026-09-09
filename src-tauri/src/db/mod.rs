@@ -127,6 +127,23 @@ pub struct MeetingIndexRow {
     pub preview: Option<String>,
 }
 
+/// The three on-disk audio files a meeting can own (each `None` once deleted).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioPaths {
+    pub mic: Option<String>,
+    pub system: Option<String>,
+    pub cleaned: Option<String>,
+}
+
+impl AudioPaths {
+    /// The paths that are set, in (mic, system, cleaned) order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        [&self.mic, &self.system, &self.cleaned]
+            .into_iter()
+            .filter_map(|p| p.as_deref())
+    }
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingDetail {
@@ -137,8 +154,13 @@ pub struct MeetingDetail {
     pub ended_at_ms: Option<i64>,
     pub mic_wav: Option<String>,
     pub system_wav: Option<String>,
-    /// Path to an offline echo-cleaned mic WAV, if `clean_echo` has been run.
-    /// The UI / AudioPlayer / re-transcribe prefer this over `mic_wav`.
+    /// Path to an offline echo-cleaned mic recording, if `clean_echo` has been
+    /// run. The UI / AudioPlayer / re-transcribe prefer this over `mic_wav`.
+    ///
+    /// The `*_wav` names are historical: since 0.3 the files are FLAC
+    /// (`audio::codec`), and recordings from before that are converted on
+    /// startup. The column/field names stay so no migration is needed; the
+    /// extension is the format signal.
     pub mic_cleaned_wav: Option<String>,
     pub notes: Option<String>,
     /// Wall-clock epoch ms of the last `update_notes` write; null until notes
@@ -614,7 +636,7 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Fill in `ended_at` and WAV paths on a row created by
+    /// Fill in `ended_at` and the recording paths on a row created by
     /// `insert_meeting_started`. Called when recording stops.
     pub fn finalize_meeting(
         &self,
@@ -1005,42 +1027,91 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
-    pub fn delete_meeting(&self, id: i64) -> Result<(Option<String>, Option<String>), String> {
+    /// Delete a meeting row. Returns its audio paths so the caller can remove
+    /// the files from disk.
+    pub fn delete_meeting(&self, id: i64) -> Result<AudioPaths, String> {
         let conn = self.conn.lock().unwrap();
-        let wavs = conn
+        let paths = conn
             .query_row(
-                "SELECT mic_wav, system_wav FROM meetings WHERE id = ?1",
+                "SELECT mic_wav, system_wav, mic_cleaned_wav FROM meetings WHERE id = ?1",
                 params![id],
                 |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                    ))
+                    Ok(AudioPaths {
+                        mic: r.get(0)?,
+                        system: r.get(1)?,
+                        cleaned: r.get(2)?,
+                    })
                 },
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .unwrap_or((None, None));
+            .unwrap_or_default();
         conn.execute("DELETE FROM meetings WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
-        Ok(wavs)
+        Ok(paths)
     }
 
-    /// Clear the audio paths (used by "delete audio after transcription").
+    /// Clear all audio paths, including the echo-cleaned mic (used by
+    /// "delete audio after transcription").
     pub fn clear_audio_paths(&self, id: i64) -> Result<(), String> {
         self.conn
             .lock()
             .unwrap()
             .execute(
-                "UPDATE meetings SET mic_wav = NULL, system_wav = NULL WHERE id = ?1",
+                "UPDATE meetings SET mic_wav = NULL, system_wav = NULL, mic_cleaned_wav = NULL
+                 WHERE id = ?1",
                 params![id],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    /// Record the path of an offline echo-cleaned mic WAV produced by
-    /// `clean_echo`. The original `mic.wav` is preserved so the action is
+    /// Point a meeting at (re)encoded audio files. Used by the WAV → FLAC
+    /// migration; `None` clears a column.
+    pub fn set_audio_paths(&self, id: i64, paths: &AudioPaths) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET mic_wav = ?2, system_wav = ?3, mic_cleaned_wav = ?4
+                 WHERE id = ?1",
+                params![id, paths.mic, paths.system, paths.cleaned],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Finished meetings that still reference a legacy `.wav` recording in
+    /// any audio column, oldest first. Empty once the migration has run.
+    pub fn meetings_with_wav_audio(&self) -> Result<Vec<(i64, AudioPaths)>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, mic_wav, system_wav, mic_cleaned_wav FROM meetings
+                 WHERE ended_at IS NOT NULL
+                   AND (mic_wav LIKE '%.wav' OR system_wav LIKE '%.wav'
+                        OR mic_cleaned_wav LIKE '%.wav')
+                 ORDER BY started_at ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    AudioPaths {
+                        mic: r.get(1)?,
+                        system: r.get(2)?,
+                        cleaned: r.get(3)?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Record the path of an offline echo-cleaned mic recording produced by
+    /// `clean_echo`. The original mic file is preserved so the action is
     /// revertible via `clear_mic_cleaned_wav`.
     pub fn set_mic_cleaned_wav(&self, id: i64, path: &str) -> Result<(), String> {
         self.conn
@@ -1099,18 +1170,26 @@ impl Db {
             .map_err(|e| format!("meeting {id} not found: {e}"))
     }
 
-    /// Drop the echo-cleaned mic WAV pointer, reverting to the original
-    /// `mic.wav` for playback and re-transcription.
-    pub fn clear_mic_cleaned_wav(&self, id: i64) -> Result<(), String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE meetings SET mic_cleaned_wav = NULL WHERE id = ?1",
+    /// Drop the echo-cleaned mic pointer, reverting to the original mic file
+    /// for playback and re-transcription. Returns the path that was stored
+    /// (if any) so the caller can remove the file from disk.
+    pub fn clear_mic_cleaned_wav(&self, id: i64) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let previous: Option<String> = conn
+            .query_row(
+                "SELECT mic_cleaned_wav FROM meetings WHERE id = ?1",
                 params![id],
+                |r| r.get(0),
             )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        conn.execute(
+            "UPDATE meetings SET mic_cleaned_wav = NULL WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(previous)
     }
 
     // -----------------------------------------------------------------------
@@ -1168,7 +1247,7 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
-    /// (mic_wav, system_wav) for a meeting, if still present.
+    /// (mic, system) recording paths for a meeting, if still present.
     pub fn meeting_wavs(&self, id: i64) -> Result<(Option<String>, Option<String>), String> {
         self.conn
             .lock()
@@ -3435,6 +3514,106 @@ mod tests {
         // No match: fallback path must not panic when byte 80 is mid-char.
         let long: String = "xé".repeat(60); // every other char is 2 bytes
         let _ = snippet_around(&long, "zzz", 40);
+    }
+
+    #[test]
+    fn clear_mic_cleaned_wav_returns_previous_path_once() {
+        let db = tmp_db();
+        let id = db.insert_meeting_started("s-clean", "t", 0).unwrap();
+        db.finalize_meeting(id, 1, "/r/mic.flac", "/r/system.flac")
+            .unwrap();
+        assert_eq!(db.clear_mic_cleaned_wav(id).unwrap(), None);
+        db.set_mic_cleaned_wav(id, "/r/mic_cleaned.flac").unwrap();
+        assert_eq!(
+            db.clear_mic_cleaned_wav(id).unwrap().as_deref(),
+            Some("/r/mic_cleaned.flac")
+        );
+        assert_eq!(db.clear_mic_cleaned_wav(id).unwrap(), None);
+        assert_eq!(db.get_meeting(id).unwrap().mic_cleaned_wav, None);
+    }
+
+    #[test]
+    fn delete_meeting_returns_all_three_audio_paths() {
+        let db = tmp_db();
+        let id = db.insert_meeting_started("s-del", "t", 0).unwrap();
+        db.finalize_meeting(id, 1, "/r/mic.flac", "/r/system.flac")
+            .unwrap();
+        db.set_mic_cleaned_wav(id, "/r/mic_cleaned.flac").unwrap();
+        let paths = db.delete_meeting(id).unwrap();
+        assert_eq!(
+            paths,
+            AudioPaths {
+                mic: Some("/r/mic.flac".into()),
+                system: Some("/r/system.flac".into()),
+                cleaned: Some("/r/mic_cleaned.flac".into()),
+            }
+        );
+        assert_eq!(paths.iter().count(), 3);
+        assert!(db.get_meeting(id).is_err());
+        // Unknown ids yield no paths rather than an error.
+        assert_eq!(db.delete_meeting(id).unwrap(), AudioPaths::default());
+    }
+
+    #[test]
+    fn clear_audio_paths_also_drops_cleaned_mic() {
+        let db = tmp_db();
+        let id = db.insert_meeting_started("s-clear", "t", 0).unwrap();
+        db.finalize_meeting(id, 1, "/r/mic.flac", "/r/system.flac")
+            .unwrap();
+        db.set_mic_cleaned_wav(id, "/r/mic_cleaned.flac").unwrap();
+        db.clear_audio_paths(id).unwrap();
+        let m = db.get_meeting(id).unwrap();
+        assert_eq!(
+            (m.mic_wav, m.system_wav, m.mic_cleaned_wav),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn meetings_with_wav_audio_selects_legacy_rows_only() {
+        let db = tmp_db();
+        // Legacy: all three columns .wav.
+        let legacy = db.insert_meeting_started("s-legacy", "t", 10).unwrap();
+        db.finalize_meeting(legacy, 11, "/a/mic.wav", "/a/system.wav")
+            .unwrap();
+        db.set_mic_cleaned_wav(legacy, "/a/mic_cleaned.wav")
+            .unwrap();
+        // Half-migrated: only the cleaned copy is still WAV.
+        let half = db.insert_meeting_started("s-half", "t", 20).unwrap();
+        db.finalize_meeting(half, 21, "/b/mic.flac", "/b/system.flac")
+            .unwrap();
+        db.set_mic_cleaned_wav(half, "/b/mic_cleaned.wav").unwrap();
+        // Already FLAC.
+        let done = db.insert_meeting_started("s-done", "t", 30).unwrap();
+        db.finalize_meeting(done, 31, "/c/mic.flac", "/c/system.flac")
+            .unwrap();
+        // Still recording (no ended_at): never touched.
+        let live = db.insert_meeting_started("s-live", "t", 5).unwrap();
+        let _ = live;
+
+        let rows = db.meetings_with_wav_audio().unwrap();
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![legacy, half], "oldest first, legacy rows only");
+
+        db.set_audio_paths(
+            legacy,
+            &AudioPaths {
+                mic: Some("/a/mic.flac".into()),
+                system: Some("/a/system.flac".into()),
+                cleaned: None,
+            },
+        )
+        .unwrap();
+        let m = db.get_meeting(legacy).unwrap();
+        assert_eq!(m.mic_wav.as_deref(), Some("/a/mic.flac"));
+        assert_eq!(m.mic_cleaned_wav, None);
+        let ids: Vec<i64> = db
+            .meetings_with_wav_audio()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ids, vec![half]);
     }
 }
 

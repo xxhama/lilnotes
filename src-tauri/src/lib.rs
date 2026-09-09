@@ -107,6 +107,9 @@ pub fn run() {
                 lazy_db
                     .init()
                     .map_err(|e| std::io::Error::other(format!("cannot unlock database: {e}")))?;
+                // Recordings from before 0.3 are WAV; convert them to FLAC in
+                // the background. New users have nothing to convert.
+                audio::migrate::spawn(app.handle().clone(), lazy_db.clone());
             }
             app.manage(lazy_db);
             // Read-only MCP server for local AI agents — only if the user

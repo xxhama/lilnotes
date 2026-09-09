@@ -11,7 +11,7 @@
 //! - Each flush passes the tail of the previous transcript as the initial
 //!   prompt so casing/terminology stay consistent across chunk boundaries.
 //!
-//! The same machinery powers batch mode: `feed` the whole WAV, then `finish`.
+//! The same machinery powers batch mode: `feed` the whole recording, then `finish`.
 
 use std::sync::Arc;
 
@@ -204,7 +204,7 @@ fn rms(samples: &[f32]) -> f32 {
 }
 
 /// Streams segments for both channels of a session; used live (fed from the
-/// capture pipelines) and in batch (fed from WAV files).
+/// capture pipelines) and in batch (fed from the recorded channel files).
 pub struct SessionChunker {
     app: AppHandle,
     session_id: String,
@@ -307,8 +307,8 @@ pub fn spawn_live_worker(
         .expect("failed to spawn asr worker")
 }
 
-/// Batch: transcribe two finished WAVs through the same chunker, emitting
-/// `asr:segment` events along the way.
+/// Batch: transcribe two finished channel recordings (FLAC, or legacy WAV)
+/// through the same chunker, emitting `asr:segment` events along the way.
 pub fn transcribe_wavs(
     app: AppHandle,
     engine: &AsrEngine,
@@ -318,13 +318,7 @@ pub fn transcribe_wavs(
 ) -> Result<Vec<Segment>, String> {
     let mut chunker = SessionChunker::new(app.clone(), session_id.clone(), None);
     for (path, source) in [(mic_wav, Source::Mic), (system_wav, Source::System)] {
-        let mut reader =
-            hound::WavReader::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
-        let samples: Vec<f32> = reader
-            .samples::<i16>()
-            .map(|s| s.map(|v| v as f32 / 32768.0))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("cannot read {path}: {e}"))?;
+        let (_, samples) = crate::audio::codec::read_mono_f32(path)?;
         eprintln!(
             "[asr] transcribe_wavs {}: {} samples ({:.1}s)",
             path,
