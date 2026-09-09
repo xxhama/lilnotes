@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/xxhama/lilnotes/compare/v0.2.0...v0.3.0) (2026-09-09)
+
+
+### Features
+
+* About section with version, source link, license and notices ([#21](https://github.com/xxhama/lilnotes/issues/21)) ([fd427e4](https://github.com/xxhama/lilnotes/commit/fd427e45ee8cfe9d84fc3af4d7da1a5f311c6ca0))
+* record audio as lossless FLAC instead of WAV ([#33](https://github.com/xxhama/lilnotes/issues/33)) ([1258285](https://github.com/xxhama/lilnotes/commit/1258285e20736aab6a52cb30dc9a9770bc4c9e11))
+
 ## [0.2.0](https://github.com/xxhama/lilnotes/compare/v0.1.0...v0.2.0) (2026-09-07)
 
 
