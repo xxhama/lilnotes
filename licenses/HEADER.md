@@ -24,6 +24,7 @@ build time, so Cargo and npm metadata do not cover them.
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)                                        | `libsherpa-onnx-c-api.dylib` in `Contents/Frameworks` (prebuilt, fetched by `sherpa-rs-sys`)       | Apache-2.0   |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime)                                    | `libonnxruntime.*.dylib` in `Contents/Frameworks` (prebuilt, fetched by `sherpa-rs-sys`)           | MIT          |
 | [WebRTC AudioProcessing](https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing) | statically linked via the `webrtc-audio-processing-sys` crate                                      | BSD-3-Clause |
+| [FLAC (libFLAC)](https://github.com/xiph/flac)                                              | statically linked via the `libflac-sys` crate (recordings are stored as FLAC)                      | BSD-3-Clause |
 | [SQLCipher](https://www.zetetic.net/sqlcipher/)                                             | statically linked via `libsqlite3-sys` (`bundled-sqlcipher-vendored-openssl`)                      | BSD-3-Clause |
 | [OpenSSL](https://www.openssl.org/)                                                         | statically linked via `openssl-src` for SQLCipher                                                  | Apache-2.0   |
 | [shadcn/ui](https://ui.shadcn.com/)                                                         | component sources vendored under `src/components/ui/`                                              | MIT          |

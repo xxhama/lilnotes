@@ -162,7 +162,7 @@ export interface AppSettings {
   liveTranscription: boolean;
   /** Where recordings are stored; null = app data dir. */
   storageDir: string | null;
-  /** Delete WAVs once a meeting is transcribed + diarized. */
+  /** Delete the audio files once a meeting is transcribed + diarized. */
   deleteAudioAfterTranscription: boolean;
   /** Summary backend: "native" (built-in llama.cpp) or "ollama". */
   summaryBackend: string;
@@ -295,7 +295,7 @@ export interface DiarizedTranscript {
   segments: TranscriptSegment[];
   /** Number of distinct speakers found on the system channel. */
   speakerCount: number;
-  /** True if the WAVs were removed per the delete-audio setting. */
+  /** True if the audio files were removed per the delete-audio setting. */
   audioDeleted: boolean;
 }
 
@@ -345,8 +345,10 @@ export interface MeetingDetail {
   endedAtMs: number | null;
   micWav: string | null;
   systemWav: string | null;
-  /** Path to an offline echo-cleaned mic WAV, if `cleanEcho` has been run. The
-   * UI / AudioPlayer / re-transcribe prefer this over `micWav`. */
+  /** Path to an offline echo-cleaned mic recording, if `cleanEcho` has been
+   * run. The UI / AudioPlayer / re-transcribe prefer this over `micWav`.
+   * (The `*Wav` names are historical: recordings are FLAC since 0.3; the
+   * extension is the format signal.) */
   micCleanedWav: string | null;
   notes: string | null;
   /** Epoch ms of the last notes save; null until notes have ever been saved. */
@@ -416,10 +418,10 @@ export interface OfflineAecProgress {
 }
 
 /**
- * Run offline AEC on a meeting's `mic.wav` using `system.wav` as the exact echo
- * reference, seeded by the user's echo-marked mic segments, then re-transcribe
- * the cleaned mic and re-diarize. Emits `offline_aec:progress` events as the
- * filter runs. The original `mic.wav` is preserved; the cleaned path is stored
+ * Run offline AEC on a meeting's mic recording using the system recording as
+ * the exact echo reference, seeded by the user's echo-marked mic segments, then
+ * re-transcribe the cleaned mic and re-diarize. Emits `offline_aec:progress`
+ * events as the filter runs. The original mic file is preserved; the cleaned path is stored
  * as `meeting.micCleanedWav` so the action is revertible.
  */
 export function cleanEcho(meetingId: number): Promise<DiarizedTranscript> {
@@ -440,9 +442,24 @@ export function cleanEchoSegment(
 }
 
 /** Revert an offline echo clean: drop `micCleanedWav` and re-transcribe from the
- * original `mic.wav`. */
+ * original mic recording. */
 export function revertEchoClean(meetingId: number): Promise<DiarizedTranscript> {
   return invoke<DiarizedTranscript>("revert_echo_clean", { meetingId });
+}
+
+/** Progress of the one-time background conversion of pre-0.3 WAV recordings
+ * to FLAC (`audio::migrate`). `done === total` means finished; `failed`
+ * meetings were left on WAV and are retried on the next launch. */
+export interface AudioMigrationProgress {
+  done: number;
+  total: number;
+  failed: number;
+}
+
+export function onAudioMigrationProgress(
+  cb: (e: AudioMigrationProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<AudioMigrationProgress>("audio_migration:progress", (ev) => cb(ev.payload));
 }
 
 export function onOfflineAecProgress(cb: (e: OfflineAecProgress) => void): Promise<UnlistenFn> {

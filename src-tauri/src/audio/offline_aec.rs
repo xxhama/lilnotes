@@ -2,7 +2,7 @@
 //!
 //! The live WebRTC AEC3 (`aec.rs`) suppresses echo in real time but can't fully
 //! track a loud-speaker path at a high echo-to-near ratio. lilnotes also
-//! records `system.wav` — the *exact* signal the speakers played — so we can
+//! records `system.flac` — the *exact* signal the speakers played — so we can
 //! do better after the fact: run an adaptive filter offline, where the delay
 //! can be found globally and the filter can iterate to convergence.
 //!
@@ -27,19 +27,21 @@
 //! 4. A simple per-20 ms residual-echo suppressor gain masks any leftover
 //!    echo: `gain = e_power / (e_power + β·echo_power)` per frame.
 //!
-//! The output is written to `mic_cleaned.wav` (16 kHz mono i16), preserving the
-//! original `mic.wav` so the action is revertible. The caller then re-transcribes
-//! the mic from the cleaned WAV.
+//! The output is written to `mic_cleaned.flac` (16 kHz mono i16), preserving the
+//! original `mic.flac` so the action is revertible. The caller then re-transcribes
+//! the mic from the cleaned file.
 //!
 //! Scope (v1): linear echo path + residual mask. Nonlinear/saturating-speaker
 //! echo and finer PB-FDAF efficiency tweaks are later improvements, not blocking
 //! — finding the delay globally and converging offline already clearly beats the
 //! live AEC on the loud-speaker case.
 
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::path::Path;
 use std::sync::Arc;
+
+use super::codec::{read_mono_f32, MonoWriter};
 
 /// Sample rate everything here operates at (the pipeline's capture rate).
 const RATE: u32 = 16_000;
@@ -130,46 +132,17 @@ pub enum ApplyScope {
     Ranges(Vec<EchoWindow>),
 }
 
-/// Read a WAV as mono f32 in [-1, 1]. Multi-channel files downmix to channel 0
-/// (the capture path is already mono; this just defensive). Returns the spec
-/// so the caller can sanity-check the sample rate.
-fn read_wav_mono_f32(path: &str) -> Result<(WavSpec, Vec<f32>), String> {
-    let mut reader = WavReader::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
-    let spec = reader.spec();
-    let ch = spec.channels.max(1) as usize;
-    let raw: Vec<f32> = match spec.sample_format {
-        SampleFormat::Int => reader
-            .samples::<i16>()
-            .map(|s| s.map(|v| v as f32 / 32768.0).unwrap_or(0.0))
-            .collect(),
-        SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
-    };
-    let mono = if ch == 1 {
-        raw
-    } else {
-        raw.into_iter().step_by(ch).collect()
-    };
-    Ok((spec, mono))
-}
-
-/// Write 16 kHz mono i16 PCM WAV (the format the rest of the pipeline expects).
-fn write_wav_mono_i16(path: &str, samples: &[f32]) -> Result<(), String> {
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate: RATE,
-        bits_per_sample: 16,
-        sample_format: SampleFormat::Int,
-    };
-    let mut writer = WavWriter::create(path, spec).map_err(|e| format!("create {path}: {e}"))?;
-    for &s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-        writer
-            .write_sample(v)
-            .map_err(|e| format!("write {path}: {e}"))?;
+/// Write 16 kHz mono i16 FLAC (the format the rest of the pipeline expects).
+fn write_mono_i16(path: &str, samples: &[f32]) -> Result<(), String> {
+    let mut writer = MonoWriter::create(Path::new(path))?;
+    for chunk in samples.chunks(RATE as usize) {
+        let pcm: Vec<i16> = chunk
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16)
+            .collect();
+        writer.write_samples(&pcm)?;
     }
-    writer
-        .finalize()
-        .map_err(|e| format!("finalize {path}: {e}"))?;
+    writer.finalize()?;
     Ok(())
 }
 
@@ -719,8 +692,9 @@ fn clean_samples(
     out
 }
 
-/// Run offline AEC on a `mic.wav` + `system.wav` pair and write the cleaned mic
-/// to `out_path` (16 kHz mono i16). `windows` are the learning regions (marked
+/// Run offline AEC on a mic + system recording pair (FLAC or legacy WAV) and
+/// write the cleaned mic to `out_path` as 16 kHz mono i16 FLAC. `windows` are
+/// the learning regions (marked
 /// echo); `apply` controls where the cleaned signal is written (see
 /// [`ApplyScope`]). `progress` receives a 0..=1 fraction. This is the entry
 /// point the `clean_echo` / `clean_echo_segment` commands call (under
@@ -733,18 +707,16 @@ pub fn clean(
     out_path: &str,
     progress: impl FnMut(f32),
 ) -> Result<(), String> {
-    let (mic_spec, mic) = read_wav_mono_f32(mic_path)?;
-    let (sys_spec, system) = read_wav_mono_f32(system_path)?;
-    if mic_spec.sample_rate != RATE {
+    let (mic_rate, mic) = read_mono_f32(mic_path)?;
+    let (sys_rate, system) = read_mono_f32(system_path)?;
+    if mic_rate != RATE {
         return Err(format!(
-            "mic.wav must be {RATE} Hz (got {}); the offline AEC expects the pipeline's 16 kHz output",
-            mic_spec.sample_rate
+            "mic recording must be {RATE} Hz (got {mic_rate}); the offline AEC expects the pipeline's 16 kHz output"
         ));
     }
-    if sys_spec.sample_rate != RATE {
+    if sys_rate != RATE {
         return Err(format!(
-            "system.wav must be {RATE} Hz (got {})",
-            sys_spec.sample_rate
+            "system recording must be {RATE} Hz (got {sys_rate})"
         ));
     }
     let apply_desc = match apply {
@@ -760,7 +732,7 @@ pub fn clean(
         windows.len(),
     );
     let cleaned = clean_samples(&mic, &system, windows, apply, progress);
-    write_wav_mono_i16(out_path, &cleaned)?;
+    write_mono_i16(out_path, &cleaned)?;
     eprintln!(
         "[offline_aec] wrote {} cleaned samples ({:.1}s) to {out_path}",
         cleaned.len(),

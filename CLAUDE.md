@@ -67,8 +67,8 @@ CI note: `ci.yml` stubs the `llama-server` sidecar (an empty file satisfies
 ## Architecture
 
 ```
-Mic ─────────► Capture (Rust/Core Audio) ── mic.wav ───► whisper-rs ─┐
-System audio ► (process tap, separate)  ── system.wav ► whisper-rs ─┤
+Mic ─────────► Capture (Rust/Core Audio) ── mic.flac ──► whisper-rs ─┐
+System audio ► (process tap, separate)  ── system.flac► whisper-rs ─┤
                                              │                       ├─► merge ─► SQLite ◄─► UI
                                              └─► sherpa-onnx diarize ┘             │
                                                 (system channel only)              └─► Ollama (localhost)
@@ -82,7 +82,7 @@ labels (renamable per meeting). Channels are never mixed before ASR.
 | Module        | Purpose                                                                                                                                                           |
 | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `commands`    | All Tauri IPC commands (thin wrappers — parse/validate, call module, map errors to strings)                                                                       |
-| `audio`       | Dual-source capture: mic + Core Audio process tap, 16 kHz mono WAV per channel                                                                                    |
+| `audio`       | Dual-source capture: mic + Core Audio process tap, 16 kHz mono FLAC per channel (`codec.rs`; legacy `.wav` still readable, `migrate.rs` converts it)              |
 | `permissions` | TCC status/request helpers for microphone + system audio                                                                                                          |
 | `asr`         | whisper-rs transcription (Metal), context reuse, silence-based chunking                                                                                           |
 | `models`      | ML model registry + downloader with progress events                                                                                                               |
@@ -199,6 +199,15 @@ handlers. Single `Mutex<Connection>`. Migrations via `PRAGMA user_version`.
     Apple's voice processing can't reference other apps' audio. The
     system-audio stream is the render reference. Both signals must be
     16 kHz mono, 10 ms frames.
+
+11. **Recordings are FLAC, read/written only via `audio::codec`.**
+    `MonoWriter` streams libFLAC to disk during capture (always `finalize`,
+    that is what patches the duration WebKit reads); `read_mono_f32`
+    decodes `.flac` (claxon) or legacy `.wav` (hound) by extension. The DB
+    columns and Rust/TS fields keep their `*_wav` names on purpose (no
+    schema migration); the extension is the only format signal.
+    `audio::migrate` converts pre-0.3 WAVs in the background at startup.
+    Never open a recording with `hound` directly outside `codec.rs`.
 
 ## MCP server (local AI agents)
 

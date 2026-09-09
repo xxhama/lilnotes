@@ -1,5 +1,5 @@
 //! Per-channel processing pipeline: mono input at native rate ->
-//! resample to 16 kHz -> soft limiter -> WAV on disk (+ level meters,
+//! resample to 16 kHz -> soft limiter -> FLAC on disk (+ level meters,
 //! + optional live feed for the ASR stage in milestone 3).
 
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 
 use super::aec::{AecProcessor, AecRenderFeeder};
+use super::codec::MonoWriter;
 use super::resampler::{StreamingResampler, TARGET_RATE};
 
 /// Which capture source a chunk came from.
@@ -53,7 +54,7 @@ impl ChannelMeters {
 
 pub struct ChannelPipeline {
     resampler: StreamingResampler,
-    writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    writer: MonoWriter,
     path: PathBuf,
     meters: Arc<ChannelMeters>,
     source: Source,
@@ -82,14 +83,7 @@ impl ChannelPipeline {
         aec_capture: Option<AecProcessor>,
         aec_render: Option<AecRenderFeeder>,
     ) -> Result<Self, String> {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: TARGET_RATE,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let writer = hound::WavWriter::create(path, spec)
-            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+        let writer = MonoWriter::create(path)?;
         Ok(Self {
             resampler: StreamingResampler::new(in_rate),
             writer,
@@ -131,7 +125,7 @@ impl ChannelPipeline {
         // AEC integration:
         // - System path (render/reference): feed the raw 16 kHz samples to the
         //   shared APM's render path, then soft-limit + write as usual. The
-        //   system WAV/ASR are unchanged — AEC only affects the mic.
+        //   system recording/ASR are unchanged — AEC only affects the mic.
         // - Mic path (capture/forward): run the 16 kHz samples through the
         //   APM capture path (echo cancellation + NS + HPF), then soft-limit +
         //   write the cleaned output. The output length may differ from the
@@ -165,12 +159,11 @@ impl ChannelPipeline {
             passthrough
         };
 
-        for &s in &processed {
-            let v = (s * i16::MAX as f32) as i16;
-            self.writer
-                .write_sample(v)
-                .map_err(|e| format!("wav write failed: {e}"))?;
-        }
+        let pcm: Vec<i16> = processed
+            .iter()
+            .map(|&s| (s * i16::MAX as f32) as i16)
+            .collect();
+        self.writer.write_samples(&pcm)?;
         self.frames_written += processed.len() as u64;
 
         if let Some(tx) = &self.live_tx {
@@ -194,17 +187,16 @@ impl ChannelPipeline {
         // zero-padded and processed — otherwise the tail of the mic would be
         // lost. The render side is flushed too (no output, just drains).
         // Flush errors are logged, not fatal — losing the tail (< 10 ms) is
-        // better than failing to finalize the WAV.
+        // better than failing to finalize the recording.
         if let Some(capture) = &mut self.aec_capture {
             if !self.aec_failed {
                 match capture.flush() {
                     Ok(tail) => {
-                        for &s in &tail {
-                            let v = (soft_limit(s) * i16::MAX as f32) as i16;
-                            self.writer
-                                .write_sample(v)
-                                .map_err(|e| format!("wav write failed: {e}"))?;
-                        }
+                        let pcm: Vec<i16> = tail
+                            .iter()
+                            .map(|&s| (soft_limit(s) * i16::MAX as f32) as i16)
+                            .collect();
+                        self.writer.write_samples(&pcm)?;
                         self.frames_written += tail.len() as u64;
                     }
                     Err(e) => eprintln!("[aec] capture flush error (tail lost): {e}"),
@@ -226,9 +218,7 @@ impl ChannelPipeline {
                 }
             }
         }
-        self.writer
-            .finalize()
-            .map_err(|e| format!("wav finalize failed: {e}"))?;
+        self.writer.finalize()?;
         Ok(self.path)
     }
 }

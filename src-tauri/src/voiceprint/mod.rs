@@ -102,14 +102,8 @@ impl VoiceprintEngine {
     ) -> Result<HashMap<String, SpeakerEmbedding>, String> {
         self.ensure_loaded(app)?;
 
-        let mut reader = hound::WavReader::open(system_wav_path)
-            .map_err(|e| format!("cannot open {system_wav_path}: {e}"))?;
-        let samples: Vec<f32> = reader
-            .samples::<i16>()
-            .map(|s| s.map(|v| v as f32 / 32768.0))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("cannot read {system_wav_path}: {e}"))?;
-        let sample_rate = reader.spec().sample_rate as usize;
+        let (sample_rate, samples) = crate::audio::codec::read_mono_f32(system_wav_path)?;
+        let sample_rate = sample_rate as usize;
 
         // Group turns by speaker and concatenate their samples.
         let mut by_speaker: HashMap<&str, (Vec<f32>, u64)> = HashMap::new();
@@ -149,7 +143,7 @@ impl VoiceprintEngine {
     }
 
     /// Compute a single L2-normalized embedding from raw mono samples in
-    /// memory (no WAV file needed). Returns `Ok(None)` if the buffer is
+    /// memory (no audio file needed). Returns `Ok(None)` if the buffer is
     /// shorter than `MIN_SPEECH_MS` so callers can skip unreliable short
     /// clips without erroring. Used by the live identification path.
     pub fn embed_samples(

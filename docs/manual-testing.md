@@ -16,10 +16,10 @@ round-trip latency and echoed message.
 1. Go to **Record** and hit the record button. Approve the Microphone prompt,
    then the System Audio Recording prompt (first run only).
 2. Talk, and play something (music, a video) so both meters move.
-3. Stop. The recording card shows the two WAV paths under
+3. Stop. The recording card shows the two recording paths under
    `~/Library/Application Support/com.lilnotes/recordings/<session>/`.
-4. Inspect: `afinfo mic.wav system.wav` (both 16 kHz mono 16-bit) and play
-   them. `mic.wav` should contain only your voice, `system.wav` only the
+4. Inspect: `afinfo mic.flac system.flac` (both 16 kHz mono 16-bit) and play
+   them. `mic.flac` should contain only your voice, `system.flac` only the
    playback.
 
 Troubleshooting:
@@ -32,11 +32,11 @@ Troubleshooting:
 - _Re-test the prompts:_ `tccutil reset Microphone com.lilnotes.dev` and
   `tccutil reset SystemAudioCaptureRequests com.lilnotes.dev` (release
   builds: `com.lilnotes`).
-- _system.wav is silent:_ something must actually be playing to the default
+- _system.flac is silent:_ something must actually be playing to the default
   output device (the tap follows the default output).
 
 Echo cancellation: with speakers on, a remote voice should not appear in
-`mic.wav`. The AEC uses the system track as its reference; if it cannot
+`mic.flac`. The AEC uses the system track as its reference; if it cannot
 initialise, capture falls back to the raw mic and logs a line saying so.
 
 ## Transcription
@@ -73,7 +73,7 @@ initialise, capture falls back to the raw mic and logs a line saying so.
    hovering a row reveals delete.
 4. Settings → Recording: change the recordings folder (new sessions land
    there) and enable "Delete audio after transcription". After the next
-   recording finishes processing, its WAVs are gone and the detail page
+   recording finishes processing, its audio files are gone and the detail page
    shows an "audio deleted" badge.
 
 ## Summaries

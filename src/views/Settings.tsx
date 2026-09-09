@@ -44,6 +44,7 @@ import {
   listAsrModels,
   mcpStatus,
   micPermissionStatus,
+  onAudioMigrationProgress,
   onModelProgress,
   openPrivacySettings,
   probeSystemAudioPermission,
@@ -53,6 +54,7 @@ import {
   type AecAggressiveness,
   type AppSettings,
   type AsrModelInfo,
+  type AudioMigrationProgress,
   type DownloadProgress,
   type McpStatus,
   type PermissionStatus,
@@ -175,6 +177,11 @@ export default function SettingsView() {
     const id = setInterval(refreshMcp, 5000);
     return () => clearInterval(id);
   }, [settings?.mcpEnabled, refreshMcp]);
+
+  /** One-time WAV → FLAC conversion of pre-0.3 recordings (runs in the
+   * background after launch). Null until the backend reports anything. */
+  const [audioMigration, setAudioMigration] = useState<AudioMigrationProgress | null>(null);
+  useTauriEvent(onAudioMigrationProgress, setAudioMigration);
 
   useTauriEvent(onModelProgress, (p) => {
     setProgress((prev) => ({ ...prev, [p.id]: p }));
@@ -838,6 +845,20 @@ export default function SettingsView() {
               <p className="truncate text-xs text-muted-foreground" data-selectable>
                 {settings?.storageDir ?? "Default (app data folder)"}
               </p>
+              {audioMigration && audioMigration.done < audioMigration.total && (
+                <p className="text-xs text-muted-foreground">
+                  Converting older recordings to FLAC… {audioMigration.done}/{audioMigration.total}
+                </p>
+              )}
+              {audioMigration &&
+                audioMigration.done === audioMigration.total &&
+                audioMigration.failed > 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    {audioMigration.failed} older recording
+                    {audioMigration.failed === 1 ? "" : "s"} could not be converted to FLAC and stay
+                    as WAV.
+                  </p>
+                )}
             </div>
             <div className="flex shrink-0 gap-2">
               <Button
@@ -869,7 +890,7 @@ export default function SettingsView() {
             <div className="space-y-0.5">
               <div className="text-sm font-medium">Delete audio after transcription</div>
               <p className="text-xs text-muted-foreground">
-                Remove the WAV files once a meeting is transcribed and speakers are identified.
+                Remove the audio files once a meeting is transcribed and speakers are identified.
                 Saves disk space; you can't re-transcribe.
               </p>
             </div>

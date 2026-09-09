@@ -3,7 +3,7 @@
 //! Drives the exact production capture path (`audio::system_tap`) without the
 //! UI: plays a system sound through the default output while tapping system
 //! audio for a few seconds, then reports live meter readings and the RMS of
-//! the captured WAV. Use it to check whether the current launch context
+//! the captured FLAC. Use it to check whether the current launch context
 //! (bare binary, app bundle, LaunchServices) actually receives system audio
 //! from TCC, independent of the app window.
 //!
@@ -17,11 +17,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use lilnotes_lib::audio::codec;
 use lilnotes_lib::audio::pipeline::{ChannelMeters, LiveChunk};
 use lilnotes_lib::audio::system_tap;
 
 fn main() {
-    let wav_path = std::env::temp_dir().join("lilnotes_tap_probe.wav");
+    let wav_path = std::env::temp_dir().join("lilnotes_tap_probe.flac");
     let _ = std::fs::remove_file(&wav_path);
 
     // Keep the default output busy so the tap has something to hear.
@@ -73,17 +74,16 @@ fn main() {
         .expect("capture thread errored");
     let _ = player.join();
 
-    let mut reader = hound::WavReader::open(&path).expect("open captured wav");
-    let (sum_sq, n) = reader
-        .samples::<i16>()
-        .map(|s| s.unwrap() as f64 / i16::MAX as f64)
-        .fold((0f64, 0u64), |(sq, n), s| (sq + s * s, n + 1));
+    let (_, samples) =
+        codec::read_mono_f32(&path.to_string_lossy()).expect("open captured recording");
+    let n = samples.len();
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
     let rms = if n > 0 {
         (sum_sq / n as f64).sqrt()
     } else {
         0.0
     };
-    println!("wav: {} samples, rms={rms:.6} ({})", n, path.display());
+    println!("flac: {} samples, rms={rms:.6} ({})", n, path.display());
 
     if rms < 1e-5 {
         println!("verdict: SILENCE — tap ran but delivered zeros");

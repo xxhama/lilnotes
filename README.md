@@ -139,8 +139,8 @@ server only runs while LilNotes is open (including hidden in the menu bar).
 ## How it works
 
 ```
-Mic ─────────► Capture (Rust/Core Audio) ── mic.wav ───► whisper.cpp ─┐
-System audio ► (process tap, separate)  ── system.wav ► whisper.cpp ─┤
+Mic ─────────► Capture (Rust/Core Audio) ── mic.flac ──► whisper.cpp ─┐
+System audio ► (process tap, separate)  ── system.flac► whisper.cpp ─┤
                                              │                       ├─► merge ─► SQLite ◄─► UI
                                              └─► sherpa-onnx diarize ┘  (SQLCipher)  │
                                                 (system channel only)               └─► llama.cpp sidecar
@@ -150,7 +150,7 @@ System audio ► (process tap, separate)  ── system.wav ► whisper.cpp ─�
 - **Shell:** [Tauri v2](https://tauri.app) (Rust core; React + TypeScript +
   Tailwind + shadcn/ui front-end).
 - **Capture:** a Core Audio process tap for system audio plus the mic, each
-  written as 16 kHz mono WAV. The two are never mixed before transcription.
+  written as 16 kHz mono FLAC (lossless). The two are never mixed before transcription.
   Mic segments are labelled **Me**; system-channel segments get diarized
   speaker labels, renamable per meeting.
 - **Echo cancellation:** WebRTC AudioProcessing (AEC3), with the system

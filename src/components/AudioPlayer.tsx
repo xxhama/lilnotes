@@ -13,9 +13,9 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 interface Props {
-  /** Filesystem path to the mic ("Me") WAV. */
+  /** Filesystem path to the mic ("Me") recording (FLAC; legacy WAV). */
   micWav: string;
-  /** Filesystem path to the system (remote speakers) WAV. */
+  /** Filesystem path to the system (remote speakers) recording. */
   systemWav: string;
   /** Seek request from a transcript timestamp click. A new object (new `n`)
    * re-triggers the seek even when `ms` is unchanged, so clicking the same
@@ -39,7 +39,7 @@ function fmtSecs(s: number): string {
 }
 
 /**
- * Plays the meeting's mic + system WAVs simultaneously over one shared
+ * Plays the meeting's mic + system recordings simultaneously over one shared
  * timeline. Both files share t=0 = recording start, so a segment's startMs
  * maps to the same offset in both. The channel with the longer duration is
  * the "leader" — its timeupdate drives the readout + transcript sync, so the
