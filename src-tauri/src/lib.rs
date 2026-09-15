@@ -98,6 +98,9 @@ pub fn run() {
                 .output();
 
             let data_dir = app.path().app_data_dir()?;
+            // Playback WAVs are transient copies of the FLAC recordings;
+            // start every launch with an empty cache.
+            audio::playback::clear_all(&audio::playback::cache_root(&data_dir));
 
             // Lazy DB: for returning users (DB file exists) we open eagerly
             // so the keychain access is silent. For new users we defer to
@@ -138,6 +141,7 @@ pub fn run() {
             commands::diarize_meeting,
             commands::list_meetings,
             commands::get_meeting,
+            commands::prepare_playback_audio,
             commands::list_hidden_segments,
             commands::mark_segment_echo,
             commands::unmark_segment_echo,

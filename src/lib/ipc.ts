@@ -379,6 +379,23 @@ export function getMeeting(meetingId: number): Promise<MeetingDetail> {
   return invoke<MeetingDetail>("get_meeting", { meetingId });
 }
 
+/** Paths the audio player should load (mic = echo-cleaned when present). */
+export interface PlaybackAudio {
+  micWav: string;
+  systemWav: string;
+}
+
+/** Decode a meeting's FLAC channels into constant-bitrate WAVs in the
+ * playback cache under the app data dir. WebKit streams the recordings
+ * through AVFoundation in imprecise-timing mode, which seeks a variable-
+ * bitrate FLAC by byte estimate and lands seconds off (and differently per
+ * channel); a WAV seeks exactly. Cheap on a cache hit; legacy `.wav` paths
+ * come back unchanged. The returned paths change whenever the source files
+ * do (echo clean / revert), so re-run after those. */
+export function preparePlaybackAudio(meetingId: number): Promise<PlaybackAudio> {
+  return invoke<PlaybackAudio>("prepare_playback_audio", { meetingId });
+}
+
 /** Every segment for a meeting including echo-marked + soft-deleted ones, for
  * the "show hidden" transcript toggle. */
 export function listHiddenSegments(meetingId: number): Promise<TranscriptSegment[]> {

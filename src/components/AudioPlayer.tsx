@@ -13,10 +13,12 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 interface Props {
-  /** Filesystem path to the mic ("Me") recording (FLAC; legacy WAV). */
-  micWav: string;
-  /** Filesystem path to the system (remote speakers) recording. */
-  systemWav: string;
+  /** Filesystem path to the mic ("Me") WAV from `preparePlaybackAudio`
+   * (constant bitrate, so WebKit/AVFoundation seeks it exactly). Null while
+   * it is still being prepared: the player renders disabled with a spinner. */
+  micWav: string | null;
+  /** Filesystem path to the system (remote speakers) WAV; null while preparing. */
+  systemWav: string | null;
   /** Seek request from a transcript timestamp click. A new object (new `n`)
    * re-triggers the seek even when `ms` is unchanged, so clicking the same
    * segment twice replays from that point. */
@@ -77,8 +79,11 @@ export default function AudioPlayer({ micWav, systemWav, seek, onTimeUpdate }: P
   const rafRef = useRef<number | null>(null);
   const draggingRef = useRef(false);
 
-  const micSrc = convertFileSrc(micWav);
-  const systemSrc = convertFileSrc(systemWav);
+  // No `src` at all while the sources are being prepared (an empty string
+  // would make WebKit try to load the page URL as media).
+  const loading = !micWav || !systemWav;
+  const micSrc = micWav ? convertFileSrc(micWav) : undefined;
+  const systemSrc = systemWav ? convertFileSrc(systemWav) : undefined;
 
   const leaderEl = (): HTMLAudioElement | null =>
     leader === "mic" ? micRef.current : systemRef.current;
@@ -172,6 +177,17 @@ export default function AudioPlayer({ micWav, systemWav, seek, onTimeUpdate }: P
     play();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seek]);
+
+  // Sources withdrawn (meeting switch, re-prepare): drop the previous
+  // timeline so the scrubber doesn't show a stale duration while the new
+  // metadata loads. `onLoadedMetadata` repopulates it.
+  useEffect(() => {
+    if (!loading) return;
+    setIsPlaying(false);
+    setLeader(null);
+    setDuration(0);
+    setCurrentTime(0);
+  }, [loading]);
 
   // Pause on unmount so audio doesn't keep playing after navigating away.
   useEffect(() => {
@@ -352,7 +368,7 @@ export default function AudioPlayer({ micWav, systemWav, seek, onTimeUpdate }: P
               aria-label={isPlaying ? "Pause" : "Play"}
               className="size-10 rounded-full bg-secondary text-secondary-foreground hover:bg-secondary/80"
             >
-              {waiting && !isPlaying ? (
+              {loading || (waiting && !isPlaying) ? (
                 <Loader2 className="size-5 animate-spin" />
               ) : isPlaying ? (
                 <Pause className="size-5" />

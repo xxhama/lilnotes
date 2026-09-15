@@ -208,6 +208,13 @@ handlers. Single `Mutex<Connection>`. Migrations via `PRAGMA user_version`.
     schema migration); the extension is the only format signal.
     `audio::migrate` converts pre-0.3 WAVs in the background at startup.
     Never open a recording with `hound` directly outside `codec.rs`.
+    **Never hand a FLAC to the `<audio>` player.** WebKit streams `asset:`
+    media through AVFoundation in imprecise-timing mode, which seeks a
+    variable-bitrate FLAC by byte estimate: transcript clicks land seconds
+    off and the two channels drift apart. `prepare_playback_audio`
+    (`audio::playback`) decodes the channels into content-keyed,
+    constant-bitrate WAVs under `<app data>/playback-cache/<meeting id>/`
+    (wiped at startup, 3 meetings max) and the player loads those.
 
 ## MCP server (local AI agents)
 
