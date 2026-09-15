@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: mini-runners
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -105,7 +105,7 @@ jobs:
   # Linux in about a minute. Tool versions are pinned so the generated text
   # is byte-stable across runs.
   licenses:
-    runs-on: ubuntu-latest
+    runs-on: mini-runners
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5

@@ -51,7 +51,7 @@ concurrency:
 jobs:
   release-please:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: mini-runners
     timeout-minutes: 10
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
@@ -75,7 +75,7 @@ jobs:
   sync-cargo-lock:
     needs: [release-please]
     if: needs.release-please.outputs.prs_created == 'true' && needs.release-please.outputs.pr != ''
-    runs-on: ubuntu-latest
+    runs-on: mini-runners
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
