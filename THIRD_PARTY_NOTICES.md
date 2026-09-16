@@ -638,7 +638,7 @@ OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ### GNU Affero General Public License v3.0 only
 
 Used by:
-- lilnotes 0.2.0 — <https://github.com/xxhama/lilnotes>
+- lilnotes 0.3.0 — <https://github.com/xxhama/lilnotes>
 
 ```
 GNU AFFERO GENERAL PUBLIC LICENSE
