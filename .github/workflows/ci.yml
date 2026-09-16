@@ -20,7 +20,7 @@ jobs:
     runs-on: mini-runners
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version-file: .nvmrc
@@ -43,7 +43,7 @@ jobs:
       # key, so changing this rolls the cache once.)
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install meson/ninja (webrtc-audio-processing build deps)
         run: brew install meson ninja pkg-config
       - uses: dtolnay/rust-toolchain@stable
@@ -108,7 +108,7 @@ jobs:
     runs-on: mini-runners
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version-file: .nvmrc
@@ -138,7 +138,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache llama.cpp build
         id: llama
