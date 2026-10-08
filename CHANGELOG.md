@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/xxhama/lilnotes/compare/v0.3.0...v0.3.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* play decoded WAV copies so transcript clicks seek exactly ([#36](https://github.com/xxhama/lilnotes/issues/36)) ([c06d10b](https://github.com/xxhama/lilnotes/commit/c06d10b80267c973971094c53cd6d082f64bdfce))
+
 ## [0.3.0](https://github.com/xxhama/lilnotes/compare/v0.2.0...v0.3.0) (2026-09-09)
 
 
