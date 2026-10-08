@@ -50,10 +50,20 @@ version fields or push `v*` tags by hand.** To force a specific version, use
 an empty commit: `git commit --allow-empty -m "chore: release 0.3.0" -m
 "Release-As: 0.3.0"`.
 
-The GitHub Release is published (and tagged) by release-please itself;
-the DMG lands a few minutes later. Do not switch it to `draft: true`: a
-draft has no tag, so release-please would not see it as the latest release
-and would open a bogus follow-up release PR.
+release-please creates the GitHub Release as a **draft** and pushes the
+tag immediately (`"draft": true` + `"force-tag-creation": true` in
+`release-please-config.json`). Keep both: a draft without a forced tag has
+no git tag, so the next run would not find the latest release and would open
+a bogus follow-up release PR. `build` (read-only token) makes the DMG and its
+provenance attestation; `publish` (the only job with `contents: write`)
+uploads assets + install notes (`.github/release-install-notes.md`) and only
+then publishes the draft, so a public release never lacks its DMG. A failed
+build leaves the draft unpublished: fix it, then run the Release workflow
+manually (`workflow_dispatch`) with that tag.
+
+PR titles are checked by `.github/workflows/pr-title.yml`. All actions are
+pinned to commit SHAs with a `# vX.Y.Z` comment; keep it that way when
+adding one.
 
 **Merge PRs with squash** (`gh pr merge --squash`), using a conventional PR
 title. A merge commit whose PR title is conventional makes release-please

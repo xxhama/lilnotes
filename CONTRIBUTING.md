@@ -106,7 +106,8 @@ title** must use a type prefix:
 | `docs:`, `chore:`, `ci:`, `refactor:`, `test:` | no release                          |
 
 PRs are squash-merged, so individual commit messages on the branch can be
-informal; the PR title becomes the changelog line. Never edit version
+informal; the PR title becomes the changelog line. A CI check (`PR title`)
+fails until the title has a valid prefix; editing the title re-runs it. Never edit version
 numbers or push `v*` tags by hand; release-please owns them.
 
 Keep PRs focused. A PR that fixes a bug and also reformats unrelated files is
