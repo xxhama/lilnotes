@@ -11,6 +11,7 @@ pub mod mic;
 pub mod migrate;
 pub mod offline_aec;
 pub mod pipeline;
+pub mod playback;
 pub mod resampler;
 pub mod system_tap;
 

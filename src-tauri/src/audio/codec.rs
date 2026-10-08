@@ -15,6 +15,10 @@
 //!   extension is the only format signal; keep WAV reading around forever.
 //! - [`convert_wav_to_flac`] is the one-time migration primitive used by
 //!   `audio::migrate` for recordings that predate FLAC.
+//! - [`transcode_flac_to_wav`] is the inverse, used by `audio::playback` to
+//!   hand the webview a constant-bitrate WAV: AVFoundation seeks FLAC by
+//!   byte-offset estimation when WebKit streams it, which lands seconds off
+//!   in a variable-bitrate speech recording.
 //!
 //! A crash mid-recording leaves a FLAC whose STREAMINFO still says
 //! `total_samples = 0` and possibly a truncated last frame. The frames before
@@ -254,6 +258,58 @@ pub fn convert_wav_to_flac(src: &Path) -> Result<PathBuf, String> {
     Ok(dst)
 }
 
+/// Decode a FLAC channel file to a 16 kHz mono i16 WAV at `dst`, streaming
+/// block by block (a multi-hour file is never held in memory). Anything that
+/// is not 16 kHz 16-bit is an error, not converted. Returns the number of
+/// samples written. On error the partial `dst` is left for the caller to
+/// remove (it typically writes to a temp name and renames on success).
+pub fn transcode_flac_to_wav(src: &Path, dst: &Path) -> Result<u64, String> {
+    let mut reader =
+        claxon::FlacReader::open(src).map_err(|e| format!("cannot open {}: {e}", src.display()))?;
+    let info = reader.streaminfo();
+    if info.sample_rate != TARGET_RATE || info.bits_per_sample != 16 {
+        return Err(format!(
+            "{}: expected {TARGET_RATE} Hz 16-bit FLAC, got {} Hz {}-bit",
+            src.display(),
+            info.sample_rate,
+            info.bits_per_sample
+        ));
+    }
+    let channels = info.channels.max(1) as usize;
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: TARGET_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(dst, spec)
+        .map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+    let mut frames = reader.blocks();
+    let mut buf = Vec::with_capacity(info.max_block_size as usize * channels);
+    let mut written = 0u64;
+    loop {
+        match frames.read_next_or_eof(buf) {
+            Ok(Some(block)) => {
+                let ch0 = block.channel(0);
+                let mut w = writer.get_i16_writer(ch0.len() as u32);
+                for &v in ch0 {
+                    w.write_sample(v as i16);
+                }
+                w.flush()
+                    .map_err(|e| format!("cannot write {}: {e}", dst.display()))?;
+                written += ch0.len() as u64;
+                buf = block.into_buffer();
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("cannot read {}: {e}", src.display())),
+        }
+    }
+    writer
+        .finalize()
+        .map_err(|e| format!("cannot finalize {}: {e}", dst.display()))?;
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +488,56 @@ mod tests {
         assert!(convert_wav_to_flac(&wav).is_err());
         assert!(!wav.with_extension("flac").exists());
         fs::remove_file(&wav).unwrap();
+    }
+
+    #[test]
+    fn transcode_flac_to_wav_round_trips() {
+        let flac = temp_path("to-wav.flac");
+        let wav = temp_path("to-wav.wav");
+        let pcm = pattern(50_000);
+        write_flac(&flac, &pcm);
+        assert_eq!(
+            transcode_flac_to_wav(&flac, &wav).unwrap(),
+            pcm.len() as u64
+        );
+        let (rate, read) = read_mono_f32(&wav.to_string_lossy()).unwrap();
+        assert_eq!(rate, TARGET_RATE);
+        assert_matches(&read, &pcm);
+        let spec = hound::WavReader::open(&wav).unwrap().spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, TARGET_RATE);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        // Constant bitrate is the whole point: header + 2 bytes per sample.
+        assert_eq!(fs::metadata(&wav).unwrap().len(), 44 + 2 * pcm.len() as u64);
+        fs::remove_file(&flac).unwrap();
+        fs::remove_file(&wav).unwrap();
+    }
+
+    #[test]
+    fn transcode_empty_flac_yields_empty_wav() {
+        let flac = temp_path("to-wav-empty.flac");
+        let wav = temp_path("to-wav-empty.wav");
+        write_flac(&flac, &[]);
+        assert_eq!(transcode_flac_to_wav(&flac, &wav).unwrap(), 0);
+        let (_, read) = read_mono_f32(&wav.to_string_lossy()).unwrap();
+        assert!(read.is_empty());
+        fs::remove_file(&flac).unwrap();
+        fs::remove_file(&wav).unwrap();
+    }
+
+    #[test]
+    fn transcode_truncated_flac_is_an_error() {
+        let flac = temp_path("to-wav-truncated.flac");
+        let wav = temp_path("to-wav-truncated.wav");
+        write_flac(&flac, &pattern(30_000));
+        let len = fs::metadata(&flac).unwrap().len();
+        let f = fs::OpenOptions::new().write(true).open(&flac).unwrap();
+        f.set_len(len * 2 / 3).unwrap();
+        drop(f);
+        assert!(transcode_flac_to_wav(&flac, &wav).is_err());
+        fs::remove_file(&flac).unwrap();
+        let _ = fs::remove_file(&wav);
     }
 
     #[test]

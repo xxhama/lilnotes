@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::asr::{chunker, AsrEngine, Segment};
-use crate::audio::{offline_aec, CaptureEngine, StartedRecording};
+use crate::audio::{offline_aec, playback, CaptureEngine, StartedRecording};
 use crate::db::{
     CustomerDetail, CustomerRollupRow, CustomerSearchResult, CustomerSummary, LazyDb,
     MeetingDetail, MeetingSummary, Persona,
@@ -154,6 +154,16 @@ fn session_dir(app: &AppHandle, settings: &AppSettings) -> Result<std::path::Pat
     };
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     Ok(base.join("recordings").join(stamp))
+}
+
+/// Playback cache root: always under the app data dir (inside the asset
+/// protocol scope), whatever `settings.storage_dir` says.
+fn playback_cache_root(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir: {e}"))?;
+    Ok(playback::cache_root(&data_dir))
 }
 
 /// Load `model_id` if present on disk. The model-id-override path used by
@@ -350,6 +360,31 @@ pub fn recording_status(engine: State<'_, CaptureEngine>) -> RecordingStatus {
     }
 }
 
+/// Paths the audio player should load for a meeting: the echo-cleaned mic
+/// when there is one (same preference as re-transcription), else the raw
+/// mic, plus the system channel — decoded from FLAC into constant-bitrate
+/// WAVs in the playback cache so the webview seeks exactly (see
+/// `audio::playback`). Cheap on a cache hit; a legacy `.wav` passes through.
+#[tauri::command]
+pub async fn prepare_playback_audio(
+    app: AppHandle,
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+) -> Result<playback::PlaybackAudio, String> {
+    let db = db.inner().clone();
+    let root = playback_cache_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let m = db.get_meeting(meeting_id)?;
+        let (mic, system) = match (m.mic_cleaned_wav.or(m.mic_wav), m.system_wav) {
+            (Some(mic), Some(system)) => (mic, system),
+            _ => return Err("this meeting's audio files have been deleted".into()),
+        };
+        playback::prepare(&root, meeting_id, &mic, &system)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Batch transcription of a persisted meeting's WAVs. Emits `asr:segment`
 /// events as it goes and saves the result.
 #[tauri::command]
@@ -467,6 +502,9 @@ pub async fn diarize_meeting(
                 let _ = std::fs::remove_file(&file);
             }
             db.clear_audio_paths(meeting_id)?;
+            if let Ok(root) = playback_cache_root(&app) {
+                playback::invalidate(&root, meeting_id);
+            }
             audio_deleted = true;
         }
 
@@ -1290,12 +1328,19 @@ pub fn unlink_speaker_persona(
 }
 
 /// Delete a meeting row; also removes its audio files (mic, system, and the
-/// echo-cleaned mic if any) from disk.
+/// echo-cleaned mic if any) from disk, plus its playback cache.
 #[tauri::command]
-pub fn delete_meeting(db: State<'_, Arc<LazyDb>>, meeting_id: i64) -> Result<(), String> {
+pub fn delete_meeting(
+    app: AppHandle,
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+) -> Result<(), String> {
     let paths = db.delete_meeting(meeting_id)?;
     for file in paths.iter() {
         let _ = std::fs::remove_file(file);
+    }
+    if let Ok(root) = playback_cache_root(&app) {
+        playback::invalidate(&root, meeting_id);
     }
     // Remove the (now likely empty) session directory. Non-recursive on
     // purpose: anything we don't know about stays.

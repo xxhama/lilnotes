@@ -62,6 +62,7 @@ import {
   onSpeakersIdentified,
   onVoiceprintsEnrolled,
   listAsrModels,
+  preparePlaybackAudio,
   renameSpeaker,
   retranscribeMeeting,
   restoreSegment,
@@ -76,6 +77,7 @@ import {
   type CustomerSummary,
   type MeetingDetail as Meeting,
   type Persona,
+  type PlaybackAudio,
   type TranscriptSegment,
 } from "@/lib/ipc";
 import type { Route } from "@/App";
@@ -156,6 +158,10 @@ export default function MeetingDetailView({
    * one) re-triggers the seek; use a counter+ms pair so repeated clicks on the
    * same segment still replay. */
   const [seek, setSeek] = useState<{ ms: number; n: number } | null>(null);
+  /** Player sources from `preparePlaybackAudio` (constant-bitrate WAVs the
+   * webview can seek exactly). Null until prepared for the current meeting;
+   * the player renders in its loading state meanwhile. */
+  const [playback, setPlayback] = useState<PlaybackAudio | null>(null);
   /** Leader playback position (ms) reported by the audio player so the
    * transcript can highlight + follow the active group. Null when idle. */
   const [currentMs, setCurrentMs] = useState<number | null>(null);
@@ -191,6 +197,34 @@ export default function MeetingDetailView({
   }, [id]);
 
   useEffect(reload, [reload]);
+
+  // Prepare the player's sources whenever the meeting (re)loads. Keyed on the
+  // meeting object so every reload after a clean-echo / revert / diarize
+  // re-checks the files; the backend keys cache names on the source files'
+  // mtime, so unchanged sources yield the same paths and `prev` is kept (no
+  // <audio> reload on a rename or notes save). Skipped while busy so the
+  // cleaned mic is never decoded mid-write.
+  useEffect(() => {
+    if (!meeting || meeting.id !== id || !meeting.micWav || !meeting.systemWav) {
+      setPlayback(null);
+      return;
+    }
+    if (busy !== null) return;
+    let cancelled = false;
+    preparePlaybackAudio(id)
+      .then((p) => {
+        if (cancelled) return;
+        setPlayback((prev) =>
+          prev && prev.micWav === p.micWav && prev.systemWav === p.systemWav ? prev : p,
+        );
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [meeting, busy, id]);
 
   // Load the whisper model registry once (drives the re-transcribe dropdown).
   useEffect(() => {
@@ -285,6 +319,7 @@ export default function MeetingDetailView({
     saveGen.current = 0;
     setSeek(null);
     setCurrentMs(null);
+    setPlayback(null);
     setShowHidden(false);
     if (saveTimer.current) {
       clearTimeout(saveTimer.current);
@@ -624,6 +659,8 @@ export default function MeetingDetailView({
 
   const hasTranscript = meeting.segments.length > 0;
   const hasAudio = Boolean(meeting.micWav && meeting.systemWav);
+  // Timestamp clicks are inert (not swallowed) until the sources are prepared.
+  const playerReady = hasAudio && playback !== null;
   const needsDiarization =
     hasTranscript && hasAudio && meeting.segments.some((s) => s.source === "system" && !s.speaker);
   const currentCustomer = customers.find((c) => c.id === meeting.customerId) ?? null;
@@ -929,9 +966,11 @@ export default function MeetingDetailView({
                 onUnlinkPersona={onUnlinkPersona}
                 onCreatePersona={onCreatePersona}
                 onSeek={
-                  hasAudio ? (ms) => setSeek((prev) => ({ ms, n: (prev?.n ?? 0) + 1 })) : undefined
+                  playerReady
+                    ? (ms) => setSeek((prev) => ({ ms, n: (prev?.n ?? 0) + 1 }))
+                    : undefined
                 }
-                currentMs={hasAudio ? (currentMs ?? undefined) : undefined}
+                currentMs={playerReady ? (currentMs ?? undefined) : undefined}
                 onMarkEcho={onMarkEcho}
                 onCleanEchoRange={onCleanEchoRange}
                 onDeleteSegment={onDeleteSegment}
@@ -955,11 +994,12 @@ export default function MeetingDetailView({
           so the Body (flex-1) above it shrinks to fit and nothing scrolls
           behind it. Visible on both Review and Transcript at every scroll
           position. Single instance; lifted playback state (seek/currentMs)
-          and tab-switch survival are unchanged. Gated on hasAudio only. */}
+          and tab-switch survival are unchanged. Gated on hasAudio only; the
+          sources arrive from `preparePlaybackAudio` (null = still decoding). */}
       {hasAudio && (
         <AudioPlayer
-          micWav={meeting.micCleanedWav ?? meeting.micWav!}
-          systemWav={meeting.systemWav!}
+          micWav={playback?.micWav ?? null}
+          systemWav={playback?.systemWav ?? null}
           seek={seek}
           onTimeUpdate={setCurrentMs}
         />
