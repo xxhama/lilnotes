@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 
-import PickerCombobox from "@/components/PickerCombobox";
+import PickerCombobox, { type PickerItem } from "@/components/PickerCombobox";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -11,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { Persona, SpeakerLink, TranscriptSegment } from "@/lib/ipc";
+import type { Persona, SpeakerCandidates, SpeakerLink, TranscriptSegment } from "@/lib/ipc";
 
 interface Props {
   segments: TranscriptSegment[];
@@ -26,6 +26,9 @@ interface Props {
   speakerLinks?: Record<string, SpeakerLink>;
   /** All personas for the picker's "choose different" list. */
   personas?: Persona[];
+  /** Voice matches + customer roster that rank the picker by relevance.
+   *  Omitted = a single alphabetical list. */
+  candidates?: SpeakerCandidates;
   onConfirmPersona?: (raw: string, personaId: number) => void;
   onUnlinkPersona?: (raw: string) => void;
   onCreatePersona?: (name: string) => Promise<number>;
@@ -90,12 +93,50 @@ function chipColor(raw: string, personaId: number | null = null): string {
   return CHIP_COLORS[Math.abs(hash) % CHIP_COLORS.length];
 }
 
+/** Picker rows for one speaker, most relevant first: personas whose voice
+ * matches this label ("Voice match", best score first), then people seen in
+ * this meeting's customer's meetings ("From <customer>", most meetings
+ * first), then everyone else alphabetically. Each persona appears once, in
+ * its highest section; the current link is excluded (shown as "Current"). */
+function orderPersonaItems(
+  personas: Persona[],
+  raw: string,
+  currentId: number | null,
+  candidates: SpeakerCandidates | undefined,
+): PickerItem[] {
+  const placed = new Set<number>(currentId != null ? [currentId] : []);
+  // Names come from the live persona list: candidates can lag a rename or
+  // delete, and a persona that no longer exists is skipped.
+  const byId = new Map(personas.map((p) => [p.id, p]));
+  const items: PickerItem[] = [];
+  const add = (id: number, sublabel: string, group: string) => {
+    const p = byId.get(id);
+    if (!p || placed.has(id)) return;
+    placed.add(id);
+    items.push({ id, label: p.displayName, sublabel, group });
+  };
+  for (const s of candidates?.voiceMatches[raw] ?? []) {
+    add(s.personaId, `${Math.round(s.score * 100)}%`, "Voice match");
+  }
+  if (candidates?.customerName) {
+    const group = `From ${candidates.customerName}`;
+    for (const r of candidates.customerRoster) {
+      add(r.personaId, `${r.meetingCount} mtgs`, group);
+    }
+  }
+  for (const p of personas) {
+    add(p.id, `${p.voiceprintCount} prints`, "All personas");
+  }
+  return items;
+}
+
 function SpeakerChip({
   segment,
   renames,
   onRename,
   speakerLinks,
   personas,
+  candidates,
   onConfirmPersona,
   onUnlinkPersona,
   onCreatePersona,
@@ -105,6 +146,7 @@ function SpeakerChip({
   onRename?: (raw: string, name: string) => void;
   speakerLinks?: Record<string, SpeakerLink>;
   personas?: Persona[];
+  candidates?: SpeakerCandidates;
   onConfirmPersona?: (raw: string, personaId: number) => void;
   onUnlinkPersona?: (raw: string) => void;
   onCreatePersona?: (name: string) => Promise<number>;
@@ -196,13 +238,7 @@ function SpeakerChip({
             {chipContent}
           </button>
         }
-        items={(personas ?? [])
-          .filter((p) => p.id !== link?.personaId)
-          .map((p) => ({
-            id: p.id,
-            label: p.displayName,
-            sublabel: `${p.voiceprintCount} prints`,
-          }))}
+        items={orderPersonaItems(personas ?? [], raw, link?.personaId ?? null, candidates)}
         currentId={link?.personaId ?? null}
         currentLabel={link?.personaName ?? undefined}
         currentSublabel={
@@ -330,6 +366,7 @@ export default function TranscriptPane({
   className,
   speakerLinks,
   personas,
+  candidates,
   onConfirmPersona,
   onUnlinkPersona,
   onCreatePersona,
@@ -472,6 +509,7 @@ export default function TranscriptPane({
                   onRename={onRenameSpeaker}
                   speakerLinks={speakerLinks}
                   personas={personas}
+                  candidates={candidates}
                   onConfirmPersona={onConfirmPersona}
                   onUnlinkPersona={onUnlinkPersona}
                   onCreatePersona={onCreatePersona}

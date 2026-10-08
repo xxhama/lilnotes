@@ -68,6 +68,7 @@ import {
   restoreSegment,
   revertEchoClean,
   setMeetingCustomer,
+  speakerPersonaCandidates,
   transcribeMeeting,
   unmarkSegmentEcho,
   unlinkSpeakerPersona,
@@ -78,6 +79,7 @@ import {
   type MeetingDetail as Meeting,
   type Persona,
   type PlaybackAudio,
+  type SpeakerCandidates,
   type TranscriptSegment,
 } from "@/lib/ipc";
 import type { Route } from "@/App";
@@ -145,6 +147,10 @@ export default function MeetingDetailView({
   /** "auto" or a declared remote-speaker count for re-identification. */
   const [numSpeakers, setNumSpeakers] = useState<string>("auto");
   const [personas, setPersonas] = useState<Persona[]>([]);
+  /** Voice matches + customer roster that rank the speaker picker. */
+  const [candidates, setCandidates] = useState<SpeakerCandidates | null>(null);
+  /** Bumped on speakers:identified (fresh embeddings) to refetch candidates. */
+  const [identifiedTick, setIdentifiedTick] = useState(0);
   const [customers, setCustomers] = useState<CustomerSummary[]>([]);
   const [assigning, setAssigning] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -340,6 +346,25 @@ export default function MeetingDetailView({
       .catch(() => {});
   }, []);
 
+  // Re-rank the speaker picker whenever its inputs change: the meeting's
+  // customer (roster), persona galleries (`personas` is refetched after every
+  // confirm / unlink / create / enrollment), or fresh speaker embeddings.
+  // Best-effort: on failure the picker falls back to the alphabetical list.
+  const customerId = meeting?.customerId;
+  useEffect(() => {
+    let cancelled = false;
+    speakerPersonaCandidates(id)
+      .then((c) => {
+        if (!cancelled) setCandidates(c);
+      })
+      .catch(() => {
+        if (!cancelled) setCandidates(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, customerId, personas, identifiedTick]);
+
   const assignCustomer = useCallback(
     async (customerId: number | null) => {
       setAssigning(true);
@@ -365,7 +390,9 @@ export default function MeetingDetailView({
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     onSpeakersIdentified(() => {
-      if (!cancelled) reload();
+      if (cancelled) return;
+      reload();
+      setIdentifiedTick((n) => n + 1);
     }).then((u) => {
       if (cancelled) u();
       else unlisten = u;
@@ -962,6 +989,7 @@ export default function MeetingDetailView({
                 onRenameSpeaker={onRename}
                 speakerLinks={meeting.speakerLinks}
                 personas={personas}
+                candidates={candidates ?? undefined}
                 onConfirmPersona={onConfirmPersona}
                 onUnlinkPersona={onUnlinkPersona}
                 onCreatePersona={onCreatePersona}

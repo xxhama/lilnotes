@@ -160,6 +160,72 @@ pub fn identify_and_persist(
     Ok(out)
 }
 
+/// What the speaker picker needs to rank personas by relevance instead of
+/// alphabetically. Returned by `speaker_persona_candidates`.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerCandidates {
+    /// raw label -> personas at/above the suggest threshold, best first.
+    pub voice_matches: HashMap<String, Vec<PersonaScore>>,
+    /// Name of the customer this meeting is assigned to, if any.
+    pub customer_name: Option<String>,
+    /// Personas confirmed in that customer's meetings (empty when unassigned).
+    pub customer_roster: Vec<crate::db::CustomerRosterEntry>,
+}
+
+/// Rank every persona against each label's embedding, keeping only those
+/// that clear the `suggest` threshold. Pure, so it's testable without a DB.
+fn voice_matches(
+    labels: &[(String, Vec<f32>)],
+    personas: &[PersonaWithEmbeddings],
+    auto: f32,
+    suggest: f32,
+) -> HashMap<String, Vec<PersonaScore>> {
+    labels
+        .iter()
+        .map(|(raw_label, emb)| {
+            let scores = rank_personas(personas, emb)
+                .into_iter()
+                .filter_map(|mut s| {
+                    s.tier = classify(s.score, auto, suggest);
+                    (s.tier != Tier::Unknown).then_some(s)
+                })
+                .collect();
+            (raw_label.clone(), scores)
+        })
+        .collect()
+}
+
+/// Score a meeting's speakers against every persona from the embeddings
+/// stored at identify time (no audio pass), plus the assigned customer's
+/// roster. Cheap enough to re-run whenever galleries or the customer change.
+pub fn speaker_candidates(
+    db: &Db,
+    meeting_id: i64,
+    settings: &AppSettings,
+) -> Result<SpeakerCandidates, String> {
+    let labels = db.meeting_speaker_embeddings(meeting_id)?;
+    let voice_matches = if labels.is_empty() {
+        HashMap::new()
+    } else {
+        voice_matches(
+            &labels,
+            &db.list_personas_with_voiceprints()?,
+            settings.persona_auto_threshold,
+            settings.persona_suggest_threshold,
+        )
+    };
+    let (customer_name, customer_roster) = match db.meeting_customer(meeting_id)? {
+        Some((id, name)) => (Some(name), db.customer_roster(id)?),
+        None => (None, Vec::new()),
+    };
+    Ok(SpeakerCandidates {
+        voice_matches,
+        customer_name,
+        customer_roster,
+    })
+}
+
 /// Fallback enrollment from audio, for a speaker with no embedding stored on
 /// its `speakers` row (identified before embeddings were persisted). The
 /// normal path is `Db::confirm_link`, which enrolls the stored embedding
@@ -252,6 +318,25 @@ mod tests {
         assert_eq!(ranked[0].persona_id, 1);
         assert!((ranked[0].score - 1.0).abs() < 1e-6);
         assert_eq!(ranked[1].persona_id, 2);
+    }
+
+    #[test]
+    fn voice_matches_drop_unknown_and_rank_best_first() {
+        let personas = vec![
+            persona(1, "A", &[&[0.6, 0.8]]), // 0.6 vs S1: suggest
+            persona(2, "B", &[&[1.0, 0.0]]), // 1.0 vs S1: auto
+            persona(3, "C", &[&[0.0, 1.0]]), // 0.0 vs S1: unknown
+        ];
+        let labels = vec![
+            ("S1".to_string(), vec![1.0, 0.0]),
+            ("S2".to_string(), vec![-1.0, 0.0]), // matches nobody
+        ];
+        let m = voice_matches(&labels, &personas, 0.65, 0.45);
+        let s1: Vec<i64> = m["S1"].iter().map(|s| s.persona_id).collect();
+        assert_eq!(s1, vec![2, 1]);
+        assert_eq!(m["S1"][0].tier, Tier::Auto);
+        assert_eq!(m["S1"][1].tier, Tier::Suggest);
+        assert!(m["S2"].is_empty());
     }
 
     #[test]

@@ -1241,6 +1241,22 @@ pub async fn identify_speakers(
     .map_err(|e| e.to_string())?
 }
 
+/// Relevance data for the speaker picker: per-label voice matches (scored
+/// from stored embeddings, no audio needed) and the meeting's customer
+/// roster. Read-only; never touches links.
+#[tauri::command]
+pub async fn speaker_persona_candidates(
+    db: State<'_, Arc<LazyDb>>,
+    meeting_id: i64,
+) -> Result<personas::SpeakerCandidates, String> {
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        personas::speaker_candidates(&db, meeting_id, &db.get_settings())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Confirm that `raw_label` in a meeting is `persona_id`. In one transaction:
 /// marks the link confirmed, drops any voiceprint previously enrolled from
 /// this speaker (so a changed mind doesn't leave the voice under the old
