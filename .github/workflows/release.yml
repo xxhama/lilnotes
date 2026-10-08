@@ -6,28 +6,39 @@ name: Release
 #      commits since the last tag (`feat:` → minor, `fix:` → patch, `feat!:`
 #      → minor while < 1.0), it opens/updates a "chore(main): release X.Y.Z"
 #      PR that bumps every version file (package.json, package-lock.json,
-#      src-tauri/tauri.conf.json, Cargo.toml, Cargo.lock) and CHANGELOG.md.
+#      src-tauri/tauri.conf.json, Cargo.toml) and CHANGELOG.md;
+#      `sync-cargo-lock` adds the matching Cargo.lock entry.
 #      Config: release-please-config.json + .release-please-manifest.json.
-#   2. Merging that PR runs release-please again; it tags vX.Y.Z and publishes
-#      the GitHub Release right away, and the `build` job below builds the DMG,
-#      uploads it + checksums, and appends the install notes (~10 min window
-#      without assets). The release must NOT be a draft: a draft has no git
-#      tag, so the next release-please run would not see it as the latest
-#      release and would open a bogus follow-up release PR.
-#   3. `workflow_dispatch` with an existing tag rebuilds and re-uploads the
-#      assets for that release (e.g. after a build-script fix).
+#   2. Merging that PR runs release-please again. It creates the vX.Y.Z
+#      release as a DRAFT (invisible to the public) and, because of
+#      `force-tag-creation`, pushes the vX.Y.Z tag right away. Without the
+#      forced tag a draft has no tag, and the next release-please run would
+#      not find the previous release and would open a bogus release PR.
+#   3. `build` compiles the DMG from the tagged commit with a read-only
+#      token and attests its build provenance. `publish` (the only job here
+#      that can write releases, and it runs no project code) uploads the
+#      DMG + checksums, appends .github/release-install-notes.md and
+#      publishes the draft. A failed build therefore leaves a draft, never a
+#      public "Latest" release without a download.
+#   4. `workflow_dispatch` with an existing tag rebuilds and re-uploads the
+#      assets for that release (e.g. to finish a draft whose build failed).
+#      It publishes the release if it is still a draft. With the repo's
+#      "immutable releases" setting on, assets of an already-published
+#      release cannot be replaced; ship a new patch release instead.
 #
-# Token: `RELEASE_PLEASE_TOKEN` (fine-grained PAT, contents + pull-requests
-# write) is optional. With the default GITHUB_TOKEN the release PR is created
-# fine but gets NO CI run (GitHub never triggers workflows on events made by
-# GITHUB_TOKEN); the PR only touches version files + CHANGELOG. The repo
-# setting "Allow GitHub Actions to create and approve pull requests" must be
-# enabled for the GITHUB_TOKEN path.
+# Token: `RELEASE_PLEASE_TOKEN` (fine-grained PAT or GitHub App token,
+# contents + pull-requests write) is optional. With the default GITHUB_TOKEN
+# the release PR is created fine but gets NO CI run (GitHub never triggers
+# workflows on events made by GITHUB_TOKEN); the PR only touches version
+# files + CHANGELOG. The repo setting "Allow GitHub Actions to create and
+# approve pull requests" must be enabled for the GITHUB_TOKEN path.
 #
 # The app is ad-hoc signed (no Apple Developer ID yet), so the release notes
 # include the Gatekeeper workaround users need on first launch. When a
-# Developer ID is available, add proper codesign + notarytool steps here and
-# in scripts/fix-bundle.sh.
+# Developer ID is available, add codesign + notarytool steps to the `build`
+# job (before "Attest build provenance") and to scripts/fix-bundle.sh.
+#
+# Actions are pinned to commit SHAs; Dependabot (github-actions) bumps them.
 
 on:
   push:
@@ -39,9 +50,8 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
-  pull-requests: write
+# Every job declares exactly the token scopes it needs.
+permissions: {}
 
 # Never run two release-please/build pipelines at once; queue instead.
 concurrency:
@@ -53,6 +63,9 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
@@ -60,7 +73,7 @@ jobs:
       prs_created: ${{ steps.rp.outputs.prs_created }}
       pr: ${{ steps.rp.outputs.pr }}
     steps:
-      - uses: googleapis/release-please-action@v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: rp
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -77,12 +90,17 @@ jobs:
     if: needs.release-please.outputs.prs_created == 'true' && needs.release-please.outputs.pr != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
+      # Credentials stay configured on purpose: the last step pushes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }} # zizmor: ignore[artipacked]
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # stable, 2026-10-01
+        with:
+          toolchain: stable
       - name: Re-lock the workspace crate at the bumped version
         run: cargo update --workspace --manifest-path src-tauri/Cargo.toml
       - name: Commit Cargo.lock to the release PR
@@ -96,6 +114,8 @@ jobs:
           git commit -m "chore: sync Cargo.lock with the release version" -- src-tauri/Cargo.lock
           git push
 
+  # Read-only: this job runs npm/cargo build scripts and builds llama.cpp,
+  # so it must not hold a token that can change releases or tags.
   build:
     needs: [release-please]
     # Run when release-please just created a (draft) release, or on a manual
@@ -105,54 +125,76 @@ jobs:
     # macos-latest is Apple Silicon (aarch64) — matches the app's only target.
     runs-on: macos-latest
     timeout-minutes: 40
-    env:
-      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: read
+      id-token: write # Sigstore certificate for the provenance attestation
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+      ref: ${{ steps.rel.outputs.ref }}
     steps:
       - name: Resolve release tag + commit
         id: rel
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RP_TAG: ${{ needs.release-please.outputs.tag_name }}
+          RP_SHA: ${{ needs.release-please.outputs.sha }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-            # A published release's tag is the commit to build.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+            # The release's tag is the commit to build.
             REF="$TAG"
           else
-            TAG="${{ needs.release-please.outputs.tag_name }}"
+            TAG="$RP_TAG"
             # Build the exact commit release-please tagged (the tag itself
             # may still be propagating when this job starts).
-            REF="${{ needs.release-please.outputs.sha }}"
+            REF="$RP_SHA"
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Not a release tag: '$TAG' (expected vX.Y.Z)"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "ref=$REF"
+            echo "version=${TAG#v}"
+          } >> "$GITHUB_OUTPUT"
           echo "Building $TAG from $REF"
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.rel.outputs.ref }}
+          persist-credentials: false
 
       - name: Verify tag matches app version
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          TAG_VERSION: ${{ steps.rel.outputs.version }}
         run: |
-          TAG_VERSION="${{ steps.rel.outputs.version }}"
           CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
           if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
-            echo "::error::Release ${{ steps.rel.outputs.tag }} does not match tauri.conf.json version $CONF_VERSION. release-please should have bumped it — check release-please-config.json extra-files."
+            echo "::error::Release $TAG does not match tauri.conf.json version $CONF_VERSION. release-please should have bumped it — check release-please-config.json extra-files."
             exit 1
           fi
 
       - name: Install meson/ninja (webrtc-audio-processing build deps)
         run: brew install meson ninja pkg-config
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version-file: .nvmrc
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # stable, 2026-10-01
+        with:
+          toolchain: stable
 
       # Release-profile artifacts never match CI's debug cache, and caches
       # aren't shared across tags, so this is only a hit when the same release
       # is rebuilt (workflow_dispatch). Cheap enough to keep.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
           prefix-key: v1-rust
@@ -163,7 +205,7 @@ jobs:
       # script fetches/checks out the pinned ref and CMake rebuilds
       # incrementally.
       - name: Cache llama.cpp build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             .llama.cpp
@@ -192,8 +234,9 @@ jobs:
         run: npm run tauri:build
 
       - name: Collect artifacts
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
-          VERSION="${{ steps.rel.outputs.version }}"
           DMG="src-tauri/target/release/bundle/dmg/LilNotes_${VERSION}_aarch64.dmg"
           if [ ! -f "$DMG" ]; then
             echo "::error::Expected DMG not found: $DMG"
@@ -206,42 +249,67 @@ jobs:
           shasum -a 256 ./* > checksums.txt
           cat checksums.txt
 
+      # Lets users check a download with
+      # `gh attestation verify <dmg> -R xxhama/lilnotes`.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist-release/*.dmg
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: dist-release/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that can write releases. It never runs project code (no
+  # npm/cargo), just uploads what `build` produced and publishes the draft.
+  publish:
+    needs: [build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.ref }}
+          persist-credentials: false
+          sparse-checkout: .github/release-install-notes.md
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist-release
+
       - name: Upload assets
-        run: gh release upload "${{ steps.rel.outputs.tag }}" dist-release/* --clobber
+        run: gh release upload "$TAG" dist-release/* --clobber
 
       # release-please wrote the changelog into the release body; append the
       # install instructions once (idempotent on manual rebuilds).
       - name: Add install notes
         run: |
-          TAG="${{ steps.rel.outputs.tag }}"
           gh release view "$TAG" --json body -q .body > release-notes.md
           if ! grep -q '^## Installation' release-notes.md; then
-            cat >> release-notes.md <<'NOTES'
-
-          ## Installation
-
-          1. Download `LilNotes_*_aarch64.dmg` below (Apple Silicon, macOS 15+ only).
-          2. Open the DMG and drag **LilNotes** to Applications.
-
-          ### First launch (important)
-
-          LilNotes is not yet notarized by Apple, so macOS will refuse to open
-          it with a "damaged" or "cannot be opened" warning. Two ways past it:
-
-          - Run this once in Terminal, then launch normally:
-
-            ```sh
-            xattr -cr /Applications/LilNotes.app
-            ```
-
-          - Or: try to open the app, then go to **System Settings → Privacy &
-            Security**, scroll down, and click **Open Anyway**.
-
-          ### Verify your download (optional)
-
-          ```sh
-          shasum -a 256 -c checksums.txt
-          ```
-          NOTES
+            printf '\n' >> release-notes.md
+            cat .github/release-install-notes.md >> release-notes.md
+            gh release edit "$TAG" --notes-file release-notes.md
           fi
-          gh release edit "$TAG" --notes-file release-notes.md
+
+      # Last step on purpose: the release only becomes public (and "Latest")
+      # once its assets and notes are in place.
+      - name: Publish release
+        run: |
+          if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "true" ]; then
+            gh release edit "$TAG" --draft=false --latest
+            echo "Published $TAG"
+          else
+            echo "$TAG was already published; assets re-uploaded"
+          fi

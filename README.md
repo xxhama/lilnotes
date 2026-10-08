@@ -47,14 +47,18 @@ cloud, no accounts, no telemetry.
 1. Download `LilNotes_<version>_aarch64.dmg` from the
    [latest release](https://github.com/xxhama/lilnotes/releases/latest).
 2. Open the DMG and drag **LilNotes** to Applications.
-3. Launch it. Releases are signed with a Developer ID and notarized by Apple,
-   so there is nothing to click through.
+3. LilNotes is not notarized by Apple yet, so the first launch shows a
+   "damaged" or "cannot be opened" warning. Run
+   `xattr -cr /Applications/LilNotes.app` once, or open the app, then click
+   **Open Anyway** in System Settings → Privacy & Security.
 
 To verify a download, compare it against the `checksums.txt` published with
-the release:
+the release, or check that it was built by this repository's release
+workflow:
 
 ```sh
 shasum -a 256 -c checksums.txt
+gh attestation verify LilNotes_*_aarch64.dmg -R xxhama/lilnotes
 ```
 
 Building from source yourself? Unsigned local builds trigger Gatekeeper's
