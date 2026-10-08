@@ -59,7 +59,7 @@ webrtc-audio-processing = { version = "~2.1", features = ["bundled", "experiment
 realfft = "1"
 # Complex type used by realfft's spectra (pinned to 0.3 to match realfft 1.x's
 # dependency, so the `Complex32` values flow through without a type mismatch).
-num-complex = "0.3"
+num-complex = "0.4"
 
 # --- diarization (M4) ---
 sherpa-rs = "0.6"  # sherpa-onnx: pyannote segmentation + CAM++ embeddings
