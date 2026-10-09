@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/xxhama/lilnotes/compare/v0.3.1...v0.4.0) (2026-10-09)
+
+
+### Features
+
+* rank speaker picker by voice match and customer roster ([#48](https://github.com/xxhama/lilnotes/issues/48)) ([f59f63b](https://github.com/xxhama/lilnotes/commit/f59f63bedbee898c6d1351ce70c914db4e6100f0))
+
 ## [0.3.1](https://github.com/xxhama/lilnotes/compare/v0.3.0...v0.3.1) (2026-10-08)
 
 
