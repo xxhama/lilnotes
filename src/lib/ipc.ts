@@ -711,6 +711,20 @@ export function identifySpeakers(meetingId: number): Promise<SpeakerMatch[]> {
   return invoke<SpeakerMatch[]>("identify_speakers", { meetingId });
 }
 
+/** Relevance data for the speaker picker (read-only, no audio pass). */
+export interface SpeakerCandidates {
+  /** raw label -> personas at/above the suggest threshold, best first. */
+  voiceMatches: Record<string, PersonaScore[]>;
+  /** Name of the customer this meeting is assigned to, if any. */
+  customerName: string | null;
+  /** Personas confirmed in that customer's meetings. */
+  customerRoster: CustomerRosterEntry[];
+}
+
+export function speakerPersonaCandidates(meetingId: number): Promise<SpeakerCandidates> {
+  return invoke<SpeakerCandidates>("speaker_persona_candidates", { meetingId });
+}
+
 export function confirmSpeakerPersona(
   meetingId: number,
   rawLabel: string,

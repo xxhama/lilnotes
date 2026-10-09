@@ -160,6 +160,7 @@ pub fn run() {
             commands::delete_persona,
             commands::delete_all_voiceprints,
             commands::identify_speakers,
+            commands::speaker_persona_candidates,
             commands::confirm_speaker_persona,
             commands::unlink_speaker_persona,
             commands::delete_meeting,

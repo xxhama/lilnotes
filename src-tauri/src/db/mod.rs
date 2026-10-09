@@ -1739,6 +1739,51 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Every speaker embedding stored for a meeting (see migration v9), by
+    /// raw label. Labels identified before embeddings were persisted are
+    /// simply absent.
+    pub fn meeting_speaker_embeddings(
+        &self,
+        meeting_id: i64,
+    ) -> Result<Vec<(String, Vec<f32>)>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT raw_label, embedding, embedding_dim FROM speakers
+                 WHERE meeting_id = ?1
+                   AND embedding IS NOT NULL AND embedding_dim > 0
+                 ORDER BY raw_label",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| {
+                let blob: Vec<u8> = r.get(1)?;
+                let dim: i64 = r.get(2)?;
+                Ok((
+                    r.get(0)?,
+                    crate::voiceprint::unpack_f32(&blob[..blob.len().min(dim as usize * 4)]),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// The customer a meeting is assigned to, as (id, name); None if unassigned.
+    pub fn meeting_customer(&self, meeting_id: i64) -> Result<Option<(i64, String)>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT c.id, c.name FROM meetings m
+             JOIN customers c ON c.id = m.customer_id
+             WHERE m.id = ?1",
+            params![meeting_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
     /// Upsert an automatic suggestion into `speaker_persona_links`. A row the
     /// user has confirmed is frozen: neither `persona_id` nor `confidence`
     /// changes (the chip only shows confidence for unconfirmed links, so a
@@ -2088,7 +2133,10 @@ impl Db {
 
     /// Distinct personas with confirmed links in this customer's meetings,
     /// with per-persona meeting count and last-seen time.
-    fn customer_roster(&self, customer_id: i64) -> Result<Vec<CustomerRosterEntry>, String> {
+    pub(crate) fn customer_roster(
+        &self,
+        customer_id: i64,
+    ) -> Result<Vec<CustomerRosterEntry>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -3230,6 +3278,31 @@ mod tests {
         assert_eq!(db.diarize_num_speakers(meeting_id).unwrap(), Some(3));
         db.set_diarize_num_speakers(meeting_id, None).unwrap();
         assert_eq!(db.diarize_num_speakers(meeting_id).unwrap(), None);
+    }
+
+    #[test]
+    fn speaker_embeddings_and_customer_for_picker() {
+        let db = tmp_db();
+        let m = db.insert_meeting_started("pk", "t", 0).unwrap();
+        assert!(db.meeting_speaker_embeddings(m).unwrap().is_empty());
+        assert_eq!(db.meeting_customer(m).unwrap(), None);
+
+        db.set_speaker_embedding(m, "SPEAKER_01", &[0.0, 1.0], 5_000)
+            .unwrap();
+        db.set_speaker_embedding(m, "SPEAKER_00", &[1.0, 0.0], 5_000)
+            .unwrap();
+        let embs = db.meeting_speaker_embeddings(m).unwrap();
+        assert_eq!(
+            embs,
+            vec![
+                ("SPEAKER_00".to_string(), vec![1.0, 0.0]),
+                ("SPEAKER_01".to_string(), vec![0.0, 1.0]),
+            ]
+        );
+
+        let c = db.create_customer("Acme", None).unwrap();
+        db.set_meeting_customer(m, Some(c)).unwrap();
+        assert_eq!(db.meeting_customer(m).unwrap(), Some((c, "Acme".into())));
     }
 
     #[test]

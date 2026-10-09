@@ -17,6 +17,10 @@ export interface PickerItem {
   id: number;
   label: string;
   sublabel?: string;
+  /** Section heading. Groups render in order of first appearance, so the
+   * caller controls section order by ordering `items`. Omitted = the default
+   * "Switch to" / "Assign" section. */
+  group?: string;
 }
 
 interface Props {
@@ -58,6 +62,9 @@ interface Props {
  * (shouldFilter={false}) so the Current + Actions rows stay selectable
  * regardless of the query. Uses only semantic color tokens (popover/primary/
  * accent/muted) so it themes correctly in light + dark — no hardcoded colors.
+ * Items may carry a `group` to split the list into ranked sections (the
+ * speaker picker's "Voice match" / "From <customer>" / "All personas");
+ * search filters within every section.
  */
 export default function PickerCombobox({
   open,
@@ -99,6 +106,7 @@ export default function PickerCombobox({
 
   const query = search.trim().toLowerCase();
   const filtered = query ? items.filter((it) => it.label.toLowerCase().includes(query)) : items;
+  const defaultHeading = currentId != null ? "Switch to" : "Assign";
 
   const pick = (id: number) => {
     onPick(id);
@@ -194,24 +202,28 @@ export default function PickerCombobox({
                   </CommandItem>
                 </CommandGroup>
               )}
-              <CommandGroup heading={currentId != null ? "Switch to" : "Assign"}>
-                {filtered.length === 0 ? (
+              {filtered.length === 0 ? (
+                <CommandGroup heading={defaultHeading}>
                   <p className="px-2 py-3 text-center text-xs text-muted-foreground">
                     {items.length === 0 ? `No ${createNoun}s yet.` : "No matches."}
                   </p>
-                ) : (
-                  filtered.map((it) => (
-                    <CommandItem key={it.id} value={`${it.id}`} onSelect={() => pick(it.id)}>
-                      {it.label}
-                      {it.sublabel && (
-                        <span className="ml-auto text-[10px] text-muted-foreground">
-                          {it.sublabel}
-                        </span>
-                      )}
-                    </CommandItem>
-                  ))
-                )}
-              </CommandGroup>
+                </CommandGroup>
+              ) : (
+                groupItems(filtered, defaultHeading).map(([heading, group]) => (
+                  <CommandGroup key={heading} heading={heading}>
+                    {group.map((it) => (
+                      <CommandItem key={it.id} value={`${it.id}`} onSelect={() => pick(it.id)}>
+                        {it.label}
+                        {it.sublabel && (
+                          <span className="ml-auto text-[10px] text-muted-foreground">
+                            {it.sublabel}
+                          </span>
+                        )}
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                ))
+              )}
               {(onCreate || onUnassign) && (
                 <CommandGroup heading="Actions">
                   {onCreate && (
@@ -232,6 +244,19 @@ export default function PickerCombobox({
       </PopoverContent>
     </Popover>
   );
+}
+
+/** Bucket items by `group` (falling back to `fallback`), keeping the order in
+ * which each group first appears and the item order within it. */
+function groupItems(items: PickerItem[], fallback: string): [string, PickerItem[]][] {
+  const groups = new Map<string, PickerItem[]>();
+  for (const it of items) {
+    const key = it.group ?? fallback;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(it);
+    else groups.set(key, [it]);
+  }
+  return [...groups];
 }
 
 /** Capitalize the first letter of `s` (for placeholder copy like "Customer name…"). */
