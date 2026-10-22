@@ -16,14 +16,15 @@ import {
   Eye,
   EyeOff,
   FileText,
-  Github,
   HelpCircle,
   RefreshCw,
   Scale,
   X,
   XCircle,
 } from "lucide-react";
+import { siGithub } from "simple-icons";
 
+import BrandIcon from "@/components/BrandIcon";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -987,7 +988,7 @@ export default function SettingsView() {
             </div>
             <div className="flex shrink-0 flex-wrap justify-end gap-2">
               <Button size="sm" variant="outline" onClick={() => openUrl(REPO_URL)}>
-                <Github /> Source code
+                <BrandIcon icon={siGithub} /> Source code
               </Button>
               <Button size="sm" variant="outline" onClick={() => openUrl(`${REPO_URL}/issues`)}>
                 <Bug /> Report an issue
