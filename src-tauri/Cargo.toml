@@ -1,6 +1,6 @@
 [package]
 name = "lilnotes"
-version = "0.3.1"
+version = "0.4.0"
 description = "Local-first meeting notes: on-device transcription, diarization, and summaries."
 authors = ["Johnny Xhama"]
 edition = "2021"
