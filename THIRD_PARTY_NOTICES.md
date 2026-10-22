@@ -12847,7 +12847,7 @@ texts ship in each package's `node_modules` directory and repository.
 | katex@0.18.10 | MIT |  | https://github.com/KaTeX/KaTeX |
 | lodash-es@4.18.1 | MIT |  | https://github.com/lodash/lodash |
 | longest-streak@3.1.0 | MIT |  | https://github.com/wooorm/longest-streak |
-| lucide-react@0.525.0 | ISC |  | https://github.com/lucide-icons/lucide |
+| lucide-react@1.55.0 | ISC |  | https://github.com/lucide-icons/lucide |
 | magic-string@0.30.21 | MIT |  | https://github.com/Rich-Harris/magic-string |
 | markdown-table@3.0.4 | MIT |  | https://github.com/wooorm/markdown-table |
 | mdast-util-definitions@6.0.0 | MIT |  | https://github.com/syntax-tree/mdast-util-definitions |
