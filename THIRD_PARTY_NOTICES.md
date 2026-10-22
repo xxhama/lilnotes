@@ -12929,6 +12929,7 @@ texts ship in each package's `node_modules` directory and repository.
 | remark@15.0.1 | MIT |  | https://github.com/remarkjs/remark.git#main |
 | rope-sequence@1.3.4 | MIT |  | https://github.com/marijnh/rope-sequence |
 | scheduler@0.28.0 | MIT |  | https://github.com/react/react |
+| simple-icons@16.35.0 | CC0-1.0 |  | https://github.com/simple-icons/simple-icons |
 | source-map-js@1.2.1 | BSD-3-Clause |  | https://github.com/7rulnik/source-map-js |
 | style-mod@4.1.3 | MIT |  | https://github.com/marijnh/style-mod |
 | tailwind-merge@3.7.0 | MIT |  | https://github.com/dcastil/tailwind-merge |
