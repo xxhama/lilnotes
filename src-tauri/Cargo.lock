@@ -2602,7 +2602,7 @@ dependencies = [
 
 [[package]]
 name = "lilnotes"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "axum",
  "block2",
