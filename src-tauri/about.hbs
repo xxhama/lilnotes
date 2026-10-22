@@ -1,9 +1,12 @@
+{{!-- The app's own crate is listed without a version: release-please bumps it
+on every release PR, which would make THIRD_PARTY_NOTICES.md stale and fail
+the CI `licenses` check each time. --}}
 {{#each licenses}}
 ### {{{name}}}
 
 Used by:
 {{#each used_by}}
-- {{crate.name}} {{crate.version}}{{#if crate.repository}} — <{{{crate.repository}}}>{{/if}}
+- {{crate.name}}{{#unless (eq crate.name "lilnotes")}} {{crate.version}}{{/unless}}{{#if crate.repository}} — <{{{crate.repository}}}>{{/if}}
 {{/each}}
 
 ```
