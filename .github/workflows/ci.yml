@@ -130,7 +130,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # stable, 2026-10-01
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-deny@0.20.2,cargo-about@0.9.2
       - run: cargo deny --manifest-path src-tauri/Cargo.toml check licenses
